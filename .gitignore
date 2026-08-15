@@ -1,0 +1,33 @@
+# Android and Gradle generated state
+android/.gradle/
+android/.kotlin/
+**/build/
+**/captures/
+**/.externalNativeBuild/
+
+# IDE and local machine files
+.idea/
+*.iml
+local.properties
+
+# Signing material and local overrides
+android/keystore.properties
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+*.cer
+*.crt
+
+# Generated distribution artifacts
+output/
+*.apk
+*.aab
+*.mapping
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
