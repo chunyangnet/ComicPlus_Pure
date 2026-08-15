@@ -1,7 +1,9 @@
 # Comic Plus
+
 [![License: Personal Non-Commercial Learning](https://img.shields.io/badge/license-personal%20non--commercial-red.svg)](LICENSE)
 
 [Download](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.1.2/Comic-Plus-release-v1.1.2.apk)  | [下载](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.1.2/Comic-Plus-release-v1.1.2.apk)  | [ダウンロード](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.1.2/Comic-Plus-release-v1.1.2.apk)  
+[![Download](https://img.shields.io/badge/Download-Comic%20Plus-blue?style=flat&logo=android)](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.1.2/Comic-Plus-release-v1.1.2.apk)
 ---
 ## 简介 / Introduction / 紹介
 
@@ -28,7 +30,9 @@ No advertisements whatsoever. If you have the means, please support the official
 
 ---
 # 社区支持 / Community Support / コミュニティサポート
- [Linux.do](https://linux.do)  
+[![Linux.do](https://img.shields.io/badge/Community-Linux.do-blue?style=flat&logo=linux)](https://linux.do)
+
+[Linux.do](https://linux.do)  
  
 ---
 
