@@ -101,6 +101,8 @@ fun HomeScreen(
     onOpenBrowse: () -> Unit,
     onMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
+    favoriteKeys: Set<String> = emptySet(),
+    onToggleFavorite: (ComicUiItem) -> Unit = {},
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     val searchIntent = remember(query) { JmIdParser.parse(query) }
@@ -172,6 +174,8 @@ fun HomeScreen(
                     items = comics.take(5),
                     onOpen = onResolve,
                     reduceMotion = reduceMotion,
+                    favoriteKeys = favoriteKeys,
+                    onToggleFavorite = onToggleFavorite,
                     modifier = Modifier.padding(horizontal = CpDimens.screenPadding),
                 )
             }
@@ -195,6 +199,8 @@ fun HomeScreen(
                     onOpen = onResolve,
                     onMore = onOpenBrowse,
                     topPadding = 28.dp,
+                    favoriteKeys = favoriteKeys,
+                    onToggleFavorite = onToggleFavorite,
                 )
             }
 
@@ -203,6 +209,8 @@ fun HomeScreen(
                     items = (comics.drop(3) + comics.take(3)).distinctBy { it.key }.take(6),
                     onOpen = onResolve,
                     onMore = onOpenBrowse,
+                    favoriteKeys = favoriteKeys,
+                    onToggleFavorite = onToggleFavorite,
                 )
             }
 
@@ -211,6 +219,8 @@ fun HomeScreen(
                     items = comics,
                     onOpen = onResolve,
                     onMore = onOpenBrowse,
+                    favoriteKeys = favoriteKeys,
+                    onToggleFavorite = onToggleFavorite,
                 )
             }
 
@@ -221,6 +231,8 @@ fun HomeScreen(
                     onOpen = onResolve,
                     onMore = onOpenBrowse,
                     topPadding = CpDimens.sectionGap,
+                    favoriteKeys = favoriteKeys,
+                    onToggleFavorite = onToggleFavorite,
                 )
             }
 
@@ -242,6 +254,8 @@ fun HomeScreen(
                     onClick = { onResolve(comic) },
                     prominent = false,
                     modifier = Modifier.padding(horizontal = CpDimens.screenPadding),
+                    isFavorite = comic.key in favoriteKeys,
+                    onToggleFavorite = { onToggleFavorite(comic) },
                 )
             }
 
@@ -315,6 +329,8 @@ private fun FeaturedCarousel(
     onOpen: (ComicUiItem) -> Unit,
     reduceMotion: Boolean,
     modifier: Modifier = Modifier,
+    favoriteKeys: Set<String> = emptySet(),
+    onToggleFavorite: (ComicUiItem) -> Unit = {},
 ) {
     val actualItems = items.ifEmpty {
         listOf(ComicUiItem("0", "正在连接漫画目录", "精选", "", 0))
@@ -375,6 +391,13 @@ private fun FeaturedCarousel(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
+                    if (current.jmId != "0") {
+                        com.comicplus.app.ui.components.FavoriteButton(
+                            isFavorite = current.key in favoriteKeys,
+                            onClick = { onToggleFavorite(current) },
+                            modifier = Modifier.align(Alignment.TopEnd).padding(12.dp),
+                        )
+                    }
             }
         }
         if (actualItems.size > 1) {
@@ -406,6 +429,8 @@ private fun HomeShelf(
     onOpen: (ComicUiItem) -> Unit,
     onMore: () -> Unit,
     topPadding: androidx.compose.ui.unit.Dp,
+    favoriteKeys: Set<String>,
+    onToggleFavorite: (ComicUiItem) -> Unit,
 ) {
     Column(Modifier.padding(top = topPadding)) {
         SectionTitle(
@@ -423,6 +448,8 @@ private fun HomeShelf(
                     comic = comic,
                     onClick = { onOpen(comic) },
                     modifier = Modifier.width(132.dp),
+                    isFavorite = comic.key in favoriteKeys,
+                    onToggleFavorite = { onToggleFavorite(comic) },
                 )
             }
         }
@@ -434,6 +461,8 @@ private fun TodayUpdates(
     items: List<ComicUiItem>,
     onOpen: (ComicUiItem) -> Unit,
     onMore: () -> Unit,
+    favoriteKeys: Set<String>,
+    onToggleFavorite: (ComicUiItem) -> Unit,
 ) {
     Column(Modifier.padding(horizontal = CpDimens.screenPadding, vertical = CpDimens.sectionGap)) {
         SectionTitle(title = "今日更新", onMore = onMore)
@@ -446,6 +475,8 @@ private fun TodayUpdates(
                         comic = comic,
                         onClick = { onOpen(comic) },
                         modifier = Modifier.weight(1f),
+                        isFavorite = comic.key in favoriteKeys,
+                        onToggleFavorite = { onToggleFavorite(comic) },
                     )
                 }
                 if (rowItems.size == 1) Spacer(Modifier.weight(1f))
@@ -459,6 +490,8 @@ private fun HotRanking(
     items: List<ComicUiItem>,
     onOpen: (ComicUiItem) -> Unit,
     onMore: () -> Unit,
+    favoriteKeys: Set<String>,
+    onToggleFavorite: (ComicUiItem) -> Unit,
 ) {
     Column(Modifier.padding(horizontal = CpDimens.screenPadding)) {
         SectionTitle(title = "热门排行", onMore = onMore)
@@ -478,7 +511,13 @@ private fun HotRanking(
             }
         } else {
             items.take(5).forEachIndexed { index, comic ->
-                RankingRow(rank = index + 1, comic = comic, onClick = { onOpen(comic) })
+                RankingRow(
+                    rank = index + 1,
+                    comic = comic,
+                    onClick = { onOpen(comic) },
+                    isFavorite = comic.key in favoriteKeys,
+                    onToggleFavorite = { onToggleFavorite(comic) },
+                )
             }
         }
     }

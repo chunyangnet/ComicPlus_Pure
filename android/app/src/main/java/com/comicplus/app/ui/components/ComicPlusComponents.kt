@@ -37,8 +37,10 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -102,6 +104,7 @@ object CpDimens {
 data class AppBarAction(
     val icon: ImageVector,
     val label: String,
+    val prominent: Boolean = false,
     val onClick: () -> Unit,
 )
 
@@ -155,13 +158,42 @@ fun ComicPlusTopBar(
         }
         Spacer(Modifier.weight(1f))
         actions.forEach { action ->
-            IconButton(onClick = action.onClick, modifier = Modifier.size(40.dp)) {
-                Icon(
-                    imageVector = action.icon,
-                    contentDescription = action.label,
-                    tint = InkSoft,
-                    modifier = Modifier.size(21.dp),
-                )
+            if (action.prominent) {
+                Surface(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(CpDimens.pillRadius))
+                        .clickable(onClick = action.onClick),
+                    color = MaterialTheme.colorScheme.primary,
+                    shadowElevation = 3.dp,
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = action.icon,
+                            contentDescription = action.label,
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.size(19.dp),
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            action.label,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                }
+            } else {
+                IconButton(onClick = action.onClick, modifier = Modifier.size(40.dp)) {
+                    Icon(
+                        imageVector = action.icon,
+                        contentDescription = action.label,
+                        tint = InkSoft,
+                        modifier = Modifier.size(21.dp),
+                    )
+                }
             }
         }
     }
@@ -411,6 +443,8 @@ fun ComicPosterCard(
     comic: ComicUiItem,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    isFavorite: Boolean = false,
+    onToggleFavorite: (() -> Unit)? = null,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     Column(
@@ -433,6 +467,13 @@ fun ComicPosterCard(
                 accentIndex = comic.accentIndex,
                 modifier = Modifier.fillMaxSize(),
             )
+            if (onToggleFavorite != null) {
+                FavoriteButton(
+                    isFavorite = isFavorite,
+                    onClick = onToggleFavorite,
+                    modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
+                )
+            }
         }
         Spacer(Modifier.height(10.dp))
         Text(
@@ -461,6 +502,8 @@ fun RankingRow(
     modifier: Modifier = Modifier,
     prominent: Boolean = rank <= 3,
 	supportingText: String? = null,
+    isFavorite: Boolean = false,
+    onToggleFavorite: (() -> Unit)? = null,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     val rankColor = when (rank) {
@@ -500,6 +543,14 @@ fun RankingRow(
                     .clip(RoundedCornerShape(12.dp)),
             ) {
                 ComicCover(comic.coverUrl, comic.title, comic.accentIndex, Modifier.fillMaxSize())
+                if (onToggleFavorite != null) {
+                    FavoriteButton(
+                        isFavorite = isFavorite,
+                        onClick = onToggleFavorite,
+                        modifier = Modifier.align(Alignment.TopEnd).padding(4.dp),
+                        compact = true,
+                    )
+                }
             }
             Spacer(Modifier.width(13.dp))
             Column(Modifier.weight(1f)) {
@@ -520,6 +571,42 @@ fun RankingRow(
                 )
             }
             Icon(Icons.Outlined.ChevronRight, contentDescription = null, tint = Line, modifier = Modifier.size(19.dp))
+        }
+    }
+}
+
+/** High-contrast cover action that remains legible over both light and dark artwork. */
+@Composable
+fun FavoriteButton(
+    isFavorite: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    compact: Boolean = false,
+) {
+    val reduceMotion = LocalComicPlusReduceMotion.current
+    val containerColor by animateColorAsState(
+        targetValue = if (isFavorite) {
+            MaterialTheme.colorScheme.primary.copy(alpha = .94f)
+        } else {
+            Color(0xD91B2029)
+        },
+        animationSpec = tween(if (reduceMotion) 0 else 180),
+        label = "favorite-button-container",
+    )
+    val size = if (compact) 28.dp else 36.dp
+    Surface(
+        modifier = modifier.size(size),
+        shape = CircleShape,
+        color = containerColor,
+        shadowElevation = if (isFavorite) 3.dp else 1.dp,
+    ) {
+        IconButton(onClick = onClick, modifier = Modifier.fillMaxSize()) {
+            Icon(
+                imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                contentDescription = if (isFavorite) "取消收藏" else "加入收藏",
+                tint = White,
+                modifier = Modifier.size(if (compact) 15.dp else 19.dp),
+            )
         }
     }
 }

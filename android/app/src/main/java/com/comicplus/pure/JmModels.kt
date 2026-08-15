@@ -19,6 +19,39 @@ data class JmCategory(
     val name: String,
     val slug: String,
     val totalAlbums: Long? = null,
+    val type: String = "slug",
+)
+
+@Immutable
+data class JmTagGroup(
+    val title: String,
+    val tags: List<String>,
+)
+
+@Immutable
+data class JmCategoryCatalog(
+    val categories: List<JmCategory>,
+    val tagGroups: List<JmTagGroup>,
+)
+
+@Immutable
+data class JmWeekOption(
+    val id: String,
+    val title: String,
+)
+
+@Immutable
+data class JmWeekCatalog(
+    val categories: List<JmWeekOption>,
+    val types: List<JmWeekOption>,
+)
+
+@Immutable
+data class JmRankingPage(
+    val page: Int,
+    val total: Long,
+    val items: List<JmRanking>,
+    val hasMore: Boolean,
 )
 
 @Immutable
@@ -59,5 +92,30 @@ data class JmSearchPage(
     val total: Long,
     val redirectAid: String?,
     val items: List<JmRanking>,
+    val hasMore: Boolean,
+)
+
+/** A read-only comment returned by the official JM forum endpoint. */
+@Immutable
+data class JmComment(
+    val id: String,
+    val userId: String? = null,
+    val albumId: String? = null,
+    val username: String = "",
+    val nickname: String = "",
+    val content: String = "",
+    val avatarUrl: String? = null,
+    val createdAt: String = "",
+    val likes: Long = 0L,
+    val parentId: String? = null,
+    val spoiler: Boolean = false,
+    val replies: List<JmComment> = emptyList(),
+)
+
+@Immutable
+data class JmCommentPage(
+    val page: Int,
+    val total: Long,
+    val comments: List<JmComment>,
     val hasMore: Boolean,
 )

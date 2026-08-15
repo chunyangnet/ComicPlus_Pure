@@ -30,10 +30,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Category
 import androidx.compose.material.icons.filled.EmojiEvents
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.outlined.Category
 import androidx.compose.material.icons.outlined.EmojiEvents
+import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Icon
@@ -48,6 +50,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -69,14 +72,18 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.net.toUri
 import com.comicplus.app.ui.AppSettings
 import com.comicplus.app.ui.ComicResolveUiState
 import com.comicplus.app.ui.ComicUiItem
 import com.comicplus.app.ui.LocalComicPlusReduceMotion
 import com.comicplus.app.ui.ReaderUiState
+import com.comicplus.app.ui.key
 import com.comicplus.app.ui.screens.CategoryScreen
 import com.comicplus.app.ui.screens.ComicDetailScreen
 import com.comicplus.app.ui.screens.HomeScreen
+import com.comicplus.app.ui.screens.LibraryScreen
+import com.comicplus.app.ui.screens.OfficialBrowseScreen
 import com.comicplus.app.ui.screens.ReaderScreen
 import com.comicplus.app.ui.screens.RankingScreen
 import com.comicplus.app.ui.screens.SearchScreen
@@ -89,6 +96,7 @@ private enum class MainTab(val label: String, val outlined: ImageVector, val fil
     Home("首页", Icons.Outlined.Home, Icons.Filled.Home),
     Ranking("排行", Icons.Outlined.EmojiEvents, Icons.Filled.EmojiEvents),
     Category("分类", Icons.Outlined.Category, Icons.Filled.Category),
+    Library("书架", Icons.Outlined.FavoriteBorder, Icons.Filled.Favorite),
     Settings("设置", Icons.Outlined.Settings, Icons.Filled.Settings),
 }
 
@@ -103,6 +111,9 @@ fun PureApp() {
     var tabName by rememberSaveable { mutableStateOf(MainTab.Home.name) }
     var searchVisible by rememberSaveable { mutableStateOf(false) }
     var searchInitialQuery by rememberSaveable { mutableStateOf("") }
+    var searchInitialScope by rememberSaveable { mutableIntStateOf(0) }
+    var officialBrowseVisible by rememberSaveable { mutableStateOf(false) }
+    val favoriteKeys = remember(state.favorites) { state.favorites.mapTo(hashSetOf(), ComicUiItem::key) }
 
     LaunchedEffect(state.message) {
         state.message?.let {
@@ -157,12 +168,18 @@ fun PureApp() {
                             downloadedChapterIds = state.downloads.filter { it.comicId == ready?.jmId && it.complete }.mapTo(mutableSetOf()) { it.chapterId },
                             downloadProgress = state.downloadProgress.mapKeys { it.key.substringAfter(':') },
                             onDownload = viewModel::downloadChapter,
+                            isFavorite = ready?.let { "${it.source}:${it.jmId}" in favoriteKeys } ?: false,
+                            onToggleFavorite = viewModel::toggleFavorite,
+                            comments = state.comments,
+                            onRetryComments = viewModel::retryComments,
+                            onLoadMoreComments = viewModel::loadMoreComments,
                         )
                     }
 
                     searchVisible -> SearchScreen(
                         state = state.search,
                         initialQuery = searchInitialQuery,
+                        initialScope = searchInitialScope,
                         reduceMotion = state.settings.reduceMotion,
                         onBack = { searchVisible = false; viewModel.clearSearch() },
                         onSearch = { query, tag, order -> viewModel.search(query, tag, order) },
@@ -170,6 +187,30 @@ fun PureApp() {
                         onResolve = viewModel::openComic,
                         onRedirectConsumed = viewModel::consumeSearchRedirect,
                         onMessage = { message -> scope.launch { snackbar.showSnackbar(message) } },
+                        favoriteKeys = favoriteKeys,
+                        onToggleFavorite = viewModel::toggleFavorite,
+                    )
+
+                    officialBrowseVisible -> OfficialBrowseScreen(
+                        state = state.officialBrowse,
+                        categories = state.categories,
+                        reduceMotion = state.settings.reduceMotion,
+                        onBack = { officialBrowseVisible = false },
+                        onEnsure = viewModel::ensureOfficialBrowse,
+                        onSelectWeeklyCategory = viewModel::selectWeeklyCategory,
+                        onSelectWeeklyType = viewModel::selectWeeklyType,
+                        onRetryWeekly = { viewModel.loadWeekly(force = true) },
+                        onOpenTag = { tag ->
+                            searchInitialQuery = tag
+                            searchInitialScope = 3
+                            searchVisible = true
+                            viewModel.search(tag, mainTag = 3)
+                        },
+                        onSelectTypeRanking = { slug, order -> viewModel.loadTypeRanking(slug, order) },
+                        onRetryTypeRanking = { viewModel.loadTypeRanking(force = true) },
+                        onResolve = viewModel::openComic,
+                        favoriteKeys = favoriteKeys,
+                        onToggleFavorite = viewModel::toggleFavorite,
                     )
 
                     else -> {
@@ -196,12 +237,14 @@ fun PureApp() {
                                     reduceMotion = state.settings.reduceMotion,
                                     onRefresh = viewModel::refreshHome,
                                     onResolve = viewModel::openComic,
-                                    onOpenSearch = { query -> searchInitialQuery = query; searchVisible = true; if (query.isNotBlank()) viewModel.search(query) },
+                                    onOpenSearch = { query -> searchInitialQuery = query; searchInitialScope = 0; searchVisible = true; if (query.isNotBlank()) viewModel.search(query) },
                                     onLoadMoreDiscovery = viewModel::loadMoreDiscovery,
                                     onOpenCategory = { category -> viewModel.selectCategory(category); tabName = MainTab.Category.name },
                                     onOpenBrowse = { tabName = MainTab.Category.name },
                                     onMessage = { message -> scope.launch { snackbar.showSnackbar(message) } },
                                     modifier = modifier,
+                                    favoriteKeys = favoriteKeys,
+                                    onToggleFavorite = viewModel::toggleFavorite,
                                 )
 
                                 MainTab.Ranking -> RankingScreen(
@@ -209,11 +252,14 @@ fun PureApp() {
                                     reduceMotion = state.settings.reduceMotion,
                                     onEnsureRankings = { viewModel.loadRankings() },
                                     onSelectOrder = viewModel::loadRankings,
-                                    onOpenSearch = { query -> searchInitialQuery = query; searchVisible = true; if (query.isNotBlank()) viewModel.search(query) },
+                                    onOpenOfficialBrowse = { officialBrowseVisible = true },
+                                    onOpenSearch = { query -> searchInitialQuery = query; searchInitialScope = 0; searchVisible = true; if (query.isNotBlank()) viewModel.search(query) },
                                     onClearSearch = viewModel::clearSearch,
                                     onResolve = viewModel::openComic,
                                     onMessage = { message -> scope.launch { snackbar.showSnackbar(message) } },
                                     modifier = modifier,
+                                    favoriteKeys = favoriteKeys,
+                                    onToggleFavorite = viewModel::toggleFavorite,
                                 )
 
                                 MainTab.Category -> CategoryScreen(
@@ -224,10 +270,21 @@ fun PureApp() {
                                     onSelectCategory = viewModel::selectCategory,
                                     onSelectOrder = viewModel::selectCategoryOrder,
                                     onLoadMore = viewModel::loadMoreCategory,
-                                    onOpenSearch = { query -> searchInitialQuery = query; searchVisible = true; if (query.isNotBlank()) viewModel.search(query) },
+                                    onOpenSearch = { query -> searchInitialQuery = query; searchInitialScope = 0; searchVisible = true; if (query.isNotBlank()) viewModel.search(query) },
                                     onClearSearch = viewModel::clearSearch,
                                     onResolve = viewModel::openComic,
                                     onMessage = { message -> scope.launch { snackbar.showSnackbar(message) } },
+                                    modifier = modifier,
+                                    favoriteKeys = favoriteKeys,
+                                    onToggleFavorite = viewModel::toggleFavorite,
+                                )
+
+                                MainTab.Library -> LibraryScreen(
+                                    favorites = state.favorites,
+                                    history = state.history,
+                                    onOpen = viewModel::openComic,
+                                    onToggleFavorite = viewModel::toggleFavorite,
+                                    onClearHistory = viewModel::clearHistory,
                                     modifier = modifier,
                                 )
 
@@ -235,7 +292,12 @@ fun PureApp() {
                                     settings = state.settings,
                                     downloads = state.downloads,
                                     sourceStatus = state.sourceStatus,
+                                    updateStatus = state.appUpdate,
                                     onSettingsChange = viewModel::updateSettings,
+                                    onCheckUpdates = viewModel::checkForUpdates,
+                                    onOpenUpdate = { url ->
+                                        openExternalUrl(context, url) { message -> scope.launch { snackbar.showSnackbar(message) } }
+                                    },
                                     onClearReaderCache = viewModel::clearReaderCache,
                                     onRefreshSources = { viewModel.refreshSources(force = true) },
                                     onOpenDownload = viewModel::openDownloaded,
@@ -352,5 +414,18 @@ private fun shareComic(context: android.content.Context, state: ComicResolveUiSt
         context.startActivity(Intent.createChooser(intent, "分享漫画"))
     } catch (_: ActivityNotFoundException) {
         onMessage("当前设备没有可用的分享应用")
+    }
+}
+
+private fun openExternalUrl(context: Context, url: String, onMessage: (String) -> Unit) {
+    val uri = runCatching { url.toUri() }.getOrNull()
+    if (uri == null || uri.scheme !in setOf("https", "http")) {
+        onMessage("更新地址无效")
+        return
+    }
+    try {
+        context.startActivity(Intent(Intent.ACTION_VIEW, uri))
+    } catch (_: ActivityNotFoundException) {
+        onMessage("当前设备没有可用的浏览器")
     }
 }

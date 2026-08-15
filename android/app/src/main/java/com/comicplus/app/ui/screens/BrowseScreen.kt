@@ -34,6 +34,8 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Explore
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -62,6 +64,7 @@ import com.comicplus.app.ui.comicPlusDeviceTestTag
 import com.comicplus.app.ui.components.ComicCover
 import com.comicplus.app.ui.components.ComicPlusTopBar
 import com.comicplus.app.ui.components.CpDimens
+import com.comicplus.app.ui.components.AppBarAction
 import com.comicplus.app.ui.components.PillRow
 import com.comicplus.app.ui.components.RankingRow
 import com.comicplus.app.ui.components.SearchCapsule
@@ -89,6 +92,8 @@ fun CategoryScreen(
     onResolve: (ComicUiItem) -> Unit,
     onMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
+    favoriteKeys: Set<String> = emptySet(),
+    onToggleFavorite: (ComicUiItem) -> Unit = {},
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     LaunchedEffect(Unit) { onEnsureCategories() }
@@ -110,7 +115,13 @@ fun CategoryScreen(
             CategoryRail(
                 categories = categories,
                 selectedSlug = state.selectedSlug,
-                onSelect = onSelectCategory,
+                onSelect = { category ->
+                    if (category.id == "0" || category.type == "slug" || category.type.isBlank()) {
+                        onSelectCategory(category)
+                    } else {
+                        onOpenSearch(category.name)
+                    }
+                },
             )
             Column(Modifier.weight(1f).fillMaxSize()) {
                 val selectedOrder = categoryOrders.firstOrNull { it.id == state.order } ?: categoryOrders.first()
@@ -129,6 +140,8 @@ fun CategoryScreen(
                         if (state.page == 0) onSelectOrder(state.order) else onLoadMore()
                     },
                     onOpen = onResolve,
+                    favoriteKeys = favoriteKeys,
+                    onToggleFavorite = onToggleFavorite,
                 )
             }
         }
@@ -141,18 +154,32 @@ fun RankingScreen(
     reduceMotion: Boolean,
     onEnsureRankings: () -> Unit,
     onSelectOrder: (String) -> Unit,
+    onOpenOfficialBrowse: () -> Unit,
     onOpenSearch: (String) -> Unit,
     onClearSearch: () -> Unit,
     onResolve: (ComicUiItem) -> Unit,
     onMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
+    favoriteKeys: Set<String> = emptySet(),
+    onToggleFavorite: (ComicUiItem) -> Unit = {},
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     val order = rankingOrders.firstOrNull { it.id == state.jmOrder } ?: rankingOrders.first()
     LaunchedEffect(Unit) { onEnsureRankings() }
 
     Column(modifier.fillMaxSize().comicPlusDeviceTestTag(ComicPlusTestTags.BrowseScreen)) {
-        ComicPlusTopBar(title = "排行", subtitle = "JM 热度榜单", actions = emptyList())
+        ComicPlusTopBar(
+            title = "排行",
+            subtitle = "JM 热度榜单",
+            actions = listOf(
+                AppBarAction(
+                    icon = Icons.Outlined.Explore,
+                    label = "官方目录",
+                    prominent = true,
+                    onClick = onOpenOfficialBrowse,
+                ),
+            ),
+        )
         BrowseSearch(
             query = query,
             onQueryChange = { query = it; onClearSearch() },
@@ -186,7 +213,7 @@ fun RankingScreen(
                     action = "重新加载",
                     onAction = onEnsureRankings,
                 )
-                else -> RankingList(state.jmItems, onResolve)
+                else -> RankingList(state.jmItems, onResolve, favoriteKeys, onToggleFavorite)
             }
         }
     }
@@ -258,6 +285,8 @@ private fun CategoryGrid(
     onLoadMore: () -> Unit,
     onRetry: () -> Unit,
     onOpen: (ComicUiItem) -> Unit,
+    favoriteKeys: Set<String>,
+    onToggleFavorite: (ComicUiItem) -> Unit,
 ) {
     if (state.loading && state.items.isEmpty()) {
         CategoryGridSkeleton(reduceMotion)
@@ -291,7 +320,12 @@ private fun CategoryGrid(
         horizontalArrangement = Arrangement.spacedBy(9.dp),
     ) {
         items(state.items, key = ComicUiItem::key, contentType = { "category-comic" }) { comic ->
-            CategoryComicCard(comic) { onOpen(comic) }
+            CategoryComicCard(
+                comic = comic,
+                onClick = { onOpen(comic) },
+                isFavorite = comic.key in favoriteKeys,
+                onToggleFavorite = { onToggleFavorite(comic) },
+            )
         }
         if (state.loadingMore || state.error != null || !state.hasMore) {
             item(key = "category-tail", span = { GridItemSpan(maxLineSpan) }) {
@@ -317,15 +351,25 @@ private fun CategoryTail(state: CategoryUiState, onRetry: () -> Unit) {
 }
 
 @Composable
-private fun CategoryComicCard(comic: ComicUiItem, onClick: () -> Unit) {
+private fun CategoryComicCard(
+    comic: ComicUiItem,
+    onClick: () -> Unit,
+    isFavorite: Boolean,
+    onToggleFavorite: () -> Unit,
+) {
     val interactionSource = remember(comic.key) { MutableInteractionSource() }
     Column(Modifier.fillMaxWidth().clickable(interactionSource, LocalIndication.current, onClick = onClick)) {
-        ComicCover(
-            comic.coverUrl,
-            comic.title,
-            comic.accentIndex,
+        Box(
             Modifier.fillMaxWidth().aspectRatio(3f / 4f).clip(RoundedCornerShape(CpDimens.cardRadius)),
-        )
+        ) {
+            ComicCover(comic.coverUrl, comic.title, comic.accentIndex, Modifier.fillMaxSize())
+            com.comicplus.app.ui.components.FavoriteButton(
+                isFavorite = isFavorite,
+                onClick = onToggleFavorite,
+                modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
+                compact = true,
+            )
+        }
         Spacer(Modifier.height(8.dp))
         Text(
             comic.title,
@@ -338,13 +382,25 @@ private fun CategoryComicCard(comic: ComicUiItem, onClick: () -> Unit) {
 }
 
 @Composable
-private fun RankingList(items: List<ComicUiItem>, onOpen: (ComicUiItem) -> Unit) {
+private fun RankingList(
+    items: List<ComicUiItem>,
+    onOpen: (ComicUiItem) -> Unit,
+    favoriteKeys: Set<String>,
+    onToggleFavorite: (ComicUiItem) -> Unit,
+) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(horizontal = CpDimens.screenPadding, vertical = 4.dp),
     ) {
         itemsIndexed(items.take(20), key = { _, item -> item.key }, contentType = { _, _ -> "ranking-row" }) { index, comic ->
-            RankingRow(index + 1, comic, { onOpen(comic) }, prominent = index < 3)
+            RankingRow(
+                rank = index + 1,
+                comic = comic,
+                onClick = { onOpen(comic) },
+                prominent = index < 3,
+                isFavorite = comic.key in favoriteKeys,
+                onToggleFavorite = { onToggleFavorite(comic) },
+            )
             if (index >= 3 && index < minOf(items.size, 20) - 1) {
                 Box(Modifier.fillMaxWidth().padding(horizontal = 44.dp).height(1.dp).background(MaterialTheme.colorScheme.outlineVariant))
             }

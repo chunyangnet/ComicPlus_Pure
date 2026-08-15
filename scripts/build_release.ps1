@@ -37,7 +37,8 @@ $resolvedOutputRoot = [IO.Path]::GetFullPath($outputRoot).TrimEnd([IO.Path]::Dir
 Get-ChildItem -LiteralPath $resolvedOutputRoot -File | Where-Object {
     $_.Name -like "ComicPlus_Pure-*-debug.apk*" -or
     $_.Name -like "ComicPlus_Pure-*-release*.apk*" -or
-    $_.Name -like "Comic-Plus-*-release*.apk*"
+    $_.Name -like "Comic-Plus-*-release*.apk*" -or
+    $_.Name -like "Comic-Plus-release-v*.apk*"
 } | ForEach-Object {
     if (-not $_.FullName.StartsWith($resolvedOutputRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to remove file outside output directory: $($_.FullName)"
@@ -79,7 +80,7 @@ if ($actualSigner -ne $expectedSigner) {
     throw "Unexpected release signer. Expected $expectedSigner but received $actualSigner"
 }
 
-$destination = Join-Path $resolvedOutputRoot "Comic-Plus-$versionName-release.apk"
+$destination = Join-Path $resolvedOutputRoot "Comic-Plus-release-v$versionName.apk"
 Copy-Item -LiteralPath $sourceApk -Destination $destination -Force
 $hash = Get-FileHash -LiteralPath $destination -Algorithm SHA256
 $hashPath = "$destination.sha256"

@@ -2,6 +2,7 @@ package com.comicplus.pure
 
 import org.junit.Assert.assertEquals
 import org.junit.Test
+import org.json.JSONObject
 
 class JmGatewayProtocolTest {
     @Test
@@ -58,6 +59,14 @@ class JmGatewayProtocolTest {
         assertEquals(true, JmGateway.hasMoreSearchResults(2, 20, 20, 45, null))
         assertEquals(false, JmGateway.hasMoreSearchResults(3, 20, 5, 45, null))
         assertEquals(false, JmGateway.hasMoreSearchResults(1, 20, 20, 100, "255468"))
+    }
+
+    @Test
+    fun officialListPaginationUsesServerPageSize() {
+        assertEquals(true, JmGateway.hasMorePagedResults(1, 20, 20, 45))
+        assertEquals(true, JmGateway.hasMorePagedResults(2, 20, 20, 45))
+        assertEquals(false, JmGateway.hasMorePagedResults(3, 20, 5, 45))
+        assertEquals(false, JmGateway.hasMorePagedResults(1, 20, 0, 45))
     }
 
     @Test
@@ -125,6 +134,75 @@ class JmGatewayProtocolTest {
                 autoSelect = false,
                 preferredHosts = listOf("chosen.example", "fast.example", "fallback.example"),
             ).map(JmSourceEndpoint::host),
+        )
+    }
+
+    @Test
+    fun officialForumPayloadParsesAliasesAndNestedReplies() {
+        val page = parseJmCommentPage(
+            JSONObject(
+                """
+                {
+                  "total": "21",
+                  "list": [
+                    {
+                      "CID": "7",
+                      "UID": "42",
+                      "AID": "123",
+                      "username": "pilot",
+                      "nickname": "Captain",
+                      "content": "<p>Hello<br/>JM</p>",
+                      "photo": "https://cdn.example/avatar.jpg",
+                      "addtime": "2026-08-15 12:00:00",
+                      "likes": "3",
+                      "spoiler": "1",
+                      "replys": [
+                        {"cid": "8", "username": "reply", "comment": "Thanks", "parent_cid": "7"}
+                      ]
+                    }
+                  ]
+                }
+                """.trimIndent(),
+            ),
+            page = 1,
+        )
+
+        assertEquals(21L, page.total)
+        assertEquals(true, page.hasMore)
+        assertEquals("7", page.comments.single().id)
+        assertEquals("42", page.comments.single().userId)
+        assertEquals("Captain", page.comments.single().nickname)
+        assertEquals(3L, page.comments.single().likes)
+        assertEquals(true, page.comments.single().spoiler)
+        assertEquals("8", page.comments.single().replies.single().id)
+        assertEquals("7", page.comments.single().replies.single().parentId)
+    }
+
+    @Test
+    fun officialForumPayloadUsesStableFallbackIdsAndStopsAtReplyDepthLimit() {
+        val page = parseJmCommentPage(
+            JSONObject("""{"list":[{"content":"root","replies":[{"content":"reply","replies":[{"content":"deep","replies":[{"content":"too deep"}]}]}]}]}"""),
+            page = 3,
+        )
+
+        val root = page.comments.single()
+        assertEquals("3-1", root.id)
+        assertEquals("3-1-r1", root.replies.single().id)
+        assertEquals("3-1-r1-r1", root.replies.single().replies.single().id)
+        assertEquals(0, root.replies.single().replies.single().replies.size)
+    }
+
+    @Test
+    fun officialForumPaginationUsesTheTenItemServerPage() {
+        val tenComments = (1..10).joinToString(",") { index -> "{\"CID\":\"$index\"}" }
+
+        assertEquals(
+            true,
+            parseJmCommentPage(JSONObject("""{"total":"23","list":[$tenComments]}"""), page = 2).hasMore,
+        )
+        assertEquals(
+            false,
+            parseJmCommentPage(JSONObject("""{"total":"23","list":[{},{},{}]}"""), page = 3).hasMore,
         )
     }
 }

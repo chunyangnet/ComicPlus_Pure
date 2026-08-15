@@ -312,20 +312,84 @@ class JmGateway(context: Context) {
     }
 
     suspend fun category(slug: String, order: String = "mr", page: Int = 1): List<JmRanking> =
-        requestJson("/categories/filter?page=${page.coerceIn(1, 200)}&order=&c=${encode(slug.ifBlank { "0" })}&o=${order.allowedOrder()}")
-            .rankingItems("JM 分类")
+        categoryPage(slug, order, page).items
 
-    suspend fun categories(): List<JmCategory> = try {
-        requestJson("/categories").array("categories").objectsOrValues().mapNotNull { item ->
+    suspend fun categoryPage(slug: String, order: String = "mr", page: Int = 1): JmRankingPage {
+        val safePage = page.coerceIn(1, 200)
+        val payload = requestJson(
+            "/categories/filter?page=$safePage&order=&c=${encode(slug.ifBlank { "0" })}&o=${order.allowedOrder()}",
+        )
+        val items = payload.rankingItems("JM 分类")
+        val total = payload.long("total") ?: items.size.toLong()
+        return JmRankingPage(
+            page = safePage,
+            total = total.coerceAtLeast(items.size.toLong()),
+            items = items,
+            hasMore = payload.hasMorePage(safePage, items.size, total),
+        )
+    }
+
+    suspend fun categories(): List<JmCategory> = categoryCatalog().categories
+
+    suspend fun categoryCatalog(): JmCategoryCatalog = try {
+        val payload = requestJson("/categories")
+        val categories = payload.array("categories").objectsOrValues().mapNotNull { item ->
             val obj = item as? JSONObject ?: return@mapNotNull null
             val name = obj.string("name").trim()
             val slug = obj.string("slug").trim().ifBlank { "0" }
-            if (name.isBlank()) null else JmCategory(obj.string("id").ifBlank { slug }, name, slug, obj.long("total_albums"))
+            if (name.isBlank()) null else JmCategory(
+                obj.string("id").ifBlank { slug },
+                name,
+                slug,
+                obj.long("total_albums"),
+                obj.string("type").trim().ifBlank { "slug" },
+            )
         }.distinctBy(JmCategory::slug).ifEmpty { fallbackCategories }
+        val tagGroups = payload.array("blocks").objectsOrValues().mapNotNull { item ->
+            val obj = item as? JSONObject ?: return@mapNotNull null
+            val tags = obj.stringList("content").map(String::trim).filter(String::isNotBlank).distinct()
+            if (tags.isEmpty()) null else JmTagGroup(obj.string("title").trim().ifBlank { "标签" }, tags)
+        }.distinctBy(JmTagGroup::title)
+        JmCategoryCatalog(categories, tagGroups)
     } catch (error: CancellationException) {
         throw error
     } catch (_: Exception) {
-        fallbackCategories
+        JmCategoryCatalog(fallbackCategories, emptyList())
+    }
+
+    suspend fun weekCatalog(): JmWeekCatalog {
+        val payload = requestJson("/week")
+        val categories = payload.array("categories").objectsOrValues().mapNotNull { item ->
+            val obj = item as? JSONObject ?: return@mapNotNull null
+            val id = obj.string("id").trim().takeIf(String::isNotBlank) ?: return@mapNotNull null
+            val title = obj.string("title").trim().ifBlank { obj.string("time").trim() }.ifBlank { id }
+            JmWeekOption(id, title)
+        }.distinctBy(JmWeekOption::id)
+        val typeArray = payload.array("type").takeIf { it.length() > 0 } ?: payload.array("types")
+        val types = typeArray.objectsOrValues().mapNotNull { item ->
+            val obj = item as? JSONObject ?: return@mapNotNull null
+            val id = obj.string("id").trim().takeIf(String::isNotBlank) ?: return@mapNotNull null
+            JmWeekOption(id, obj.string("title").trim().ifBlank { obj.string("name").trim() }.ifBlank { id })
+        }.distinctBy(JmWeekOption::id)
+        if (categories.isEmpty() || types.isEmpty()) throw JmSourceException()
+        return JmWeekCatalog(categories, types)
+    }
+
+    suspend fun week(categoryId: String, typeId: String, page: Int = 1): JmRankingPage {
+        require(categoryId.isNotBlank()) { "每周必看分类无效" }
+        require(typeId.isNotBlank()) { "每周必看类型无效" }
+        val safePage = page.coerceIn(1, 200)
+        val payload = requestJson(
+            "/week/filter?page=$safePage&id=${encode(categoryId)}&type=${encode(typeId)}",
+        )
+        val items = payload.rankingItemsFrom("list", "JM 每周必看", preferResultImage = true)
+        val total = payload.long("total") ?: items.size.toLong()
+        return JmRankingPage(
+            page = safePage,
+            total = total.coerceAtLeast(items.size.toLong()),
+            items = items,
+            hasMore = payload.hasMorePage(safePage, items.size, total),
+        )
     }
 
     suspend fun discoverDomains(force: Boolean = false): List<String> {
@@ -399,6 +463,21 @@ class JmGateway(context: Context) {
             JmChapter(chapterId, sort, formatChapterTitle(item.string("name"), sort))
         }.sortedBy(JmChapter::index).distinctBy(JmChapter::index).ifEmpty { listOf(JmChapter(actualId, 1, "第 1 话")) }
         return JmComic(actualId, data.string("name").ifBlank { "JM$actualId" }, data.string("description"), coverUrl(actualId), data.stringList("author"), data.stringList("tags"), series, data.long("total_views"), data.long("likes"))
+    }
+
+    /** Read the official, anonymous forum for an album. Posting is intentionally out of scope. */
+    suspend fun comments(albumId: String, page: Int = 1): JmCommentPage {
+        require(albumId.matches(Regex("\\d{1,12}"))) { "JM 编号无效" }
+        val safePage = page.coerceIn(1, 200)
+        val payload = requestJson(
+            "/forum?page=$safePage&aid=${encode(albumId)}&mode=manhua",
+        )
+        val parsed = parseJmCommentPage(payload, safePage)
+        return parsed.copy(
+            comments = parsed.comments.map { comment ->
+                comment.withAvatarHost(domains.firstOrNull())
+            },
+        )
     }
 
     suspend fun chapter(id: String): JmChapterPages {
@@ -1643,11 +1722,33 @@ class JmGateway(context: Context) {
 
     private fun headers(timestamp: String, secret: String): Map<String, String> = mapOf("Accept" to "application/json", "Accept-Language" to "zh-CN,zh;q=0.9", "User-Agent" to APP_USER_AGENT, "token" to md5(timestamp + secret), "tokenparam" to "$timestamp,$APP_VERSION")
 
-    private fun JSONObject.rankingItems(badge: String, preferResultImage: Boolean = false): List<JmRanking> = array("content").objectsOrValues().mapIndexedNotNull { index, element ->
+    private fun JSONObject.rankingItems(badge: String, preferResultImage: Boolean = false): List<JmRanking> =
+        rankingItemsFrom("content", badge, preferResultImage)
+
+    private fun JSONObject.rankingItemsFrom(
+        key: String,
+        badge: String,
+        preferResultImage: Boolean = false,
+    ): List<JmRanking> = array(key).objectsOrValues().mapIndexedNotNull { index, element ->
         val item = element as? JSONObject ?: return@mapIndexedNotNull null
         val id = item.string("id").takeIf { it.matches(Regex("\\d{1,12}")) } ?: return@mapIndexedNotNull null
         val title = item.string("name").ifBlank { return@mapIndexedNotNull null }
-        JmRanking(id, title, item.string("image").takeIf { preferResultImage && it.startsWith("https://") } ?: coverUrl(id), item.long("total_views"), item.long("likes"), if (badge == "JM 热门") "$badge ${index + 1}" else badge, item.obj("category").string("title"))
+        val supporting = item.obj("category").string("title").ifBlank { item.string("author") }
+        JmRanking(
+            id,
+            title,
+            item.string("image").takeIf { preferResultImage && it.startsWith("https://") } ?: coverUrl(id),
+            item.long("total_views"),
+            item.long("likes"),
+            if (badge == "JM 热门") "$badge ${index + 1}" else badge,
+            supporting,
+        )
+    }
+
+    private fun JSONObject.hasMorePage(page: Int, loaded: Int, total: Long): Boolean {
+        if (loaded <= 0 || total <= loaded) return false
+        val pageSize = long("count")?.toInt()?.takeIf { it > 0 } ?: OFFICIAL_LIST_PAGE_SIZE
+        return hasMorePagedResults(page, pageSize, loaded, total)
     }
 
     private fun String.allowedOrder() = takeIf { it in officialOrders } ?: "mr"
@@ -1710,6 +1811,7 @@ class JmGateway(context: Context) {
         private const val SOURCE_LOAD_REUSE_MILLIS = 400L
         private const val SCRAMBLE_CACHE_MILLIS = 6L * 60L * 60L * 1_000L
         private const val OFFICIAL_SEARCH_PAGE_SIZE = 20
+        private const val OFFICIAL_LIST_PAGE_SIZE = 20
         private const val SCRAMBLE_268850 = 268850L
         private const val SCRAMBLE_421926 = 421926L
         private val builtInDomains = listOf("www.cdnhjk.net", "www.cdngwc.cc", "www.cdngwc.net", "www.cdngwc.club", "www.cdnhjk.cc", "www.cdnutc.me")
@@ -1825,6 +1927,8 @@ class JmGateway(context: Context) {
         }
         internal fun hasMoreSearchResults(page: Int, pageSize: Int, loaded: Int, total: Long, redirectAid: String?): Boolean =
             redirectAid == null && loaded > 0 && ((page.coerceAtLeast(1) - 1L) * pageSize.coerceAtLeast(1) + loaded) < total
+        internal fun hasMorePagedResults(page: Int, pageSize: Int, loaded: Int, total: Long): Boolean =
+            loaded > 0 && ((page.coerceAtLeast(1) - 1L) * pageSize.coerceAtLeast(1) + loaded) < total
         private fun imageSequence(fileName: String) = Regex("\\d+").find(fileName)?.value?.toLongOrNull() ?: Long.MAX_VALUE
         private fun formatChapterTitle(raw: String, sort: Int): String { val name = raw.trim(); if (name.isBlank()) return "第 $sort 话"; if (name.matches(Regex("^\\d+(?:\\.\\d+)?$"))) return "第 $name 话"; return if (name.contains('第') || name.contains('话') || name.contains('話') || name.contains('章')) name else "第 $sort 话 · $name" }
         private fun encode(value: String) = URLEncoder.encode(value, Charsets.UTF_8.name()).replace("+", "%20")
@@ -1909,6 +2013,98 @@ private fun JSONArray.objectsOrValues(): List<Any?> = buildList(length()) {
     for (index in 0 until length()) add(opt(index))
 }
 private fun Any?.primitiveContent(): String? = this?.toString()?.takeUnless { it == "null" }
+
+/**
+ * The forum payload has changed field casing over time (CID vs cid, replys vs replies),
+ * so keep the compatibility rules in one parser instead of leaking them into the UI.
+ */
+internal fun parseJmCommentPage(payload: JSONObject, page: Int = 1): JmCommentPage {
+    val root = payload.optJSONObject("data") ?: payload
+    val items = firstJsonArray(root, "list", "comments", "content", "data")
+        ?.objectsOrValues()
+        ?.mapIndexedNotNull { index, value ->
+            (value as? JSONObject)?.let { parseJmComment(it, "${page.coerceAtLeast(1)}-${index + 1}", 0) }
+        }
+        .orEmpty()
+    val total = firstJsonLong(root, "total", "count")?.coerceAtLeast(items.size.toLong())
+        ?: items.size.toLong()
+    return JmCommentPage(
+        page = page.coerceIn(1, 200),
+        total = total,
+        comments = items,
+        hasMore = JmGateway.hasMorePagedResults(
+            page = page,
+            pageSize = OFFICIAL_COMMENT_PAGE_SIZE,
+            loaded = items.size,
+            total = total,
+        ),
+    )
+}
+
+private const val MAX_COMMENT_REPLY_DEPTH = 2
+private const val OFFICIAL_COMMENT_PAGE_SIZE = 10
+
+private fun parseJmComment(value: JSONObject, fallbackId: String, depth: Int): JmComment {
+    val id = firstJsonString(value, "CID", "cid", "comment_id", "id").ifBlank { fallbackId }
+    val replies = if (depth >= MAX_COMMENT_REPLY_DEPTH) {
+        emptyList()
+    } else {
+        firstJsonArray(value, "replys", "replies", "reply")
+            ?.objectsOrValues()
+            ?.mapIndexedNotNull { index, child ->
+                (child as? JSONObject)?.let { parseJmComment(it, "$id-r${index + 1}", depth + 1) }
+            }
+            .orEmpty()
+    }
+    return JmComment(
+        id = id,
+        userId = firstJsonString(value, "UID", "uid", "user_id").takeIf(String::isNotBlank),
+        albumId = firstJsonString(value, "AID", "aid", "album_id").takeIf(String::isNotBlank),
+        username = firstJsonString(value, "username", "user_name", "name"),
+        nickname = firstJsonString(value, "nickname", "display_name"),
+        content = firstJsonString(value, "content", "comment", "text"),
+        avatarUrl = firstJsonString(value, "photo", "avatar", "avatar_url").takeIf(String::isNotBlank),
+        createdAt = firstJsonString(value, "addtime", "update_at", "created_at", "time"),
+        likes = firstJsonLong(value, "likes", "like", "like_count") ?: 0L,
+        parentId = firstJsonString(value, "parent_CID", "parent_cid", "parent_id").takeIf(String::isNotBlank),
+        spoiler = firstJsonString(value, "spoiler", "is_spoiler") in setOf("1", "true", "TRUE", "yes"),
+        replies = replies,
+    )
+}
+
+private fun JmComment.withAvatarHost(host: String?): JmComment = copy(
+    avatarUrl = avatarUrl?.trim()?.let { raw ->
+        when {
+            raw.startsWith("https://") -> raw
+            host.isNullOrBlank() -> null
+            raw.startsWith("/") -> "https://$host$raw"
+            else -> "https://$host/media/users/$raw"
+        }
+    },
+    replies = replies.map { reply -> reply.withAvatarHost(host) },
+)
+
+private fun firstJsonArray(value: JSONObject, vararg keys: String): JSONArray? {
+    keys.forEach { key ->
+        value.optJSONArray(key)?.let { return it }
+        val encoded = value.optString(key).trim()
+        if (encoded.startsWith("[")) {
+            runCatching { JSONArray(encoded) }.getOrNull()?.let { return it }
+        }
+    }
+    return null
+}
+
+private fun firstJsonString(value: JSONObject, vararg keys: String): String =
+    keys.asSequence()
+        .map { value.string(it).trim() }
+        .firstOrNull(String::isNotBlank)
+        .orEmpty()
+
+private fun firstJsonLong(value: JSONObject, vararg keys: String): Long? =
+    keys.asSequence()
+        .mapNotNull { value.long(it) }
+        .firstOrNull()
 
 internal fun parseCompactLong(raw: String): Long? {
     val normalized = raw.replace(",", "").trim()

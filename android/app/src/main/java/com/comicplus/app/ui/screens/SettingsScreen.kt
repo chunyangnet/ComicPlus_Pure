@@ -18,14 +18,17 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoDelete
 import androidx.compose.material.icons.outlined.Cached
@@ -38,6 +41,7 @@ import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.NetworkCheck
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Speed
+import androidx.compose.material.icons.outlined.SystemUpdateAlt
 import androidx.compose.material.icons.outlined.TouchApp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -64,6 +68,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.comicplus.app.ui.AppSettings
+import com.comicplus.app.ui.AppUpdateUiState
 import com.comicplus.app.ui.LocalComicPlusReduceMotion
 import com.comicplus.app.ui.ReaderDirection
 import com.comicplus.app.ui.ReaderImageQuality
@@ -83,6 +88,9 @@ import com.comicplus.pure.DownloadedChapter
 import com.comicplus.app.ui.JmSourceUiState
 import com.comicplus.app.ui.JmSourceUiItem
 import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -94,12 +102,17 @@ fun SettingsScreen(
     onSettingsChange: (AppSettings) -> Unit,
     onClearReaderCache: () -> Unit,
     sourceStatus: JmSourceUiState,
+    updateStatus: AppUpdateUiState,
     onRefreshSources: () -> Unit,
+    onCheckUpdates: (Boolean) -> Unit,
+    onOpenUpdate: (String) -> Unit,
     onOpenDownload: (DownloadedChapter) -> Unit,
     onDeleteDownload: (DownloadedChapter) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var pendingDelete by remember { mutableStateOf<DownloadedChapter?>(null) }
+    var showUpdateDetails by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { onCheckUpdates(false) }
     Column(modifier.fillMaxSize().background(Canvas)) {
         ComicPlusTopBar(title = "设置", subtitle = "纯本地设置与下载管理", actions = emptyList())
         LazyColumn(modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 32.dp)) {
@@ -252,6 +265,14 @@ fun SettingsScreen(
                 )
             }
             item {
+                SettingsSectionTitle("应用更新")
+                AppUpdateSettings(
+                    status = updateStatus,
+                    onCheck = { onCheckUpdates(true) },
+                    onShowDetails = { showUpdateDetails = true },
+                )
+            }
+            item {
                 SettingsSectionTitle("下载管理")
                 Surface(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = CpDimens.screenPadding, vertical = 4.dp),
@@ -290,7 +311,12 @@ fun SettingsScreen(
             }
             item {
                 SettingsSectionTitle("关于")
-                SettingsActionRow(Icons.Outlined.Info, "Comic Plus", "JM 官方源、本地阅读与下载", onClick = {})
+                SettingsActionRow(
+                    Icons.Outlined.Info,
+                    "Comic Plus",
+                    "当前版本 ${updateStatus.currentVersion.ifBlank { "未知" }}",
+                    onClick = { if (updateStatus.releaseUrl != null) showUpdateDetails = true },
+                )
                 Text(
                     "Comic Plus · 数据与下载仅保存在本机",
                     modifier = Modifier.fillMaxWidth().padding(top = 24.dp).navigationBarsPadding(),
@@ -316,6 +342,124 @@ fun SettingsScreen(
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("取消") } },
             containerColor = MaterialTheme.colorScheme.surface,
         )
+    }
+
+    val updateUrl = if (updateStatus.updateAvailable) {
+        updateStatus.downloadUrl ?: updateStatus.releaseUrl
+    } else {
+        updateStatus.releaseUrl
+    }
+    if (showUpdateDetails && updateUrl != null) {
+        AlertDialog(
+            onDismissRequest = { showUpdateDetails = false },
+            icon = { Icon(Icons.Outlined.SystemUpdateAlt, null, tint = MaterialTheme.colorScheme.primary) },
+            title = { Text(updateStatus.releaseName ?: "Comic Plus ${updateStatus.latestVersion.orEmpty()}") },
+            text = {
+                Column(
+                    Modifier.fillMaxWidth().heightIn(max = 430.dp).verticalScroll(rememberScrollState()),
+                ) {
+                    Text(
+                        "当前 ${updateStatus.currentVersion} · 最新 ${updateStatus.latestVersion.orEmpty()}",
+                        color = InkSoft,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    updateStatus.publishedAt?.let { publishedAt ->
+                        Text(
+                            "发布于 ${formatReleaseDate(publishedAt)}" + updateStatus.assetSize?.let { " · ${formatBytes(it)}" }.orEmpty(),
+                            modifier = Modifier.padding(top = 4.dp),
+                            color = Muted,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Text(
+                        updateStatus.notes.ifBlank { "本次发布未提供更新说明。" },
+                        modifier = Modifier.padding(top = 16.dp),
+                        color = Ink,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onOpenUpdate(updateUrl)
+                        showUpdateDetails = false
+                    },
+                ) {
+                    Text(if (updateStatus.updateAvailable && updateStatus.downloadUrl != null) "下载 APK" else "打开发布页")
+                }
+            },
+            dismissButton = { TextButton(onClick = { showUpdateDetails = false }) { Text("关闭") } },
+            containerColor = MaterialTheme.colorScheme.surface,
+        )
+    }
+}
+
+@Composable
+private fun AppUpdateSettings(
+    status: AppUpdateUiState,
+    onCheck: () -> Unit,
+    onShowDetails: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = CpDimens.screenPadding, vertical = 4.dp),
+        shape = RoundedCornerShape(CpDimens.cardRadius),
+        color = MaterialTheme.colorScheme.surface,
+    ) {
+        Column(Modifier.padding(15.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer) {
+                    Icon(
+                        Icons.Outlined.SystemUpdateAlt,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(8.dp).size(20.dp),
+                    )
+                }
+                Spacer(Modifier.width(11.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("GitHub Release", color = Ink, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold)
+                    Text(
+                        updateStatusSummary(status),
+                        color = if (status.error == null) Muted else MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp)
+                    .clickable(enabled = !status.checking, onClick = onCheck),
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.primaryContainer,
+            ) {
+                Row(Modifier.padding(horizontal = 13.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (status.checking) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            color = MaterialTheme.colorScheme.primary,
+                            strokeWidth = 2.dp,
+                        )
+                    } else {
+                        Icon(Icons.Outlined.Refresh, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                    }
+                    Spacer(Modifier.width(9.dp))
+                    Text(
+                        if (status.checking) "正在检查 GitHub Release" else "检查更新",
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+            if (status.releaseUrl != null) {
+                TextButton(
+                    onClick = onShowDetails,
+                    modifier = Modifier.align(Alignment.End).padding(top = 3.dp),
+                ) {
+                    Text("查看 ${status.latestVersion.orEmpty()} 更新详情")
+                }
+            }
+        }
     }
 }
 
@@ -491,6 +635,20 @@ private fun sourceStatusSummary(status: JmSourceUiState): String {
         else -> "接口 $available/${status.items.size} · 图片 $imageAvailable/${status.imageItems.size} · 最近检测 $updated"
     }
 }
+
+private fun updateStatusSummary(status: AppUpdateUiState): String = when {
+    status.checking -> "正在读取 GitHub 最新版本"
+    status.error != null -> "检查失败：${status.error}"
+    status.updateAvailable -> "发现新版本 ${status.latestVersion.orEmpty()}"
+    status.checked && status.latestVersion != null -> "已是最新版 · ${status.latestVersion}"
+    else -> "当前版本 ${status.currentVersion.ifBlank { "未知" }}"
+}
+
+private fun formatReleaseDate(value: String): String = runCatching {
+    Instant.parse(value).atZone(ZoneId.systemDefault()).format(RELEASE_DATE_FORMAT)
+}.getOrDefault(value)
+
+private val RELEASE_DATE_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
 
 @Composable
 private fun ReaderModeSettings(settings: AppSettings, onSettingsChange: (AppSettings) -> Unit) {

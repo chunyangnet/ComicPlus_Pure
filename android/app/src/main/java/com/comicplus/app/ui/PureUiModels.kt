@@ -20,6 +20,17 @@ data class ComicUiItem(
 
 val ComicUiItem.key: String get() = "$source:$jmId"
 
+/** A locally persisted reading entry. The comic snapshot keeps the library useful offline. */
+@Immutable
+data class ReadingHistoryItem(
+    val comic: ComicUiItem,
+    val chapterId: String? = null,
+    val chapterTitle: String? = null,
+    val pageIndex: Int = 0,
+    val pageCount: Int = 0,
+    val updatedAt: Long = 0L,
+)
+
 @Immutable
 data class JmSearchUiState(
     val query: String = "",
@@ -43,6 +54,79 @@ data class RankingsUiState(
     val jmLoading: Boolean = false,
     val jmLoaded: Boolean = false,
     val jmError: String? = null,
+)
+
+@Immutable
+data class JmBrowseOptionUi(
+    val id: String,
+    val title: String,
+)
+
+@Immutable
+data class JmTagGroupUi(
+    val title: String,
+    val tags: List<String>,
+)
+
+@Immutable
+data class JmWeeklyUiState(
+    val categories: List<JmBrowseOptionUi> = emptyList(),
+    val types: List<JmBrowseOptionUi> = emptyList(),
+    val selectedCategoryId: String = "",
+    val selectedTypeId: String = "",
+    val items: List<ComicUiItem> = emptyList(),
+    val total: Long = 0,
+    val catalogLoading: Boolean = false,
+    val loading: Boolean = false,
+    val loaded: Boolean = false,
+    val error: String? = null,
+)
+
+@Immutable
+data class JmTypeRankingUiState(
+    val selectedSlug: String = "doujin",
+    val order: String = "mv",
+    val items: List<ComicUiItem> = emptyList(),
+    val total: Long = 0,
+    val loading: Boolean = false,
+    val loaded: Boolean = false,
+    val error: String? = null,
+)
+
+@Immutable
+data class JmOfficialBrowseUiState(
+    val tagGroups: List<JmTagGroupUi> = emptyList(),
+    val catalogLoading: Boolean = false,
+    val catalogLoaded: Boolean = false,
+    val weekly: JmWeeklyUiState = JmWeeklyUiState(),
+    val typeRanking: JmTypeRankingUiState = JmTypeRankingUiState(),
+)
+
+@Immutable
+data class JmCommentUiItem(
+    val id: String,
+    val userId: String? = null,
+    val displayName: String = "JM 用户",
+    val username: String = "",
+    val content: String = "",
+    val avatarUrl: String? = null,
+    val createdAt: String = "",
+    val likes: Long = 0L,
+    val spoiler: Boolean = false,
+    val replies: List<JmCommentUiItem> = emptyList(),
+)
+
+@Immutable
+data class JmCommentsUiState(
+    val comicId: String = "",
+    val items: List<JmCommentUiItem> = emptyList(),
+    val page: Int = 0,
+    val total: Long = 0L,
+    val loading: Boolean = false,
+    val loadingMore: Boolean = false,
+    val loaded: Boolean = false,
+    val hasMore: Boolean = false,
+    val error: String? = null,
 )
 
 @Immutable
@@ -193,11 +277,13 @@ internal fun effectiveReaderPrefetchPages(
 data class PureUiState(
     val home: List<ComicUiItem> = emptyList(),
     val rankings: RankingsUiState = RankingsUiState(),
+    val officialBrowse: JmOfficialBrowseUiState = JmOfficialBrowseUiState(),
     val categories: List<DirectJmCategory> = emptyList(),
     val category: CategoryUiState = CategoryUiState(),
     val loading: Boolean = true,
     val search: JmSearchUiState = JmSearchUiState(),
     val detail: ComicResolveUiState = ComicResolveUiState.Idle,
+    val comments: JmCommentsUiState = JmCommentsUiState(),
     val reader: ReaderUiState = ReaderUiState.Idle,
     val settings: AppSettings = AppSettings(),
     val message: String? = null,
@@ -207,6 +293,9 @@ data class PureUiState(
     val discoveryLoading: Boolean = false,
     val discoveryExhausted: Boolean = false,
     val sourceStatus: JmSourceUiState = JmSourceUiState(),
+    val appUpdate: AppUpdateUiState = AppUpdateUiState(),
+    val favorites: List<ComicUiItem> = emptyList(),
+    val history: List<ReadingHistoryItem> = emptyList(),
 )
 
 @Immutable
@@ -225,4 +314,20 @@ data class JmSourceUiState(
 data class JmSourceUiItem(
     val host: String,
     val latencyMs: Long?,
+)
+
+@Immutable
+data class AppUpdateUiState(
+    val currentVersion: String = "",
+    val checking: Boolean = false,
+    val checked: Boolean = false,
+    val latestVersion: String? = null,
+    val releaseName: String? = null,
+    val notes: String = "",
+    val publishedAt: String? = null,
+    val releaseUrl: String? = null,
+    val downloadUrl: String? = null,
+    val assetSize: Long? = null,
+    val updateAvailable: Boolean = false,
+    val error: String? = null,
 )

@@ -10,16 +10,22 @@ import com.comicplus.app.data.source.DirectReaderPage
 import com.comicplus.app.data.source.SourceChapterDto
 import com.comicplus.app.data.source.SourceIds
 import com.comicplus.app.ui.AppSettings
+import com.comicplus.app.ui.AppUpdateUiState
 import com.comicplus.app.ui.CategoryUiState
 import com.comicplus.app.ui.ComicResolveUiState
 import com.comicplus.app.ui.ComicUiItem
 import com.comicplus.app.ui.JmSearchUiState
+import com.comicplus.app.ui.JmBrowseOptionUi
+import com.comicplus.app.ui.JmCommentUiItem
+import com.comicplus.app.ui.JmCommentsUiState
+import com.comicplus.app.ui.JmTagGroupUi
 import com.comicplus.app.ui.JmSourceUiState
 import com.comicplus.app.ui.JmSourceUiItem
 import com.comicplus.app.ui.PureUiState
 import com.comicplus.app.ui.RankingsUiState
 import com.comicplus.app.ui.ReaderUiState
 import com.comicplus.app.ui.ReaderChapterSegment
+import com.comicplus.app.ui.ReadingHistoryItem
 import com.comicplus.app.ui.key
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
@@ -43,8 +49,18 @@ class PureViewModel(
     private val gateway: JmGateway,
     private val downloadStore: DownloadStore,
     private val settingsStore: LocalSettingsStore,
+    private val releaseClient: GitHubReleaseClient,
+    currentVersion: String,
+    private val libraryStore: LibraryStore = LibraryStore(),
 ) : ViewModel() {
+    private data class CachedCommentPage(
+        val page: JmCommentPage,
+        val cachedAt: Long,
+    )
+
     private val initialSettings = settingsStore.load()
+    private val initialFavorites = libraryStore.loadFavorites()
+    private val initialHistory = libraryStore.loadHistory()
     private val cachedSourceSnapshot = gateway.apply {
         setSourcePreferences(
             autoSelect = initialSettings.autoSelectSource,
@@ -56,7 +72,10 @@ class PureViewModel(
         PureUiState(
             downloads = downloadStore.items.value,
             settings = initialSettings,
+            favorites = initialFavorites,
+            history = initialHistory,
             sourceStatus = cachedSourceSnapshot.toUiState(),
+            appUpdate = AppUpdateUiState(currentVersion = currentVersion),
         ),
     )
     val state: StateFlow<PureUiState> = _state.asStateFlow()
@@ -65,19 +84,31 @@ class PureViewModel(
     private var categoryCatalogJob: Job? = null
     private var categoryJob: Job? = null
     private var rankingJob: Job? = null
+    private var weeklyCatalogJob: Job? = null
+    private var weeklyJob: Job? = null
+    private var typeRankingJob: Job? = null
     private var searchJob: Job? = null
     private var detailJob: Job? = null
+    private var commentsJob: Job? = null
     private var readerJob: Job? = null
     private var readerWarmupJob: Job? = null
     private var lastProgressSignature: String? = null
     private val progressWriteMutex = Mutex()
+    private val libraryWriteMutex = Mutex()
     private var settingsSaveJob: Job? = null
     private var sourceRefreshJob: Job? = null
     private var sourceScheduleJob: Job? = null
+    private var updateCheckJob: Job? = null
     private val comicCache = Collections.synchronizedMap(
         object : LinkedHashMap<String, JmComic>(COMIC_CACHE_LIMIT, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, JmComic>?): Boolean =
                 size > COMIC_CACHE_LIMIT
+        },
+    )
+    private val commentCache = Collections.synchronizedMap(
+        object : LinkedHashMap<String, CachedCommentPage>(COMMENT_CACHE_LIMIT, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedCommentPage>?): Boolean =
+                size > COMMENT_CACHE_LIMIT
         },
     )
     private val downloadLimiter = Semaphore(permits = 2)
@@ -180,16 +211,229 @@ class PureViewModel(
         }
     }
 
-    fun loadCategories() {
-        if (_state.value.categories.isNotEmpty() || categoryCatalogJob?.isActive == true) return
-        categoryCatalogJob = viewModelScope.launch {
-            runCatching { gateway.categories() }
-                .onSuccess { categories ->
-                    _state.update { it.copy(categories = categories.map(JmCategory::toDirectCategory)) }
+    fun ensureOfficialBrowse() {
+        loadCategories()
+        loadWeeklyCatalog()
+        val ranking = _state.value.officialBrowse.typeRanking
+        if (!ranking.loading && !ranking.loaded) {
+            loadTypeRanking(ranking.selectedSlug, ranking.order)
+        }
+    }
+
+    fun loadWeeklyCatalog(force: Boolean = false) {
+        val current = _state.value.officialBrowse.weekly
+        if (!force && (current.catalogLoading || current.categories.isNotEmpty() && current.types.isNotEmpty())) return
+        weeklyCatalogJob?.cancel()
+        weeklyCatalogJob = viewModelScope.launch {
+            _state.update { state ->
+                state.copy(
+                    officialBrowse = state.officialBrowse.copy(
+                        weekly = state.officialBrowse.weekly.copy(catalogLoading = true, error = null),
+                    ),
+                )
+            }
+            runCatching { gateway.weekCatalog() }
+                .onSuccess { catalog ->
+                    val categoryOptions = catalog.categories.map { JmBrowseOptionUi(it.id, it.title) }
+                    val typeOptions = catalog.types.map { JmBrowseOptionUi(it.id, it.title) }
+                    val previous = _state.value.officialBrowse.weekly
+                    val categoryId = previous.selectedCategoryId.takeIf { id -> categoryOptions.any { it.id == id } }
+                        ?: categoryOptions.first().id
+                    val typeId = previous.selectedTypeId.takeIf { id -> typeOptions.any { it.id == id } }
+                        ?: typeOptions.first().id
+                    _state.update { state ->
+                        state.copy(
+                            officialBrowse = state.officialBrowse.copy(
+                                weekly = state.officialBrowse.weekly.copy(
+                                    categories = categoryOptions,
+                                    types = typeOptions,
+                                    selectedCategoryId = categoryId,
+                                    selectedTypeId = typeId,
+                                    catalogLoading = false,
+                                    error = null,
+                                ),
+                            ),
+                        )
+                    }
+                    loadWeekly(categoryId, typeId)
                 }
                 .onFailure { error ->
                     error.rethrowCancellation()
-                    _state.update { it.copy(message = error.readable()) }
+                    _state.update { state ->
+                        state.copy(
+                            officialBrowse = state.officialBrowse.copy(
+                                weekly = state.officialBrowse.weekly.copy(
+                                    catalogLoading = false,
+                                    loading = false,
+                                    error = error.readable(),
+                                ),
+                            ),
+                        )
+                    }
+                }
+        }
+    }
+
+    fun selectWeeklyCategory(categoryId: String) = loadWeekly(
+        categoryId = categoryId,
+        typeId = _state.value.officialBrowse.weekly.selectedTypeId,
+    )
+
+    fun selectWeeklyType(typeId: String) = loadWeekly(
+        categoryId = _state.value.officialBrowse.weekly.selectedCategoryId,
+        typeId = typeId,
+    )
+
+    fun loadWeekly(
+        categoryId: String = _state.value.officialBrowse.weekly.selectedCategoryId,
+        typeId: String = _state.value.officialBrowse.weekly.selectedTypeId,
+        force: Boolean = false,
+    ) {
+        if (categoryId.isBlank() || typeId.isBlank()) {
+            loadWeeklyCatalog(force)
+            return
+        }
+        val current = _state.value.officialBrowse.weekly
+        val sameFilter = current.selectedCategoryId == categoryId && current.selectedTypeId == typeId
+        if (!force && sameFilter && (current.loading || current.loaded)) return
+        weeklyJob?.cancel()
+        weeklyJob = viewModelScope.launch {
+            _state.update { state ->
+                val weekly = state.officialBrowse.weekly
+                val changingFilter = weekly.selectedCategoryId != categoryId || weekly.selectedTypeId != typeId
+                state.copy(
+                    officialBrowse = state.officialBrowse.copy(
+                        weekly = weekly.copy(
+                            selectedCategoryId = categoryId,
+                            selectedTypeId = typeId,
+                            items = if (changingFilter) emptyList() else weekly.items,
+                            total = if (changingFilter) 0 else weekly.total,
+                            loading = true,
+                            loaded = if (changingFilter) false else weekly.loaded,
+                            error = null,
+                        ),
+                    ),
+                )
+            }
+            runCatching { gateway.week(categoryId, typeId) }
+                .onSuccess { page ->
+                    _state.update { state ->
+                        val weekly = state.officialBrowse.weekly
+                        if (weekly.selectedCategoryId != categoryId || weekly.selectedTypeId != typeId) return@update state
+                        state.copy(
+                            officialBrowse = state.officialBrowse.copy(
+                                weekly = weekly.copy(
+                                    items = page.items.map(JmRanking::toUiItem),
+                                    total = page.total,
+                                    loading = false,
+                                    loaded = true,
+                                ),
+                            ),
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    error.rethrowCancellation()
+                    _state.update { state ->
+                        val weekly = state.officialBrowse.weekly
+                        if (weekly.selectedCategoryId != categoryId || weekly.selectedTypeId != typeId) return@update state
+                        state.copy(
+                            officialBrowse = state.officialBrowse.copy(
+                                weekly = weekly.copy(loading = false, error = error.readable()),
+                            ),
+                        )
+                    }
+                }
+        }
+    }
+
+    fun loadTypeRanking(
+        slug: String = _state.value.officialBrowse.typeRanking.selectedSlug,
+        order: String = _state.value.officialBrowse.typeRanking.order,
+        force: Boolean = false,
+    ) {
+        val safeSlug = slug.ifBlank { "doujin" }
+        val current = _state.value.officialBrowse.typeRanking
+        val sameFilter = current.selectedSlug == safeSlug && current.order == order
+        if (!force && sameFilter && (current.loading || current.loaded)) return
+        typeRankingJob?.cancel()
+        typeRankingJob = viewModelScope.launch {
+            _state.update { state ->
+                val ranking = state.officialBrowse.typeRanking
+                val changingFilter = ranking.selectedSlug != safeSlug || ranking.order != order
+                state.copy(
+                    officialBrowse = state.officialBrowse.copy(
+                        typeRanking = ranking.copy(
+                            selectedSlug = safeSlug,
+                            order = order,
+                            items = if (changingFilter) emptyList() else ranking.items,
+                            total = if (changingFilter) 0 else ranking.total,
+                            loading = true,
+                            loaded = if (changingFilter) false else ranking.loaded,
+                            error = null,
+                        ),
+                    ),
+                )
+            }
+            runCatching { gateway.categoryPage(safeSlug, order) }
+                .onSuccess { page ->
+                    _state.update { state ->
+                        val ranking = state.officialBrowse.typeRanking
+                        if (ranking.selectedSlug != safeSlug || ranking.order != order) return@update state
+                        state.copy(
+                            officialBrowse = state.officialBrowse.copy(
+                                typeRanking = ranking.copy(
+                                    items = page.items.map(JmRanking::toUiItem),
+                                    total = page.total,
+                                    loading = false,
+                                    loaded = true,
+                                ),
+                            ),
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    error.rethrowCancellation()
+                    _state.update { state ->
+                        val ranking = state.officialBrowse.typeRanking
+                        if (ranking.selectedSlug != safeSlug || ranking.order != order) return@update state
+                        state.copy(
+                            officialBrowse = state.officialBrowse.copy(
+                                typeRanking = ranking.copy(loading = false, error = error.readable()),
+                            ),
+                        )
+                    }
+                }
+        }
+    }
+
+    fun loadCategories() {
+        if (_state.value.officialBrowse.catalogLoaded || categoryCatalogJob?.isActive == true) return
+        categoryCatalogJob = viewModelScope.launch {
+            _state.update {
+                it.copy(officialBrowse = it.officialBrowse.copy(catalogLoading = true))
+            }
+            runCatching { gateway.categoryCatalog() }
+                .onSuccess { catalog ->
+                    _state.update {
+                        it.copy(
+                            categories = catalog.categories.map(JmCategory::toDirectCategory),
+                            officialBrowse = it.officialBrowse.copy(
+                                tagGroups = catalog.tagGroups.map { group -> JmTagGroupUi(group.title, group.tags) },
+                                catalogLoading = false,
+                                catalogLoaded = true,
+                            ),
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    error.rethrowCancellation()
+                    _state.update {
+                        it.copy(
+                            officialBrowse = it.officialBrowse.copy(catalogLoading = false),
+                            message = error.readable(),
+                        )
+                    }
                 }
         }
     }
@@ -372,17 +616,37 @@ class PureViewModel(
         _state.update { state -> state.copy(search = state.search.copy(redirectAid = null)) }
     }
 
-    fun openComic(item: ComicUiItem) = openComic(item.jmId)
+    fun openComic(item: ComicUiItem) = openComic(item.jmId, item)
 
-    fun openComic(id: String) {
+    fun openComic(id: String) = openComic(id, null)
+
+    private fun openComic(id: String, sourceItem: ComicUiItem?) {
         detailJob?.cancel()
+        commentsJob?.cancel()
         readerWarmupJob?.cancel()
         detailJob = viewModelScope.launch {
-            _state.update { it.copy(detail = ComicResolveUiState.Loading(SourceIds.Jm, id)) }
+            _state.update {
+                it.copy(
+                    detail = ComicResolveUiState.Loading(SourceIds.Jm, id),
+                    comments = JmCommentsUiState(comicId = id),
+                )
+            }
+            // The album and forum endpoints are independent. Start the forum request
+            // immediately so the comments tab is ready by the time the detail card settles.
+            loadComments(id)
             runCatching { comicCache[id] ?: gateway.comic(id).also { comicCache[id] = it } }
                 .onSuccess { comic ->
                     val progress = settingsStore.loadProgress(comic.id)
                     _state.update { it.copy(detail = comic.toResolveState(progress)) }
+                    val historyItem = comic.toUiItem().let { actual ->
+                        sourceItem?.let { seed ->
+                            actual.copy(
+                                subtitle = seed.subtitle.takeIf(String::isNotBlank) ?: actual.subtitle,
+                                metric = seed.metric.takeIf(String::isNotBlank) ?: actual.metric,
+                            )
+                        } ?: actual
+                    }
+                    recordHistorySnapshot(historyItem)
                     warmReaderEntry(comic, progress)
                 }
                 .onFailure { error ->
@@ -392,10 +656,200 @@ class PureViewModel(
         }
     }
 
+    private fun cachedCommentPage(comicId: String): JmCommentPage? {
+        val cached = commentCache[comicId] ?: return null
+        if (System.currentTimeMillis() - cached.cachedAt <= COMMENT_CACHE_TTL_MS) return cached.page
+        commentCache.remove(comicId, cached)
+        return null
+    }
+
+    private fun loadComments(comicId: String, page: Int = 1, force: Boolean = false) {
+        if (!comicId.matches(Regex("\\d{1,12}"))) return
+        val safePage = page.coerceIn(1, 200)
+        val current = _state.value.comments
+        if (
+            !force &&
+            safePage == 1 &&
+            current.comicId == comicId &&
+            (current.loading || current.loaded)
+        ) return
+        commentsJob?.cancel()
+        _state.update { state ->
+            val previous = state.comments.takeIf { it.comicId == comicId } ?: JmCommentsUiState(comicId = comicId)
+            state.copy(
+                comments = previous.copy(
+                    items = if (safePage == 1) emptyList() else previous.items,
+                    page = if (safePage == 1) 0 else previous.page,
+                    total = if (safePage == 1) 0L else previous.total,
+                    loading = safePage == 1,
+                    loadingMore = safePage > 1,
+                    loaded = if (safePage == 1) false else previous.loaded,
+                    hasMore = if (safePage == 1) false else previous.hasMore,
+                    error = null,
+                ),
+            )
+        }
+        commentsJob = viewModelScope.launch {
+            runCatching {
+                val cached = if (safePage == 1 && !force) cachedCommentPage(comicId) else null
+                cached ?: gateway.comments(comicId, safePage).also { result ->
+                    if (safePage == 1) {
+                        commentCache[comicId] = CachedCommentPage(result, System.currentTimeMillis())
+                    }
+                }
+            }
+                .onSuccess { result ->
+                    _state.update { state ->
+                        val previous = state.comments
+                        if (previous.comicId != comicId) return@update state
+                        state.copy(
+                            comments = previous.copy(
+                                items = if (safePage == 1) {
+                                    result.comments.map(JmComment::toUiItem).distinctBy(JmCommentUiItem::id)
+                                } else {
+                                    mergeCommentPage(previous.items, result.comments.map(JmComment::toUiItem))
+                                },
+                                page = result.page,
+                                total = result.total,
+                                loading = false,
+                                loadingMore = false,
+                                loaded = true,
+                                hasMore = result.hasMore,
+                                error = null,
+                            ),
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    error.rethrowCancellation()
+                    _state.update { state ->
+                        val previous = state.comments
+                        if (previous.comicId != comicId) return@update state
+                        state.copy(
+                            comments = previous.copy(
+                                loading = false,
+                                loadingMore = false,
+                                error = error.readable(),
+                            ),
+                        )
+                    }
+                }
+        }
+    }
+
+    fun retryComments() {
+        val current = _state.value.comments
+        if (current.comicId.isBlank()) return
+        val page = if (current.items.isNotEmpty() && current.page > 0) current.page + 1 else 1
+        loadComments(current.comicId, page, force = true)
+    }
+
+    fun loadMoreComments() {
+        val current = _state.value.comments
+        if (
+            current.comicId.isBlank() ||
+            current.loading ||
+            current.loadingMore ||
+            !current.loaded ||
+            !current.hasMore
+        ) return
+        loadComments(current.comicId, current.page + 1)
+    }
+
+    /** Toggle a comic in the local shelf and keep every visible card in sync. */
+    fun toggleFavorite(item: ComicUiItem) {
+        val wasFavorite = _state.value.favorites.any { it.key == item.key }
+        _state.update { state ->
+            state.copy(
+                favorites = if (wasFavorite) {
+                    state.favorites.filterNot { it.key == item.key }
+                } else {
+                    (listOf(item) + state.favorites.filterNot { it.key == item.key }).take(MAX_FAVORITE_ENTRIES)
+                },
+            )
+        }
+        viewModelScope.launch {
+            libraryWriteMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    libraryStore.setFavorite(item, !wasFavorite)
+                }
+            }
+        }
+    }
+
+    fun toggleFavorite(state: ComicResolveUiState.Ready) {
+        toggleFavorite(state.toUiItem())
+    }
+
+    fun recordHistory(
+        item: ComicUiItem,
+        chapterId: String? = null,
+        chapterTitle: String? = null,
+        pageIndex: Int = 0,
+        pageCount: Int = 0,
+    ) {
+        recordHistorySnapshot(item, chapterId, chapterTitle, pageIndex, pageCount)
+    }
+
+    fun clearHistory() {
+        _state.update { it.copy(history = emptyList()) }
+        viewModelScope.launch {
+            libraryWriteMutex.withLock {
+                withContext(Dispatchers.IO) { libraryStore.clearHistory() }
+            }
+        }
+    }
+
+    private fun recordHistorySnapshot(
+        item: ComicUiItem,
+        chapterId: String? = null,
+        chapterTitle: String? = null,
+        pageIndex: Int = 0,
+        pageCount: Int = 0,
+    ) {
+        val now = System.currentTimeMillis()
+        _state.update { state ->
+            val previous = state.history.firstOrNull { it.comic.key == item.key }
+            val sameChapter = chapterId != null && chapterId == previous?.chapterId
+            val entry = ReadingHistoryItem(
+                comic = item,
+                chapterId = chapterId ?: previous?.chapterId,
+                chapterTitle = chapterTitle ?: previous?.chapterTitle?.takeIf { chapterId == null || sameChapter },
+                pageIndex = when {
+                    pageCount > 0 -> pageIndex.coerceIn(0, pageCount - 1)
+                    chapterId != null -> pageIndex.coerceAtLeast(0)
+                    else -> previous?.pageIndex ?: 0
+                },
+                pageCount = when {
+                    pageCount > 0 -> pageCount
+                    sameChapter -> previous?.pageCount ?: 0
+                    chapterId == null -> previous?.pageCount ?: 0
+                    else -> 0
+                },
+                updatedAt = now,
+            )
+            state.copy(history = (listOf(entry) + state.history.filterNot { it.comic.key == item.key }).take(MAX_HISTORY_ENTRIES))
+        }
+        viewModelScope.launch {
+            libraryWriteMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    libraryStore.recordHistory(item, chapterId, chapterTitle, pageIndex, pageCount, now)
+                }
+            }
+        }
+    }
+
     fun dismissDetail() {
         detailJob?.cancel()
+        commentsJob?.cancel()
         readerWarmupJob?.cancel()
-        _state.update { it.copy(detail = ComicResolveUiState.Idle, reader = ReaderUiState.Idle) }
+        _state.update {
+            it.copy(
+                detail = ComicResolveUiState.Idle,
+                comments = JmCommentsUiState(),
+                reader = ReaderUiState.Idle,
+            )
+        }
     }
 
     private fun warmReaderEntry(comic: JmComic, progress: LocalReadingProgress?) {
@@ -445,6 +899,21 @@ class PureViewModel(
         preserveCurrent: Boolean,
     ) {
         val previousReader = _state.value.reader as? ReaderUiState.Ready
+        val historyItem = comicCache[comicId]?.toUiItem()
+            ?: (_state.value.detail as? ComicResolveUiState.Ready)?.takeIf { it.jmId == comicId }?.toUiItem()
+            ?: ComicUiItem(
+                jmId = comicId,
+                title = comicTitle,
+                subtitle = "JM 官方源",
+                metric = "",
+                accentIndex = comicId.takeLast(4).toIntOrNull() ?: comicTitle.hashCode(),
+            )
+        recordHistorySnapshot(
+            item = historyItem,
+            chapterId = chapter.sourceChapterId,
+            chapterTitle = chapter.title,
+            pageIndex = initialPageIndex,
+        )
         if (!_state.value.settings.dataSaver) {
             gateway.warmImageConnections(comicId, chapter.sourceChapterId)
         }
@@ -579,6 +1048,25 @@ class PureViewModel(
             if (detail.jmId != comicId) return@update state
             state.copy(detail = detail.copy(resumeChapterId = chapterId, resumePageIndex = safePageIndex))
         }
+        val current = _state.value
+        val reader = current.reader as? ReaderUiState.Ready
+        val detail = current.detail as? ComicResolveUiState.Ready
+        val historyItem = detail?.takeIf { it.jmId == comicId }?.toUiItem()
+            ?: comicCache[comicId]?.toUiItem()
+            ?: ComicUiItem(
+                jmId = comicId,
+                title = reader?.takeIf { it.sourceId == comicId }?.title ?: "JM$comicId",
+                subtitle = "JM 官方源",
+                metric = "",
+                accentIndex = comicId.takeLast(4).toIntOrNull() ?: 0,
+            )
+        recordHistorySnapshot(
+            item = historyItem,
+            chapterId = chapterId,
+            chapterTitle = reader?.takeIf { it.chapterId == chapterId }?.chapterTitle,
+            pageIndex = safePageIndex,
+            pageCount = pageCount,
+        )
     }
 
     private fun persistReaderProgress(comicId: String, chapterId: String, pageIndex: Int, pageCount: Int) {
@@ -658,6 +1146,49 @@ class PureViewModel(
         }
     }
 
+    fun checkForUpdates(force: Boolean = false) {
+        val current = _state.value.appUpdate
+        if (current.checking || !force && current.checked) return
+        updateCheckJob?.cancel()
+        updateCheckJob = viewModelScope.launch {
+            _state.update { state ->
+                state.copy(appUpdate = state.appUpdate.copy(checking = true, error = null))
+            }
+            runCatching { releaseClient.latest() }
+                .onSuccess { release ->
+                    _state.update { state ->
+                        state.copy(
+                            appUpdate = state.appUpdate.copy(
+                                checking = false,
+                                checked = true,
+                                latestVersion = release.version,
+                                releaseName = release.name,
+                                notes = release.notes,
+                                publishedAt = release.publishedAt,
+                                releaseUrl = release.releaseUrl,
+                                downloadUrl = release.downloadUrl,
+                                assetSize = release.assetSize,
+                                updateAvailable = isRemoteVersionNewer(state.appUpdate.currentVersion, release.version),
+                                error = null,
+                            ),
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    error.rethrowCancellation()
+                    _state.update { state ->
+                        state.copy(
+                            appUpdate = state.appUpdate.copy(
+                                checking = false,
+                                checked = true,
+                                error = error.message?.take(160).orEmpty().ifBlank { "无法连接 GitHub" },
+                            ),
+                        )
+                    }
+                }
+        }
+    }
+
     fun clearReaderCache() {
         viewModelScope.launch {
             runCatching { gateway.clearPageCache() }
@@ -706,6 +1237,19 @@ class PureViewModel(
                     ),
                 )
             }
+            recordHistorySnapshot(
+                item = ComicUiItem(
+                    jmId = item.comicId,
+                    title = item.comicTitle,
+                    subtitle = "本地下载",
+                    metric = "",
+                    accentIndex = item.comicId.takeLast(4).toIntOrNull() ?: item.comicTitle.hashCode(),
+                ),
+                chapterId = item.chapterId,
+                chapterTitle = item.chapterTitle,
+                pageIndex = resumePageIndex,
+                pageCount = item.pageCount,
+            )
         }
     }
 
@@ -807,8 +1351,12 @@ class PureViewModel(
     }
 
     override fun onCleared() {
+        weeklyCatalogJob?.cancel()
+        weeklyJob?.cancel()
+        typeRankingJob?.cancel()
         sourceRefreshJob?.cancel()
         sourceScheduleJob?.cancel()
+        updateCheckJob?.cancel()
         settingsStore.save(_state.value.settings)
         super.onCleared()
     }
@@ -819,6 +1367,9 @@ class PureViewModel(
             gateway = JmGateway(context),
             downloadStore = DownloadStore(context),
             settingsStore = LocalSettingsStore(context),
+            releaseClient = GitHubReleaseClient(),
+            currentVersion = context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty(),
+            libraryStore = LibraryStore(context),
         ) as T
     }
 }
@@ -836,6 +1387,47 @@ private fun JmRanking.toUiItem() = ComicUiItem(
     coverUrl = coverUrl,
 )
 
+private fun JmComic.toUiItem() = ComicUiItem(
+    jmId = id,
+    title = title,
+    subtitle = authors.take(2).joinToString(" · ").ifBlank { "JM 官方源" },
+    metric = likes?.let { "JM 收藏 ${it.compact()}" }
+        ?: views?.let { "JM 浏览 ${it.compact()}" }
+        ?: "",
+    accentIndex = id.takeLast(4).toIntOrNull() ?: title.hashCode(),
+    coverUrl = coverUrl,
+)
+
+private fun ComicResolveUiState.Ready.toUiItem() = ComicUiItem(
+    jmId = jmId,
+    title = title,
+    subtitle = "JM 官方源",
+    metric = "",
+    accentIndex = jmId.takeLast(4).toIntOrNull() ?: title.hashCode(),
+    coverUrl = coverUrl,
+    source = source,
+)
+
+private fun JmComment.toUiItem(): JmCommentUiItem {
+    val normalizedUsername = username.trim()
+    val normalizedNickname = nickname.trim()
+    return JmCommentUiItem(
+        id = id,
+        userId = userId,
+        displayName = normalizedNickname
+            .ifBlank { normalizedUsername }
+            .ifBlank { userId?.let { "JM$it" }.orEmpty() }
+            .ifBlank { "JM 用户" },
+        username = normalizedUsername,
+        content = content.trim(),
+        avatarUrl = avatarUrl?.trim()?.takeIf { it.startsWith("https://") },
+        createdAt = createdAt.trim(),
+        likes = likes.coerceAtLeast(0L),
+        spoiler = spoiler,
+        replies = replies.map(JmComment::toUiItem),
+    )
+}
+
 internal fun mergeComicPage(
     existing: List<ComicUiItem>,
     incoming: List<ComicUiItem>,
@@ -846,10 +1438,20 @@ internal fun mergeComicPage(
     }
 }
 
+internal fun mergeCommentPage(
+    existing: List<JmCommentUiItem>,
+    incoming: List<JmCommentUiItem>,
+): List<JmCommentUiItem> = buildList(existing.size + incoming.size) {
+    val seen = HashSet<String>(existing.size + incoming.size)
+    (existing + incoming).forEach { item ->
+        if (seen.add(item.id)) add(item)
+    }
+}
+
 internal fun shouldPublishProgress(previous: Float, current: Float, elapsedNanos: Long, completed: Boolean): Boolean =
     completed || current - previous >= 0.01f || elapsedNanos >= 150_000_000L
 
-private fun JmCategory.toDirectCategory() = DirectJmCategory(id, name, slug, "slug", totalAlbums)
+private fun JmCategory.toDirectCategory() = DirectJmCategory(id, name, slug, type, totalAlbums)
 
 private fun JmComic.toResolveState(progress: LocalReadingProgress?) = ComicResolveUiState.Ready(
     source = SourceIds.Jm,
@@ -920,5 +1522,9 @@ private fun parseJmId(raw: String): String? {
     }
 }
 
-private const val COMIC_CACHE_LIMIT = 48
+    private const val COMIC_CACHE_LIMIT = 48
+    private const val COMMENT_CACHE_LIMIT = 24
+    private const val COMMENT_CACHE_TTL_MS = 5L * 60L * 1_000L
+    private const val MAX_FAVORITE_ENTRIES = 200
+private const val MAX_HISTORY_ENTRIES = 100
 private const val SOURCE_REFRESH_INTERVAL_MS = 6L * 60L * 60L * 1_000L

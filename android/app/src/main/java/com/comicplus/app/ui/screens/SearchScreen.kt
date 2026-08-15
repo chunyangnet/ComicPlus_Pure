@@ -51,6 +51,7 @@ import com.comicplus.app.search.JmIdParser
 import com.comicplus.app.data.source.SourceIds
 import com.comicplus.app.ui.ComicUiItem
 import com.comicplus.app.ui.JmSearchUiState
+import com.comicplus.app.ui.key
 import com.comicplus.app.ui.components.CpDimens
 import com.comicplus.app.ui.components.PillRow
 import com.comicplus.app.ui.components.RankingRow
@@ -82,6 +83,7 @@ private val jmSearchOrders = listOf(
 fun SearchScreen(
     state: JmSearchUiState,
     initialQuery: String,
+    initialScope: Int,
     reduceMotion: Boolean,
     onBack: () -> Unit,
     onSearch: (String, Int, String) -> Unit,
@@ -90,9 +92,11 @@ fun SearchScreen(
     onRedirectConsumed: () -> Unit,
     onMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
+    favoriteKeys: Set<String> = emptySet(),
+    onToggleFavorite: (ComicUiItem) -> Unit = {},
 ) {
     var query by rememberSaveable(initialQuery) { mutableStateOf(initialQuery) }
-    var scopeId by rememberSaveable(initialQuery) { mutableIntStateOf(state.mainTag) }
+    var scopeId by rememberSaveable(initialQuery, initialScope) { mutableIntStateOf(initialScope.coerceIn(0, 4)) }
     var orderId by rememberSaveable(initialQuery) { mutableStateOf(state.order) }
     val parsed = remember(query) { JmIdParser.parse(query) }
     BackHandler(onBack = onBack)
@@ -157,6 +161,8 @@ fun SearchScreen(
                     state = state,
                     onOpen = onResolve,
                     onLoadMore = onLoadMore,
+                    favoriteKeys = favoriteKeys,
+                    onToggleFavorite = onToggleFavorite,
                     onRetry = {
                         if (state.page <= 0) onSearch(query, scopeId, orderId) else onLoadMore()
                     },
@@ -219,6 +225,8 @@ private fun SearchResultList(
     onOpen: (ComicUiItem) -> Unit,
     onLoadMore: () -> Unit,
     onRetry: () -> Unit,
+    favoriteKeys: Set<String>,
+    onToggleFavorite: (ComicUiItem) -> Unit,
 ) {
 	val listState = rememberLazyListState()
 	LaunchedEffect(listState, state.hasMore, state.loadingMore, state.items.size, state.error) {
@@ -254,6 +262,8 @@ private fun SearchResultList(
 				onClick = { onOpen(comic) },
 				prominent = false,
 				supportingText = listOf(comic.subtitle, comic.metric).filter(String::isNotBlank).joinToString("  ·  "),
+				isFavorite = comic.key in favoriteKeys,
+				onToggleFavorite = { onToggleFavorite(comic) },
 			)
         }
         if (state.loadingMore) item("loading-more") {
