@@ -27,17 +27,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Category
-import androidx.compose.material.icons.filled.EmojiEvents
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.outlined.Category
-import androidx.compose.material.icons.outlined.EmojiEvents
-import androidx.compose.material.icons.outlined.FavoriteBorder
-import androidx.compose.material.icons.outlined.Home
-import androidx.compose.material.icons.outlined.Settings
+import com.comicplus.app.ui.icons.ComicPlusIcons as Icons
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -128,7 +118,6 @@ fun PureApp() {
         reduceMotion = state.settings.reduceMotion,
     ) {
         GlobalSystemBars(
-            darkMode = state.settings.darkMode,
             readerVisible = state.reader !is ReaderUiState.Idle,
         )
         CompositionLocalProvider(LocalComicPlusReduceMotion provides state.settings.reduceMotion) {
@@ -156,6 +145,8 @@ fun PureApp() {
                             state = state.detail,
                             reduceMotion = state.settings.reduceMotion,
                             autoResumeReading = state.settings.autoResumeReading,
+                            chapterDescending = state.settings.chapterDescending,
+                            onChapterDescendingChange = viewModel::updateChapterSort,
                             onBack = viewModel::dismissDetail,
                             onShare = { detail -> shareComic(context, detail) { message -> scope.launch { snackbar.showSnackbar(message) } } },
                             onRead = { detail, chapter ->
@@ -282,6 +273,7 @@ fun PureApp() {
                                 MainTab.Library -> LibraryScreen(
                                     favorites = state.favorites,
                                     history = state.history,
+                                    signedIn = state.account.signedIn,
                                     onOpen = viewModel::openComic,
                                     onToggleFavorite = viewModel::toggleFavorite,
                                     onClearHistory = viewModel::clearHistory,
@@ -291,6 +283,10 @@ fun PureApp() {
                                 MainTab.Settings -> SettingsScreen(
                                     settings = state.settings,
                                     downloads = state.downloads,
+                                    account = state.account,
+                                    onLogin = viewModel::login,
+                                    onLogout = viewModel::logout,
+                                    onSyncFavorites = viewModel::syncOfficialFavorites,
                                     sourceStatus = state.sourceStatus,
                                     updateStatus = state.appUpdate,
                                     onSettingsChange = viewModel::updateSettings,
@@ -316,7 +312,8 @@ fun PureApp() {
 }
 
 @Composable
-private fun GlobalSystemBars(darkMode: Boolean, readerVisible: Boolean) {
+@Suppress("DEPRECATION") // Required to restore bar colors on pre-Android 15 devices.
+private fun GlobalSystemBars(readerVisible: Boolean) {
     val context = LocalContext.current
     val view = LocalView.current
     val window = context.findActivity()?.window
@@ -419,7 +416,7 @@ private fun shareComic(context: android.content.Context, state: ComicResolveUiSt
 
 private fun openExternalUrl(context: Context, url: String, onMessage: (String) -> Unit) {
     val uri = runCatching { url.toUri() }.getOrNull()
-    if (uri == null || uri.scheme !in setOf("https", "http")) {
+    if (uri == null || uri.scheme != "https") {
         onMessage("更新地址无效")
         return
     }

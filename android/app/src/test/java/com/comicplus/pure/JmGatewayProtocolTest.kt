@@ -1,8 +1,11 @@
 package com.comicplus.pure
 
 import org.junit.Assert.assertEquals
+import org.json.JSONArray
 import org.junit.Test
 import org.json.JSONObject
+import okhttp3.Cookie
+import okhttp3.HttpUrl.Companion.toHttpUrl
 
 class JmGatewayProtocolTest {
     @Test
@@ -47,11 +50,12 @@ class JmGatewayProtocolTest {
     }
 
     @Test
-    fun legacyDownloadsAreInvalidatedAfterExactScalingUpgrade() {
+    fun legacyDownloadsAreInvalidatedAfterSeamlessStitchingUpgrade() {
         assertEquals(false, isCompatibleDownload("255468", null))
         assertEquals(false, isCompatibleDownload("255468", "decode-v2"))
+        assertEquals(false, isCompatibleDownload("421927", "decode-v3"))
         assertEquals(false, isCompatibleDownload("200000", null))
-        assertEquals(true, isCompatibleDownload("421927", "decode-v3"))
+        assertEquals(true, isCompatibleDownload("421927", "decode-v4"))
     }
 
     @Test
@@ -67,6 +71,14 @@ class JmGatewayProtocolTest {
         assertEquals(true, JmGateway.hasMorePagedResults(2, 20, 20, 45))
         assertEquals(false, JmGateway.hasMorePagedResults(3, 20, 5, 45))
         assertEquals(false, JmGateway.hasMorePagedResults(1, 20, 0, 45))
+        assertEquals(false, JmGateway.hasMorePagedResults(200, 20, 20, Long.MAX_VALUE))
+        assertEquals(false, JmGateway.hasMoreSearchResults(200, 20, 20, Long.MAX_VALUE, null))
+        assertEquals(true, JmGateway.hasMorePagedResults(1, 20, 20, null))
+        assertEquals(false, JmGateway.hasMorePagedResults(1, 20, 19, null))
+        assertEquals(true, JmGateway.hasMoreSearchResults(2, 20, 20, null, null))
+        assertEquals(40L, JmGateway.normalizedPagedTotal(2, 20, 20, null))
+        assertEquals(45L, JmGateway.normalizedPagedTotal(3, 20, 5, 45L))
+        assertEquals(45L, JmGateway.normalizedPagedTotal(3, 20, 5, 1L))
     }
 
     @Test
@@ -88,6 +100,15 @@ class JmGatewayProtocolTest {
         assertEquals(35_000L, parseCompactLong("3.5万"))
         assertEquals(1_234_567L, parseCompactLong("1,234,567"))
         assertEquals(null, parseCompactLong("not-a-number"))
+    }
+
+    @Test
+    fun jsonIntegersRejectOverflowInsteadOfWrapping() {
+        assertEquals(Int.MAX_VALUE, parseJsonInt(Int.MAX_VALUE.toLong()))
+        assertEquals(Int.MIN_VALUE, parseJsonInt(Int.MIN_VALUE.toString()))
+        assertEquals(null, parseJsonInt(Int.MAX_VALUE.toLong() + 1L))
+        assertEquals(null, parseJsonInt(Long.MAX_VALUE))
+        assertEquals(null, parseJsonInt("1.5"))
     }
 
     @Test
@@ -193,6 +214,33 @@ class JmGatewayProtocolTest {
     }
 
     @Test
+    fun officialFavoritePayloadParsesAliasesAndBoundsItems() {
+        val page = parseFavoritePage(
+            JSONObject(
+                """
+                {
+                  "total": "21",
+                  "content": [
+                    {"aid":"123", "title":"Saved", "image":"cover.jpg", "author":"a,b"},
+                    {"id":"123", "name":"duplicate"},
+                    {"id":"bad", "name":"ignored"}
+                  ]
+                }
+                """.trimIndent(),
+            ),
+            page = 1,
+        )
+
+        assertEquals(21L, page.total)
+        assertEquals(true, page.hasMore)
+        assertEquals(1, page.items.size)
+        assertEquals("123", page.items.single().id)
+        assertEquals("Saved", page.items.single().title)
+        assertEquals(listOf("a", "b"), page.items.single().authors)
+        assertEquals("https://cover.invalid/media/albums/cover.jpg", page.items.single().coverUrl)
+    }
+
+    @Test
     fun officialForumPaginationUsesTheTenItemServerPage() {
         val tenComments = (1..10).joinToString(",") { index -> "{\"CID\":\"$index\"}" }
 
@@ -203,6 +251,87 @@ class JmGatewayProtocolTest {
         assertEquals(
             false,
             parseJmCommentPage(JSONObject("""{"total":"23","list":[{},{},{}]}"""), page = 3).hasMore,
+        )
+    }
+
+    @Test
+    fun officialForumPayloadCapsUntrustedItemsAndText() {
+        val hugeText = "x".repeat(25_000)
+        val comments = JSONArray().apply {
+            repeat(60) { index ->
+                put(JSONObject().put("CID", index + 1).put("content", hugeText))
+            }
+        }
+        val page = parseJmCommentPage(JSONObject().put("total", 60).put("list", comments))
+
+        assertEquals(50, page.comments.size)
+        assertEquals(20_000, page.comments.first().content.length)
+    }
+
+    @Test
+    fun sourceValidationRejectsLocalHostsAndNonSuccessImageProbes() {
+        assertEquals("example.com", JmGateway.normalizeRemoteDomain("example.com"))
+        assertEquals(null, JmGateway.normalizeRemoteDomain("localhost"))
+        assertEquals(null, JmGateway.normalizeRemoteDomain("reader.localhost"))
+        assertEquals(null, JmGateway.normalizeRemoteDomain("127.0.0.1"))
+        assertEquals(null, JmGateway.normalizeRemoteDomain("https://example.com:8443"))
+        assertEquals(null, JmGateway.normalizeRemoteDomain("intranet"))
+        assertEquals(null, JmGateway.normalizeRemoteDomain("https://example.com/setting"))
+        assertEquals(null, JmGateway.normalizeRemoteDomain("https://example.com?next=localhost"))
+        assertEquals(null, JmGateway.normalizeRemoteDomain("https://example.com/#fragment"))
+        assertEquals(null, JmGateway.normalizeRemoteDomain("https://user:secret@example.com"))
+        assertEquals(null, JmGateway.normalizeRemoteDomain("bad..example.com"))
+        assertEquals(null, JmGateway.normalizeRemoteDomain("-bad.example.com"))
+        assertEquals("https://cdn.example/avatar.jpg", JmGateway.normalizeRemoteHttpsUrl("https://cdn.example/avatar.jpg"))
+        assertEquals(null, JmGateway.normalizeRemoteHttpsUrl("https://localhost/avatar.jpg"))
+        assertEquals(null, JmGateway.normalizeRemoteHttpsUrl("https://user:secret@cdn.example/avatar.jpg"))
+        assertEquals(null, JmGateway.normalizeRemoteHttpsUrl("https://cdn.example:8443/avatar.jpg"))
+        assertEquals(true, JmGateway.isUsableImageProbeStatus(200))
+        assertEquals(true, JmGateway.isUsableImageProbeStatus(204))
+        assertEquals(false, JmGateway.isUsableImageProbeStatus(404))
+        assertEquals(false, JmGateway.isUsableImageProbeStatus(500))
+    }
+
+    @Test
+    fun cookieJarBoundsUntrustedCookieCountAndValueSize() {
+        val jar = MemoryCookieJar()
+        val url = "https://example.com/setting".toHttpUrl()
+        val cookies = (1..100).map { index ->
+            Cookie.Builder()
+                .name("c$index")
+                .value("ok")
+                .domain("example.com")
+                .build()
+        } + Cookie.Builder()
+            .name("oversized")
+            .value("x".repeat(5 * 1024))
+            .domain("example.com")
+            .build()
+
+        jar.saveFromResponse(url, cookies)
+
+        assertEquals(64, jar.loadForRequest(url).size)
+        assertEquals(false, jar.loadForRequest(url).any { it.name == "oversized" })
+    }
+
+    @Test
+    fun chapterImageOrderingDoesNotDropFilesWithSameOrMissingSequence() {
+        assertEquals(
+            listOf("1.jpg", "1.png", "cover.webp", "extra.jpeg"),
+            JmGateway.normalizeChapterImageFiles(listOf("extra.jpeg", "1.png", "cover.webp", "1.jpg", "1.JPG")),
+        )
+    }
+
+    @Test
+    fun commentPaginationInfersMoreOnlyFromFullPageWhenTotalIsMissing() {
+        val tenComments = (1..10).joinToString(",") { index -> "{\"CID\":\"$index\"}" }
+
+        val secondPage = parseJmCommentPage(JSONObject("""{"list":[$tenComments]}"""), page = 2)
+        assertEquals(true, secondPage.hasMore)
+        assertEquals(20L, secondPage.total)
+        assertEquals(
+            false,
+            parseJmCommentPage(JSONObject("""{"list":[{"CID":"1"}]}"""), page = 1).hasMore,
         )
     }
 }

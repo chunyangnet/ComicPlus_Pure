@@ -27,17 +27,25 @@ class LibraryStore(context: Context? = null) {
 
     /** Returns the new favorite state. */
     fun toggleFavorite(item: ComicUiItem): Boolean = synchronized(lock) {
+        val safeItem = item.sanitized() ?: return@synchronized false
         val current = readFavoritesLocked()
-        val alreadyFavorite = current.any { it.key == item.key }
-        val next = if (alreadyFavorite) current.filterNot { it.key == item.key } else listOf(item) + current
+        val alreadyFavorite = current.any { it.key == safeItem.key }
+        val next = if (alreadyFavorite) current.filterNot { it.key == safeItem.key } else listOf(safeItem) + current
         writeFavoritesLocked(next.take(MAX_FAVORITES))
         !alreadyFavorite
     }
 
     fun setFavorite(item: ComicUiItem, favorite: Boolean) = synchronized(lock) {
-        val current = readFavoritesLocked().filterNot { it.key == item.key }
-        val next = if (favorite) listOf(item) + current else current
+        val safeItem = item.sanitized() ?: return@synchronized
+        val current = readFavoritesLocked().filterNot { it.key == safeItem.key }
+        val next = if (favorite) listOf(safeItem) + current else current
         writeFavoritesLocked(next.take(MAX_FAVORITES))
+    }
+
+    fun replaceFavorites(items: List<ComicUiItem>) = synchronized(lock) {
+        writeFavoritesLocked(
+            items.mapNotNull(ComicUiItem::sanitized).distinctBy(ComicUiItem::key).take(MAX_FAVORITES),
+        )
     }
 
     fun recordHistory(
@@ -48,27 +56,31 @@ class LibraryStore(context: Context? = null) {
         pageCount: Int = 0,
         updatedAt: Long = System.currentTimeMillis(),
     ) = synchronized(lock) {
+        val safeItem = item.sanitized() ?: return@synchronized
+        val safeChapterId = chapterId?.trim()?.take(MAX_LIBRARY_ID_LENGTH)?.takeIf(String::isNotBlank)
+        val safeChapterTitle = chapterTitle?.trim()?.take(MAX_LIBRARY_FIELD_LENGTH)?.takeIf(String::isNotBlank)
+        val safePageCount = pageCount.coerceIn(0, MAX_HISTORY_PAGE_COUNT)
         val current = readHistoryLocked()
-        val previous = current.firstOrNull { it.comic.key == item.key }
-        val sameChapter = chapterId != null && chapterId == previous?.chapterId
+        val previous = current.firstOrNull { it.comic.key == safeItem.key }
+        val sameChapter = safeChapterId != null && safeChapterId == previous?.chapterId
         val entry = ReadingHistoryItem(
-            comic = item,
-            chapterId = chapterId ?: previous?.chapterId,
-            chapterTitle = chapterTitle ?: previous?.chapterTitle?.takeIf { chapterId == null || sameChapter },
+            comic = safeItem,
+            chapterId = safeChapterId ?: previous?.chapterId,
+            chapterTitle = safeChapterTitle ?: previous?.chapterTitle?.takeIf { safeChapterId == null || sameChapter },
             pageIndex = when {
-                pageCount > 0 -> pageIndex.coerceIn(0, pageCount - 1)
-                chapterId != null -> pageIndex.coerceAtLeast(0)
+                safePageCount > 0 -> pageIndex.coerceIn(0, safePageCount - 1)
+                safeChapterId != null -> pageIndex.coerceAtLeast(0).coerceAtMost(MAX_HISTORY_PAGE_COUNT - 1)
                 else -> previous?.pageIndex ?: 0
             },
             pageCount = when {
-                pageCount > 0 -> pageCount
-                sameChapter -> previous?.pageCount ?: 0
-                chapterId == null -> previous?.pageCount ?: 0
+                safePageCount > 0 -> safePageCount
+                sameChapter -> previous.pageCount
+                safeChapterId == null -> previous?.pageCount ?: 0
                 else -> 0
             },
-            updatedAt = updatedAt,
+            updatedAt = sanitizeTimestamp(updatedAt),
         )
-        writeHistoryLocked((listOf(entry) + current.filterNot { it.comic.key == item.key })
+        writeHistoryLocked((listOf(entry) + current.filterNot { it.comic.key == safeItem.key })
             .sortedByDescending(ReadingHistoryItem::updatedAt)
             .take(MAX_HISTORY))
     }
@@ -81,10 +93,11 @@ class LibraryStore(context: Context? = null) {
     private fun readFavoritesLocked(): List<ComicUiItem> {
         val raw = preferences?.getString(FAVORITES_KEY, null)
         if (raw == null) return memoryFavorites
+        val entryLimit = boundedLibraryEntryCount(raw, MAX_FAVORITES) ?: return emptyList()
         return runCatching {
             val array = JSONArray(raw)
-            buildList(array.length()) {
-                for (index in 0 until array.length()) {
+            buildList(entryLimit) {
+                for (index in 0 until entryLimit) {
                     array.optJSONObject(index)?.toComicItem()?.let(::add)
                 }
             }.distinctBy(ComicUiItem::key)
@@ -94,10 +107,11 @@ class LibraryStore(context: Context? = null) {
     private fun readHistoryLocked(): List<ReadingHistoryItem> {
         val raw = preferences?.getString(HISTORY_KEY, null)
         if (raw == null) return memoryHistory
+        val entryLimit = boundedLibraryEntryCount(raw, MAX_HISTORY) ?: return emptyList()
         return runCatching {
             val array = JSONArray(raw)
-            buildList(array.length()) {
-                for (index in 0 until array.length()) {
+            buildList(entryLimit) {
+                for (index in 0 until entryLimit) {
                     array.optJSONObject(index)?.toHistoryItem()?.let(::add)
                 }
             }.distinctBy { it.comic.key }
@@ -119,52 +133,114 @@ class LibraryStore(context: Context? = null) {
     }
 
     private fun ComicUiItem.toJson(): JSONObject = JSONObject()
-        .put("id", jmId)
-        .put("title", title)
-        .put("subtitle", subtitle)
-        .put("metric", metric)
+        .put("id", jmId.take(MAX_LIBRARY_ID_LENGTH))
+        .put("title", title.take(MAX_LIBRARY_TITLE_LENGTH))
+        .put("subtitle", subtitle.take(MAX_LIBRARY_FIELD_LENGTH))
+        .put("metric", metric.take(MAX_LIBRARY_FIELD_LENGTH))
         .put("accent", accentIndex)
-        .put("cover", coverUrl ?: JSONObject.NULL)
-        .put("source", source)
+        .put("cover", coverUrl?.take(MAX_LIBRARY_URL_LENGTH) ?: JSONObject.NULL)
+        .put("source", source.take(MAX_LIBRARY_FIELD_LENGTH))
 
     private fun JSONObject.toComicItem(): ComicUiItem? {
-        val id = optString("id").trim().takeIf(String::isNotBlank) ?: return null
+        val id = optString("id").trim().take(MAX_LIBRARY_ID_LENGTH).takeIf(String::isNotBlank) ?: return null
         return ComicUiItem(
             jmId = id,
-            title = optString("title", "JM$id"),
-            subtitle = optString("subtitle"),
-            metric = optString("metric"),
+            title = optString("title", "JM$id").take(MAX_LIBRARY_TITLE_LENGTH),
+            subtitle = optString("subtitle").take(MAX_LIBRARY_FIELD_LENGTH),
+            metric = optString("metric").take(MAX_LIBRARY_FIELD_LENGTH),
             accentIndex = optInt("accent", 0),
-            coverUrl = optString("cover").takeIf { it.isNotBlank() && it != "null" },
-            source = optString("source", "jm").ifBlank { "jm" },
+            coverUrl = optString("cover")
+                .take(MAX_LIBRARY_URL_LENGTH)
+                .takeIf { it.isNotBlank() && it != "null" }
+                ?.let { JmGateway.normalizeRemoteHttpsUrl(it) },
+            source = optString("source", "jm").take(MAX_LIBRARY_FIELD_LENGTH).ifBlank { "jm" },
         )
     }
 
     private fun ReadingHistoryItem.toJson(): JSONObject = JSONObject()
         .put("comic", comic.toJson())
-        .put("chapterId", chapterId ?: JSONObject.NULL)
-        .put("chapterTitle", chapterTitle ?: JSONObject.NULL)
+        .put("chapterId", chapterId?.take(MAX_LIBRARY_ID_LENGTH) ?: JSONObject.NULL)
+        .put("chapterTitle", chapterTitle?.take(MAX_LIBRARY_FIELD_LENGTH) ?: JSONObject.NULL)
         .put("pageIndex", pageIndex)
         .put("pageCount", pageCount)
-        .put("updatedAt", updatedAt)
+        .put("updatedAt", sanitizeTimestamp(updatedAt))
 
     private fun JSONObject.toHistoryItem(): ReadingHistoryItem? {
         val comic = optJSONObject("comic")?.toComicItem() ?: return null
+        val pageCount = optInt("pageCount", 0).coerceIn(0, MAX_HISTORY_PAGE_COUNT)
         return ReadingHistoryItem(
             comic = comic,
-            chapterId = optString("chapterId").takeIf { it.isNotBlank() && it != "null" },
-            chapterTitle = optString("chapterTitle").takeIf { it.isNotBlank() && it != "null" },
-            pageIndex = optInt("pageIndex", 0).coerceAtLeast(0),
-            pageCount = optInt("pageCount", 0).coerceAtLeast(0),
-            updatedAt = optLong("updatedAt", 0L),
+            chapterId = optString("chapterId").take(MAX_LIBRARY_ID_LENGTH).takeIf { it.isNotBlank() && it != "null" },
+            chapterTitle = optString("chapterTitle").take(MAX_LIBRARY_FIELD_LENGTH).takeIf { it.isNotBlank() && it != "null" },
+            pageIndex = optInt("pageIndex", 0).coerceIn(0, (pageCount - 1).coerceAtLeast(0)),
+            pageCount = pageCount,
+            updatedAt = sanitizeTimestamp(optLong("updatedAt", 0L)),
         )
     }
 
-    private companion object {
+    companion object {
         const val PREFERENCES_NAME = "comicplus_pure_library"
         const val FAVORITES_KEY = "favorites_v1"
         const val HISTORY_KEY = "history_v1"
         const val MAX_FAVORITES = 200
         const val MAX_HISTORY = 100
+        internal const val MAX_LIBRARY_JSON_CHARS = 512 * 1024
+        internal const val MAX_LIBRARY_ID_LENGTH = 128
+        internal const val MAX_LIBRARY_TITLE_LENGTH = 500
+        internal const val MAX_LIBRARY_FIELD_LENGTH = 512
+        internal const val MAX_LIBRARY_URL_LENGTH = 2_048
+        internal const val MAX_HISTORY_PAGE_COUNT = 20_000
+        internal const val MAX_FUTURE_TIMESTAMP_MILLIS = 24L * 60L * 60L * 1_000L
     }
+
+    fun replaceHistory(items: List<ReadingHistoryItem>) = synchronized(lock) {
+        writeHistoryLocked(
+            items.mapNotNull(ReadingHistoryItem::sanitized)
+                .distinctBy { it.comic.key }
+                .sortedByDescending(ReadingHistoryItem::updatedAt)
+                .take(MAX_HISTORY),
+        )
+    }
+}
+
+private fun ComicUiItem.sanitized(): ComicUiItem? {
+    val id = jmId.trim().take(LibraryStore.MAX_LIBRARY_ID_LENGTH).takeIf(String::isNotBlank) ?: return null
+    return copy(
+        jmId = id,
+        title = title.trim().take(LibraryStore.MAX_LIBRARY_TITLE_LENGTH).ifBlank { "JM$id" },
+        subtitle = subtitle.trim().take(LibraryStore.MAX_LIBRARY_FIELD_LENGTH),
+        metric = metric.trim().take(LibraryStore.MAX_LIBRARY_FIELD_LENGTH),
+        coverUrl = coverUrl?.trim()?.take(LibraryStore.MAX_LIBRARY_URL_LENGTH)
+            ?.takeIf(String::isNotBlank)
+            ?.let { JmGateway.normalizeRemoteHttpsUrl(it) },
+        source = source.trim().take(LibraryStore.MAX_LIBRARY_FIELD_LENGTH).ifBlank { "jm" },
+    )
+}
+
+private fun ReadingHistoryItem.sanitized(): ReadingHistoryItem? {
+    val safeComic = comic.sanitized() ?: return null
+    val safePageCount = pageCount.coerceIn(0, LibraryStore.MAX_HISTORY_PAGE_COUNT)
+    return copy(
+        comic = safeComic,
+        chapterId = chapterId?.trim()?.take(LibraryStore.MAX_LIBRARY_ID_LENGTH)?.takeIf(String::isNotBlank),
+        chapterTitle = chapterTitle?.trim()?.take(LibraryStore.MAX_LIBRARY_FIELD_LENGTH)?.takeIf(String::isNotBlank),
+        pageIndex = pageIndex.coerceIn(0, (safePageCount - 1).coerceAtLeast(0)),
+        pageCount = safePageCount,
+        updatedAt = sanitizeTimestamp(updatedAt),
+    )
+}
+
+private fun sanitizeTimestamp(value: Long): Long {
+    val now = System.currentTimeMillis().coerceAtLeast(0L)
+    val maximum = if (now > Long.MAX_VALUE - LibraryStore.MAX_FUTURE_TIMESTAMP_MILLIS) {
+        Long.MAX_VALUE
+    } else {
+        now + LibraryStore.MAX_FUTURE_TIMESTAMP_MILLIS
+    }
+    return value.coerceIn(0L, maximum)
+}
+
+internal fun boundedLibraryEntryCount(raw: String, maxItems: Int): Int? {
+    if (maxItems < 0 || raw.length !in 1..LibraryStore.MAX_LIBRARY_JSON_CHARS) return null
+    return runCatching { JSONArray(raw).length().coerceAtMost(maxItems) }.getOrNull()
 }

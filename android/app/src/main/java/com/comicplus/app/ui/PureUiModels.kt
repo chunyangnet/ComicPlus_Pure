@@ -129,6 +129,26 @@ data class JmCommentsUiState(
     val error: String? = null,
 )
 
+enum class JmAccountStatus {
+    SignedOut,
+    Restoring,
+    SigningIn,
+    SignedIn,
+    Error,
+}
+
+@Immutable
+data class JmAccountUiState(
+    val status: JmAccountStatus = JmAccountStatus.SignedOut,
+    val uid: String = "",
+    val username: String = "",
+    val favoriteCount: Long? = null,
+    val error: String? = null,
+    val syncing: Boolean = false,
+) {
+    val signedIn: Boolean get() = status == JmAccountStatus.SignedIn
+}
+
 @Immutable
 data class CategoryUiState(
     val selectedSlug: String = "0",
@@ -207,6 +227,7 @@ data class ReaderChapterSegment(
 data class AppSettings(
     val paletteKey: String = "ocean",
     val darkMode: Boolean = false,
+    val chapterDescending: Boolean = false,
     val readerPrefetchPages: Int = 3,
     val readerPrefetchMode: ReaderPrefetchMode = ReaderPrefetchMode.Smart,
     val readerPageSpacingDp: Int = 0,
@@ -284,6 +305,7 @@ data class PureUiState(
     val search: JmSearchUiState = JmSearchUiState(),
     val detail: ComicResolveUiState = ComicResolveUiState.Idle,
     val comments: JmCommentsUiState = JmCommentsUiState(),
+    val account: JmAccountUiState = JmAccountUiState(),
     val reader: ReaderUiState = ReaderUiState.Idle,
     val settings: AppSettings = AppSettings(),
     val message: String? = null,

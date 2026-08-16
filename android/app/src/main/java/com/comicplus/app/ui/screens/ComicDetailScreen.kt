@@ -25,20 +25,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.automirrored.outlined.ArrowForward
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.outlined.Share
-import androidx.compose.material.icons.outlined.Download
-import androidx.compose.material.icons.outlined.FavoriteBorder
-import androidx.compose.material.icons.outlined.CheckCircle
-import androidx.compose.material.icons.outlined.ChatBubbleOutline
-import androidx.compose.material.icons.outlined.Refresh
-import androidx.compose.material.icons.outlined.SwapVert
-import androidx.compose.material.icons.outlined.ThumbUp
-import androidx.compose.material.icons.outlined.Visibility
-import androidx.compose.material.icons.outlined.VisibilityOff
+import com.comicplus.app.ui.icons.ComicPlusIcons as Icons
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -61,9 +48,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.fromHtml
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -73,6 +58,7 @@ import com.comicplus.app.data.source.SourceChapterDto
 import com.comicplus.app.ui.ComicResolveUiState
 import com.comicplus.app.ui.JmCommentUiItem
 import com.comicplus.app.ui.JmCommentsUiState
+import com.comicplus.app.ui.markdownToAnnotatedString
 import com.comicplus.app.ui.components.ComicCover
 import com.comicplus.app.ui.components.CpDimens
 import com.comicplus.app.ui.components.FavoriteButton
@@ -96,6 +82,8 @@ fun ComicDetailScreen(
     state: ComicResolveUiState,
     reduceMotion: Boolean,
     autoResumeReading: Boolean,
+    chapterDescending: Boolean = false,
+    onChapterDescendingChange: (Boolean) -> Unit = {},
     onBack: () -> Unit,
     onShare: (ComicResolveUiState.Ready) -> Unit,
     onRead: (ComicResolveUiState.Ready, SourceChapterDto) -> Unit,
@@ -137,6 +125,8 @@ fun ComicDetailScreen(
             is ComicResolveUiState.Ready -> DetailReady(
                 state = state,
                 autoResumeReading = autoResumeReading,
+                chapterDescending = chapterDescending,
+                onChapterDescendingChange = onChapterDescendingChange,
                 onRead = onRead,
                 downloadedChapterIds = downloadedChapterIds,
                 downloadProgress = downloadProgress,
@@ -228,6 +218,8 @@ private fun DetailTopBarAction(
 private fun DetailReady(
     state: ComicResolveUiState.Ready,
     autoResumeReading: Boolean,
+    chapterDescending: Boolean,
+    onChapterDescendingChange: (Boolean) -> Unit,
     reduceMotion: Boolean,
     onRead: (ComicResolveUiState.Ready, SourceChapterDto) -> Unit,
     downloadedChapterIds: Set<String>,
@@ -255,7 +247,10 @@ private fun DetailReady(
         if (autoResumeReading && resumableChapterId != null) selectedChapterId = resumableChapterId
     }
     var query by rememberSaveable(state.jmId) { mutableStateOf("") }
-    var descending by rememberSaveable(state.jmId) { mutableStateOf(false) }
+    var descending by rememberSaveable(state.jmId) { mutableStateOf(chapterDescending) }
+    LaunchedEffect(chapterDescending, state.jmId) {
+        descending = chapterDescending
+    }
     val selectedChapter = chapters.firstOrNull { it.sourceChapterId == selectedChapterId } ?: chapters.first()
     val ranges = remember(chapters, descending) { buildChapterRanges(chapters, descending) }
     var selectedRangeKey by rememberSaveable(state.jmId) {
@@ -380,7 +375,11 @@ private fun DetailReady(
                                 )
                             }
                             Surface(
-                                modifier = Modifier.clickable { descending = !descending },
+                                modifier = Modifier.clickable {
+                                    val next = !descending
+                                    descending = next
+                                    onChapterDescendingChange(next)
+                                },
                                 shape = CircleShape,
                                 color = SurfaceSoft,
                             ) {
@@ -408,9 +407,9 @@ private fun DetailReady(
                         item(key = "chapter-ranges", contentType = "chapter-ranges") {
                             PillRow(
                                 labels = ranges.map(ChapterRange::label),
-                                selected = selectedRange.label,
-                                onSelected = { label ->
-                                    ranges.firstOrNull { it.label == label }?.let { range ->
+                                selectedIndex = ranges.indexOf(selectedRange),
+                                onSelected = { index ->
+                                    ranges.getOrNull(index)?.let { range ->
                                         selectedRangeKey = range.key
                                         scope.launch { chapterListState.animateScrollToItem(chapterContentStartIndex) }
                                     }
@@ -546,8 +545,8 @@ private fun OfficialCommentsHeader(
 @Composable
 private fun OfficialCommentItem(
     comment: JmCommentUiItem,
-    replyDepth: Int = 0,
     modifier: Modifier = Modifier,
+    replyDepth: Int = 0,
 ) {
     var spoilerVisible by rememberSaveable(comment.id, comment.spoiler) { mutableStateOf(!comment.spoiler) }
     val compact = replyDepth > 0
@@ -718,7 +717,7 @@ private fun CommentAvatar(
 private fun CommentText(content: String, compact: Boolean) {
     val source = content.ifBlank { "（无文字内容）" }
     val text = remember(source) {
-        runCatching { AnnotatedString.fromHtml(source) }.getOrElse { AnnotatedString(source) }
+        markdownToAnnotatedString(source)
     }
     Text(
         text = text,
@@ -941,12 +940,11 @@ private fun ComicDetailHeader(
     }
     if (state.description.isNotBlank()) {
         Spacer(Modifier.height(17.dp))
+        val description = remember(state.description) { markdownToAnnotatedString(state.description) }
         Text(
-            state.description,
+            text = description,
             color = InkSoft,
             style = MaterialTheme.typography.bodyMedium,
-            maxLines = 3,
-            overflow = TextOverflow.Ellipsis,
         )
     }
 }

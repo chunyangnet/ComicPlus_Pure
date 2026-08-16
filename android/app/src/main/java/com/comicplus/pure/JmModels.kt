@@ -1,6 +1,7 @@
 package com.comicplus.pure
 
 import androidx.compose.runtime.Immutable
+import java.io.IOException
 
 @Immutable
 data class JmRanking(
@@ -119,3 +120,40 @@ data class JmCommentPage(
     val comments: List<JmComment>,
     val hasMore: Boolean,
 )
+
+/** Account information returned by the official JM mobile API. */
+@Immutable
+data class JmAccount(
+    val uid: String,
+    val username: String,
+    val avatarUrl: String? = null,
+    val favoriteCount: Long? = null,
+)
+
+/** The only credential retained by the app is the short-lived AVS session cookie. */
+data class JmSession(
+    val uid: String,
+    val username: String,
+    val avs: String,
+)
+
+@Immutable
+data class JmFavoriteItem(
+    val id: String,
+    val title: String,
+    val description: String = "",
+    val coverUrl: String? = null,
+    val authors: List<String> = emptyList(),
+)
+
+@Immutable
+data class JmFavoritePage(
+    val page: Int,
+    val total: Long,
+    val items: List<JmFavoriteItem>,
+    val hasMore: Boolean,
+)
+
+class JmAuthException(message: String) : IOException(message)
+
+class JmApiException(message: String, val statusCode: Int? = null) : IOException(message)

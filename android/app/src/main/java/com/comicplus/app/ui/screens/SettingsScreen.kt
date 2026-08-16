@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -29,24 +30,14 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.AutoDelete
-import androidx.compose.material.icons.outlined.Cached
-import androidx.compose.material.icons.outlined.Check
-import androidx.compose.material.icons.outlined.ColorLens
-import androidx.compose.material.icons.outlined.DeleteSweep
-import androidx.compose.material.icons.outlined.DarkMode
-import androidx.compose.material.icons.outlined.Download
-import androidx.compose.material.icons.outlined.Info
-import androidx.compose.material.icons.outlined.NetworkCheck
-import androidx.compose.material.icons.outlined.Refresh
-import androidx.compose.material.icons.outlined.Speed
-import androidx.compose.material.icons.outlined.SystemUpdateAlt
-import androidx.compose.material.icons.outlined.TouchApp
+import androidx.compose.foundation.text.KeyboardOptions
+import com.comicplus.app.ui.icons.ComicPlusIcons as Icons
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -65,10 +56,16 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.comicplus.app.ui.AppSettings
 import com.comicplus.app.ui.AppUpdateUiState
+import com.comicplus.app.ui.JmAccountStatus
+import com.comicplus.app.ui.JmAccountUiState
+import com.comicplus.app.ui.markdownToAnnotatedString
 import com.comicplus.app.ui.LocalComicPlusReduceMotion
 import com.comicplus.app.ui.ReaderDirection
 import com.comicplus.app.ui.ReaderImageQuality
@@ -109,12 +106,22 @@ fun SettingsScreen(
     onOpenDownload: (DownloadedChapter) -> Unit,
     onDeleteDownload: (DownloadedChapter) -> Unit,
     modifier: Modifier = Modifier,
+    account: JmAccountUiState = JmAccountUiState(),
+    onLogin: (String, String) -> Unit = { _, _ -> },
+    onLogout: () -> Unit = {},
+    onSyncFavorites: () -> Unit = {},
 ) {
     var pendingDelete by remember { mutableStateOf<DownloadedChapter?>(null) }
     var showUpdateDetails by remember { mutableStateOf(false) }
+    var jmUsername by remember { mutableStateOf(account.username) }
+    var jmPassword by remember { mutableStateOf("") }
+    LaunchedEffect(account.username, account.status) {
+        if (account.username.isNotBlank()) jmUsername = account.username
+        if (account.status == JmAccountStatus.SignedIn) jmPassword = ""
+    }
     LaunchedEffect(Unit) { onCheckUpdates(false) }
     Column(modifier.fillMaxSize().background(Canvas)) {
-        ComicPlusTopBar(title = "设置", subtitle = "纯本地设置与下载管理", actions = emptyList())
+        ComicPlusTopBar(title = "设置", subtitle = "应用设置、JM 账号与下载管理", actions = emptyList())
         LazyColumn(modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 32.dp)) {
             item {
                 SettingsSectionTitle("外观")
@@ -252,6 +259,22 @@ fun SettingsScreen(
                 }
             }
             item {
+                SettingsSectionTitle("JM 官方账号")
+                JmAccountSettings(
+                    account = account,
+                    username = jmUsername,
+                    password = jmPassword,
+                    onUsernameChange = { jmUsername = it.take(128) },
+                    onPasswordChange = { jmPassword = it.take(512) },
+                    onLogin = {
+                        onLogin(jmUsername.trim(), jmPassword)
+                        jmPassword = ""
+                    },
+                    onLogout = onLogout,
+                    onSyncFavorites = onSyncFavorites,
+                )
+            }
+            item {
                 SettingsSectionTitle("本地存储")
                 SettingsActionRow(Icons.Outlined.AutoDelete, "清理阅读缓存", "删除已解码页面，不影响已下载章节", onClearReaderCache)
             }
@@ -318,7 +341,7 @@ fun SettingsScreen(
                     onClick = { if (updateStatus.releaseUrl != null) showUpdateDetails = true },
                 )
                 Text(
-                    "Comic Plus · 数据与下载仅保存在本机",
+                    "Comic Plus · 阅读记录与下载保存在本机，JM 收藏通过官方接口同步",
                     modifier = Modifier.fillMaxWidth().padding(top = 24.dp).navigationBarsPadding(),
                     color = Muted,
                     style = MaterialTheme.typography.bodySmall,
@@ -371,8 +394,11 @@ fun SettingsScreen(
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
+                    val releaseNotes = remember(updateStatus.notes) {
+                        markdownToAnnotatedString(updateStatus.notes.ifBlank { "本次发布未提供更新说明。" })
+                    }
                     Text(
-                        updateStatus.notes.ifBlank { "本次发布未提供更新说明。" },
+                        text = releaseNotes,
                         modifier = Modifier.padding(top = 16.dp),
                         color = Ink,
                         style = MaterialTheme.typography.bodyMedium,
@@ -392,6 +418,155 @@ fun SettingsScreen(
             dismissButton = { TextButton(onClick = { showUpdateDetails = false }) { Text("关闭") } },
             containerColor = MaterialTheme.colorScheme.surface,
         )
+    }
+}
+
+@Composable
+private fun JmAccountSettings(
+    account: JmAccountUiState,
+    username: String,
+    password: String,
+    onUsernameChange: (String) -> Unit,
+    onPasswordChange: (String) -> Unit,
+    onLogin: () -> Unit,
+    onLogout: () -> Unit,
+    onSyncFavorites: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = CpDimens.screenPadding, vertical = 4.dp),
+        shape = RoundedCornerShape(CpDimens.cardRadius),
+        color = MaterialTheme.colorScheme.surface,
+    ) {
+        Column(Modifier.padding(15.dp)) {
+            when (account.status) {
+                JmAccountStatus.SignedIn -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer) {
+                            Icon(
+                                Icons.Outlined.CheckCircle,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(8.dp).size(22.dp),
+                            )
+                        }
+                        Spacer(Modifier.width(11.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(account.username.ifBlank { "JM 官方账号" }, color = Ink, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold)
+                            Text(
+                                buildString {
+                                    append("UID ")
+                                    append(account.uid.ifBlank { "未知" })
+                                    account.favoriteCount?.let { append(" · 收藏 $it 部") }
+                                },
+                                color = Muted,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "收藏操作将通过 JM 官方接口同步到账号",
+                        color = Muted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    account.error?.takeIf(String::isNotBlank)?.let { error ->
+                        Text(
+                            error,
+                            modifier = Modifier.padding(top = 7.dp),
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Row(Modifier.align(Alignment.End), verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = onSyncFavorites, enabled = !account.syncing) {
+                            if (account.syncing) {
+                                CircularProgressIndicator(modifier = Modifier.size(17.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(17.dp))
+                            }
+                            Spacer(Modifier.width(5.dp))
+                            Text(if (account.syncing) "同步中" else "同步收藏")
+                        }
+                        TextButton(onClick = onLogout, enabled = !account.syncing) {
+                            Icon(Icons.Outlined.Close, contentDescription = null, modifier = Modifier.size(17.dp))
+                            Spacer(Modifier.width(5.dp))
+                            Text("退出登录")
+                        }
+                    }
+                }
+
+                JmAccountStatus.Restoring -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(11.dp))
+                        Column {
+                            Text("正在恢复 JM 登录状态", color = Ink, style = MaterialTheme.typography.bodyLarge)
+                            Text("正在读取官方收藏夹", color = Muted, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+
+                else -> {
+                    Text(
+                        "登录 JM 官方账号后，收藏会在设备间同步；密码不会保存在本机。",
+                        color = Muted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(11.dp))
+                    OutlinedTextField(
+                        value = username,
+                        onValueChange = onUsernameChange,
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        enabled = account.status != JmAccountStatus.SigningIn,
+                        label = { Text("JM 用户名") },
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                    )
+                    Spacer(Modifier.height(9.dp))
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = onPasswordChange,
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        enabled = account.status != JmAccountStatus.SigningIn,
+                        label = { Text("JM 密码") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Password,
+                            imeAction = ImeAction.Done,
+                        ),
+                    )
+                    account.error?.takeIf(String::isNotBlank)?.let { error ->
+                        Text(
+                            error,
+                            modifier = Modifier.padding(top = 8.dp),
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Spacer(Modifier.height(11.dp))
+                    Button(
+                        onClick = onLogin,
+                        enabled = account.status != JmAccountStatus.SigningIn && username.isNotBlank() && password.isNotEmpty(),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        if (account.status == JmAccountStatus.SigningIn) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                color = MaterialTheme.colorScheme.onPrimary,
+                                strokeWidth = 2.dp,
+                            )
+                            Spacer(Modifier.width(7.dp))
+                            Text("正在登录")
+                        } else {
+                            Icon(Icons.Outlined.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(7.dp))
+                            Text("登录 JM 官方账号")
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -34,8 +34,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Explore
+import com.comicplus.app.ui.icons.ComicPlusIcons as Icons
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -97,8 +96,10 @@ fun CategoryScreen(
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     LaunchedEffect(Unit) { onEnsureCategories() }
-    LaunchedEffect(categories.isNotEmpty()) {
-        if (categories.isNotEmpty() && state.page == 0 && !state.loading) onSelectOrder(state.order)
+    LaunchedEffect(categories.isNotEmpty(), state.page, state.loading, state.error) {
+        if (categories.isNotEmpty() && state.page == 0 && !state.loading && state.error == null) {
+            onSelectOrder(state.order)
+        }
     }
 
     Column(modifier.fillMaxSize().comicPlusDeviceTestTag(ComicPlusTestTags.BrowseScreen)) {
@@ -127,8 +128,8 @@ fun CategoryScreen(
                 val selectedOrder = categoryOrders.firstOrNull { it.id == state.order } ?: categoryOrders.first()
                 PillRow(
                     labels = categoryOrders.map(BrowseOrder::label),
-                    selected = selectedOrder.label,
-                    onSelected = { label -> categoryOrders.firstOrNull { it.label == label }?.let { onSelectOrder(it.id) } },
+                    selectedIndex = categoryOrders.indexOf(selectedOrder),
+                    onSelected = { index -> categoryOrders.getOrNull(index)?.let { onSelectOrder(it.id) } },
                     contentPadding = PaddingValues(horizontal = 8.dp),
                 )
                 Spacer(Modifier.height(12.dp))
@@ -190,8 +191,8 @@ fun RankingScreen(
         Spacer(Modifier.height(14.dp))
         PillRow(
             labels = rankingOrders.map(BrowseOrder::label),
-            selected = order.label,
-            onSelected = { label -> rankingOrders.firstOrNull { it.label == label }?.let { onSelectOrder(it.id) } },
+            selectedIndex = rankingOrders.indexOf(order),
+            onSelected = { index -> rankingOrders.getOrNull(index)?.let { onSelectOrder(it.id) } },
         )
         Spacer(Modifier.height(8.dp))
         AnimatedContent(
@@ -232,10 +233,10 @@ private fun BrowseSearch(
         query = query,
         onQueryChange = onQueryChange,
         onSearch = {
-            searchIntent?.sourceId?.let { id -> onResolve(ComicUiItem(id, "JM$id", "", "", 0)) }
+            searchIntent.sourceId?.let { id -> onResolve(ComicUiItem(id, "JM$id", "", "", 0)) }
                 ?: if (query.isBlank()) onMessage("输入漫画名或 JM ID") else onOpenSearch(query)
         },
-        hint = searchIntent?.sourceId?.let { "JM$it" },
+        hint = searchIntent.sourceId?.let { "JM$it" },
         placeholder = "搜索漫画或输入 JM ID",
         modifier = Modifier.padding(horizontal = CpDimens.screenPadding),
     )

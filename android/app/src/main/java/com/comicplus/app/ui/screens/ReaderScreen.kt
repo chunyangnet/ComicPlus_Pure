@@ -60,13 +60,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowLeft
-import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
-import androidx.compose.material.icons.outlined.FormatListNumbered
-import androidx.compose.material.icons.outlined.Refresh
-import androidx.compose.material.icons.outlined.Tune
+import com.comicplus.app.ui.icons.ComicPlusIcons as Icons
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -2106,26 +2100,26 @@ internal fun readerPrefetchPlan(
     if (pageCount <= 0 || distance <= 0) return emptyList()
     val safeCurrent = currentPageIndex.coerceIn(0, pageCount - 1)
     val forward = if (direction < 0) -1 else 1
+    fun side(step: Int): List<Int> = buildList(distance) {
+        for (offset in 1..distance) {
+            val index = safeCurrent + step * offset
+            if (index !in 0 until pageCount) break
+            add(index)
+        }
+    }
+    val primary = side(forward)
+    if (!includeOpposite) return primary
+    val opposite = side(-forward)
     val result = ArrayList<Int>(distance)
-    val primaryLimit = if (includeOpposite) (distance + 1) / 2 else distance
-    var offset = 1
-    while (result.size < primaryLimit && safeCurrent + forward * offset in 0 until pageCount) {
-        val primary = safeCurrent + forward * offset
-        result += primary
-        offset++
-    }
-    if (includeOpposite) {
-        offset = 1
-        while (result.size < distance && safeCurrent - forward * offset in 0 until pageCount) {
-            result += safeCurrent - forward * offset
-            offset++
-        }
-        var forwardOffset = result.count { index -> (index - safeCurrent) * forward > 0 } + 1
-        while (result.size < distance && safeCurrent + forward * forwardOffset in 0 until pageCount) {
-            result += safeCurrent + forward * forwardOffset
-            forwardOffset++
-        }
-    }
+    // Keep the established UX: spend roughly half the budget in the travel
+    // direction, then warm the opposite side. If an edge has fewer pages,
+    // consume the remaining budget from the other side instead of returning a
+    // short plan while valid pages are still available.
+    val primaryQuota = minOf((distance + 1) / 2, primary.size)
+    result += primary.take(primaryQuota)
+    result += opposite.take(distance - result.size)
+    if (result.size < distance) result += primary.drop(primaryQuota).take(distance - result.size)
+    if (result.size < distance) result += opposite.drop(distance - result.size).take(distance - result.size)
     return result.distinct().take(distance)
 }
 

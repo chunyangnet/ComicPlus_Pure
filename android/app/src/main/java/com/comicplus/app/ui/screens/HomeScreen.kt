@@ -28,8 +28,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Search
+import com.comicplus.app.ui.icons.ComicPlusIcons as Icons
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -146,14 +145,14 @@ fun HomeScreen(
                         query = query,
                         onQueryChange = { query = it },
                         onSearch = {
-                            searchIntent?.sourceId?.let { id -> onResolve(ComicUiItem(id, "JM$id", "", "", 0)) }
+                            searchIntent.sourceId?.let { id -> onResolve(ComicUiItem(id, "JM$id", "", "", 0)) }
                                 ?: if (query.isBlank()) {
                                     onMessage("请输入漫画名或 JM ID")
                                 } else {
                                     onOpenSearch(query)
                                 }
                         },
-                        hint = searchIntent?.sourceId?.let { "JM$it" },
+                        hint = searchIntent.sourceId?.let { "JM$it" },
                         placeholder = "搜索漫画或输入 JM ID",
                         focusRequester = searchFocusRequester,
                         modifier = Modifier.padding(horizontal = CpDimens.screenPadding),
@@ -185,9 +184,9 @@ fun HomeScreen(
                 val labels = listOf("精选") + categories.take(5).map(DirectJmCategory::name)
                 PillRow(
                     labels = labels,
-                    selected = "精选",
-                    onSelected = { label ->
-                        categories.firstOrNull { it.name == label }?.let(onOpenCategory)
+                    selectedIndex = 0,
+                    onSelected = { index ->
+                        categories.take(5).getOrNull(index - 1)?.let(onOpenCategory)
                     },
                 )
             }

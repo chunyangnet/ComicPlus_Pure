@@ -97,6 +97,22 @@ class ReaderPrefetchTest {
     }
 
     @Test
+    fun prefetchPlanFillsAvailablePagesAtChapterEdges() {
+        assertEquals(
+            listOf(8, 7, 6, 5),
+            readerPrefetchPlan(9, 10, 4, direction = 1, includeOpposite = true),
+        )
+        assertEquals(
+            listOf(1, 2, 3, 4),
+            readerPrefetchPlan(0, 10, 4, direction = -1, includeOpposite = true),
+        )
+        assertEquals(
+            listOf(6, 4, 3, 2, 1, 0),
+            readerPrefetchPlan(5, 7, 6, direction = 1, includeOpposite = true),
+        )
+    }
+
+    @Test
     fun rightToLeftPagerMappingIsReversible() {
         repeat(12) { readingIndex ->
             val pagerPage = readingIndexToPagerPage(readingIndex, 12, ReaderDirection.RightToLeft)

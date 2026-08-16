@@ -23,10 +23,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.outlined.AutoAwesome
-import androidx.compose.material.icons.outlined.Search
+import com.comicplus.app.ui.icons.ComicPlusIcons as Icons
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
@@ -124,29 +121,29 @@ fun SearchScreen(
             query = query,
             onQueryChange = { query = it.take(160) },
             onSearch = {
-                parsed?.sourceId?.let { id -> onResolve(ComicUiItem(id, "JM$id", "", "", 0, source = SourceIds.Jm)) }
+                parsed.sourceId?.let { id -> onResolve(ComicUiItem(id, "JM$id", "", "", 0, source = SourceIds.Jm)) }
                     ?: if (query.isBlank()) onMessage("输入作品、作者、标签或 JM ID")
                 else onSearch(query, scopeId, orderId)
             },
-            hint = parsed?.sourceId?.let { "JM$it · 直接打开" },
+            hint = parsed.sourceId?.let { "JM$it · 直接打开" },
             placeholder = "搜索漫画或输入 JM ID",
             modifier = Modifier.padding(horizontal = CpDimens.screenPadding),
         )
         Spacer(Modifier.height(13.dp))
         PillRow(
             labels = jmSearchScopes.map(JmSearchScope::label),
-            selected = jmSearchScopes.firstOrNull { it.id == scopeId }?.label ?: "综合",
-            onSelected = { label ->
-                scopeId = jmSearchScopes.first { it.label == label }.id
+            selectedIndex = jmSearchScopes.indexOfFirst { it.id == scopeId }.coerceAtLeast(0),
+            onSelected = { index ->
+                scopeId = jmSearchScopes.getOrNull(index)?.id ?: return@PillRow
                 if (state.submitted && query.isNotBlank()) onSearch(query, scopeId, orderId)
             },
         )
         Spacer(Modifier.height(8.dp))
         PillRow(
             labels = jmSearchOrders.map(JmSearchOrder::label),
-            selected = jmSearchOrders.firstOrNull { it.id == orderId }?.label ?: "最新",
-            onSelected = { label ->
-                orderId = jmSearchOrders.first { it.label == label }.id
+            selectedIndex = jmSearchOrders.indexOfFirst { it.id == orderId }.coerceAtLeast(0),
+            onSelected = { index ->
+                orderId = jmSearchOrders.getOrNull(index)?.id ?: return@PillRow
                 if (state.submitted && query.isNotBlank()) onSearch(query, scopeId, orderId)
             },
         )
@@ -255,13 +252,16 @@ private fun SearchResultList(
                 )
             }
         }
-        itemsIndexed(state.items, key = { _, item -> item.jmId }, contentType = { _, _ -> "jm-search-row" }) { index, comic ->
+        itemsIndexed(state.items, key = { _, item -> item.key }, contentType = { _, _ -> "jm-search-row" }) { index, comic ->
 			RankingRow(
 				rank = index + 1,
 				comic = comic,
 				onClick = { onOpen(comic) },
 				prominent = false,
-				supportingText = listOf(comic.subtitle, comic.metric).filter(String::isNotBlank).joinToString("  ·  "),
+				supportingText = listOfNotNull(
+					comic.subtitle.takeIf(String::isNotBlank),
+					comic.metric.takeIf(String::isNotBlank),
+				).joinToString("  ·  "),
 				isFavorite = comic.key in favoriteKeys,
 				onToggleFavorite = { onToggleFavorite(comic) },
 			)

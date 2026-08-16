@@ -30,18 +30,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.outlined.ChevronRight
-import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.FavoriteBorder
-import androidx.compose.material.icons.outlined.Search
+import com.comicplus.app.ui.icons.ComicPlusIcons as Icons
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -286,8 +280,8 @@ fun SearchCapsule(
 @Composable
 fun PillRow(
     labels: List<String>,
-    selected: String,
-    onSelected: (String) -> Unit,
+    selectedIndex: Int,
+    onSelected: (Int) -> Unit,
     modifier: Modifier = Modifier,
     contentPadding: PaddingValues = PaddingValues(horizontal = CpDimens.screenPadding),
 ) {
@@ -296,8 +290,9 @@ fun PillRow(
         contentPadding = contentPadding,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        items(labels, key = { it }) { label ->
-            Pill(label = label, selected = label == selected, onClick = { onSelected(label) })
+        items(labels.size, key = { index -> "pill-$index-${labels[index]}" }) { index ->
+            val label = labels[index]
+            Pill(label = label, selected = index == selectedIndex, onClick = { onSelected(index) })
         }
     }
 }

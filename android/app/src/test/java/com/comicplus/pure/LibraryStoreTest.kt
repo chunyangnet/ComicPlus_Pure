@@ -39,6 +39,60 @@ class LibraryStoreTest {
         assertEquals(10, history.first().pageCount)
     }
 
+    @Test
+    fun historyClampsCorruptProgressToTheChapterBounds() {
+        val store = LibraryStore()
+
+        store.recordHistory(
+            item = comic("7"),
+            chapterId = "70",
+            pageIndex = Int.MAX_VALUE,
+            pageCount = 3,
+        )
+
+        assertEquals(2, store.loadHistory().single().pageIndex)
+        assertEquals(3, store.loadHistory().single().pageCount)
+    }
+
+    @Test
+    fun favoriteSnapshotsBoundFieldsAndRejectBlankIds() {
+        val store = LibraryStore()
+        val oversized = comic("9").copy(title = "x".repeat(2_000), subtitle = "y".repeat(2_000))
+
+        assertTrue(store.toggleFavorite(oversized))
+        assertEquals(500, store.loadFavorites().single().title.length)
+        assertEquals(512, store.loadFavorites().single().subtitle.length)
+        assertFalse(store.toggleFavorite(oversized.copy(jmId = "  ")))
+    }
+
+    @Test
+    fun persistedSnapshotsHaveSizeAndEntryLimits() {
+        val oversizedArray = "[" + List(250) { "{}" }.joinToString(",") + "]"
+
+        assertEquals(200, boundedLibraryEntryCount(oversizedArray, 200))
+        assertEquals(0, boundedLibraryEntryCount("[]", 200))
+        assertEquals(null, boundedLibraryEntryCount("not-json", 200))
+        assertEquals(null, boundedLibraryEntryCount("x".repeat(512 * 1024 + 1), 200))
+    }
+
+    @Test
+    fun replacingAFullSnapshotMakesRapidUiMutationsConverge() {
+        val store = LibraryStore()
+        store.setFavorite(comic("1"), true)
+
+        store.replaceFavorites(listOf(comic("2"), comic("2"), comic("3")))
+
+        assertEquals(listOf("2", "3"), store.loadFavorites().map(ComicUiItem::jmId))
+    }
+
+    @Test
+    fun persistedCoverUrlsCannotSwitchToLocalOrCleartextSchemes() {
+        val store = LibraryStore()
+        store.toggleFavorite(comic("10").copy(coverUrl = "file:///data/user/0/private.jpg"))
+        store.replaceFavorites(listOf(comic("10"), comic("11").copy(coverUrl = "http://example.com/cover.jpg")))
+        assertEquals(listOf(null, null), store.loadFavorites().map(ComicUiItem::coverUrl))
+    }
+
     private fun comic(id: String) = ComicUiItem(
         jmId = id,
         title = "Comic $id",

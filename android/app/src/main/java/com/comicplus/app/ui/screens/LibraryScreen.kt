@@ -17,8 +17,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.DeleteSweep
+import com.comicplus.app.ui.icons.ComicPlusIcons as Icons
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -65,6 +64,7 @@ fun LibraryScreen(
     onToggleFavorite: (ComicUiItem) -> Unit,
     onClearHistory: () -> Unit,
     modifier: Modifier = Modifier,
+    signedIn: Boolean = false,
 ) {
     var sectionName by rememberSaveable { mutableStateOf(LibrarySection.Favorites.name) }
     var showClearDialog by remember { mutableStateOf(false) }
@@ -75,7 +75,8 @@ fun LibraryScreen(
         ComicPlusTopBar(
             title = "我的书架",
             subtitle = if (section == LibrarySection.Favorites) {
-                "仅保存在本机 · 收藏 ${favorites.size} 部"
+                if (signedIn) "JM 官方收藏同步 · 当前 ${favorites.size} 部"
+                else "本机收藏缓存 · 登录 JM 后同步"
             } else {
                 "仅保存在本机 · 最近阅读 ${history.size} 部"
             },
@@ -87,9 +88,9 @@ fun LibraryScreen(
         )
         PillRow(
             labels = listOf("收藏 ${favorites.size}", "历史记录 ${history.size}"),
-            selected = if (section == LibrarySection.Favorites) "收藏 ${favorites.size}" else "历史记录 ${history.size}",
-            onSelected = { label ->
-                sectionName = if (label.startsWith("收藏")) LibrarySection.Favorites.name else LibrarySection.History.name
+            selectedIndex = if (section == LibrarySection.Favorites) 0 else 1,
+            onSelected = { index ->
+                sectionName = if (index == 0) LibrarySection.Favorites.name else LibrarySection.History.name
             },
         )
         Spacer(Modifier.height(10.dp))

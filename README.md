@@ -2,8 +2,8 @@
 
 [![License: Personal Non-Commercial Learning](https://img.shields.io/badge/license-personal%20non--commercial-red.svg)](LICENSE)
 
-[Download](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.1.3/Comic-Plus-release-v1.1.3.apk)  | [下载](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.1.3/Comic-Plus-release-v1.1.3.apk)  | [ダウンロード](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.1.3/Comic-Plus-release-v1.1.3.apk)<br>
-[![Download](https://img.shields.io/badge/Download-Comic%20Plus-blue?style=flat&logo=android)](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.1.3/Comic-Plus-release-v1.1.3.apk)
+[Download](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.2.0/Comic-Plus-release-v1.2.0.apk)  | [下载](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.2.0/Comic-Plus-release-v1.2.0.apk)  | [ダウンロード](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.2.0/Comic-Plus-release-v1.2.0.apk)<br>
+[![Download](https://img.shields.io/badge/Download-Comic%20Plus-blue?style=flat&logo=android)](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.2.0/Comic-Plus-release-v1.2.0.apk)
 ---
 ## 简介 / Introduction / 紹介
 

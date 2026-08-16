@@ -21,6 +21,14 @@ class PureViewModelTest {
         assertEquals(true, shouldPublishProgress(0.99f, 1f, 1L, completed = true))
     }
 
+    @Test
+    fun paginationAcceptsOnlyTheRequestedForwardPage() {
+        assertEquals(true, isForwardPageResponse(previousPage = 1, requestedPage = 2, responsePage = 2))
+        assertEquals(false, isForwardPageResponse(previousPage = 2, requestedPage = 2, responsePage = 2))
+        assertEquals(false, isForwardPageResponse(previousPage = 1, requestedPage = 2, responsePage = 1))
+        assertEquals(false, isForwardPageResponse(previousPage = 1, requestedPage = 2, responsePage = 3))
+    }
+
     private fun comic(id: String) = ComicUiItem(
         jmId = id,
         title = "Comic $id",

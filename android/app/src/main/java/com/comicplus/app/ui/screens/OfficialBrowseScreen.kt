@@ -28,8 +28,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import com.comicplus.app.ui.icons.ComicPlusIcons as Icons
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -119,8 +118,10 @@ fun OfficialBrowseScreen(
         )
         PillRow(
             labels = OfficialBrowseSection.entries.map(OfficialBrowseSection::label),
-            selected = section.label,
-            onSelected = { label -> sectionName = OfficialBrowseSection.entries.first { it.label == label }.name },
+            selectedIndex = OfficialBrowseSection.entries.indexOf(section),
+            onSelected = { index ->
+                OfficialBrowseSection.entries.getOrNull(index)?.let { sectionName = it.name }
+            },
         )
         Spacer(Modifier.height(10.dp))
         AnimatedContent(
@@ -187,14 +188,14 @@ private fun WeeklyBrowse(
     Column(Modifier.fillMaxSize()) {
         PillRow(
             labels = state.categories.map { it.title },
-            selected = category.title,
-            onSelected = { label -> state.categories.firstOrNull { it.title == label }?.let { onSelectCategory(it.id) } },
+            selectedIndex = state.categories.indexOf(category),
+            onSelected = { index -> state.categories.getOrNull(index)?.let { onSelectCategory(it.id) } },
         )
         Spacer(Modifier.height(7.dp))
         PillRow(
             labels = state.types.map { it.title },
-            selected = type.title,
-            onSelected = { label -> state.types.firstOrNull { it.title == label }?.let { onSelectType(it.id) } },
+            selectedIndex = state.types.indexOf(type),
+            onSelected = { index -> state.types.getOrNull(index)?.let { onSelectType(it.id) } },
         )
         Spacer(Modifier.height(8.dp))
         OfficialRankingResults(
@@ -285,17 +286,17 @@ private fun TypeRankingBrowse(
     Column(Modifier.fillMaxSize()) {
         PillRow(
             labels = rankableCategories.map { it.name },
-            selected = category.name,
-            onSelected = { label ->
-                rankableCategories.firstOrNull { it.name == label }?.let { onSelect(it.slug, state.order) }
+            selectedIndex = rankableCategories.indexOf(category),
+            onSelected = { index ->
+                rankableCategories.getOrNull(index)?.let { onSelect(it.slug, state.order) }
             },
         )
         Spacer(Modifier.height(7.dp))
         PillRow(
             labels = officialRankingOrders.map(OfficialRankingOrder::label),
-            selected = order.label,
-            onSelected = { label ->
-                officialRankingOrders.firstOrNull { it.label == label }?.let { onSelect(category.slug, it.id) }
+            selectedIndex = officialRankingOrders.indexOf(order),
+            onSelected = { index ->
+                officialRankingOrders.getOrNull(index)?.let { onSelect(category.slug, it.id) }
             },
         )
         Spacer(Modifier.height(8.dp))
@@ -342,7 +343,7 @@ private fun OfficialRankingResults(
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
-            itemsIndexed(items, key = { _, item -> item.jmId }, contentType = { _, _ -> "official-ranking-row" }) { index, comic ->
+            itemsIndexed(items, key = { _, item -> item.key }, contentType = { _, _ -> "official-ranking-row" }) { index, comic ->
                 RankingRow(
                     rank = index + 1,
                     comic = comic,
