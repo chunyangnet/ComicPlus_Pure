@@ -38,12 +38,10 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
-import org.json.JSONArray
 import org.json.JSONObject
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.FormBody
-import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -65,22 +63,26 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
-data class JmSourceEndpoint(
-    val host: String,
-    val latencyMs: Long?,
-)
-
-data class JmSourceSnapshot(
-    val endpoints: List<JmSourceEndpoint>,
-    val selectedHost: String?,
-    val updatedAt: Long,
-    val imageEndpoints: List<JmSourceEndpoint> = emptyList(),
-    val selectedImageHost: String? = null,
-    val imageUpdatedAt: Long = 0L,
-)
-
 private data class FetchedImage(val url: String, val bytes: ByteArray)
 private data class OpenedImage(val url: String, val response: Response)
+private class FeatureRequestTracker(
+    val featureKey: String,
+    private val validator: (JSONObject) -> Boolean,
+) {
+    private val lock = Any()
+    private val rejectedHosts = LinkedHashSet<String>()
+    private var fallbackPayload: JSONObject? = null
+
+    fun accepts(payload: JSONObject): Boolean = runCatching { validator(payload) }.getOrDefault(false)
+
+    fun reject(host: String, payload: JSONObject) = synchronized(lock) {
+        rejectedHosts += host
+        if (fallbackPayload == null) fallbackPayload = payload
+    }
+
+    fun rejectedHostSnapshot(): List<String> = synchronized(lock) { rejectedHosts.toList() }
+    fun fallback(): JSONObject? = synchronized(lock) { fallbackPayload }
+}
 private data class PageDecodeProfile(
     val maxWidth: Int,
     val maxPixels: Long,
@@ -90,29 +92,19 @@ private data class PageDecodeProfile(
     val turboMode: Boolean,
 )
 
-private const val MAX_OFFICIAL_PAGE = 200
 private const val MAX_CHAPTER_PAGE_ITEMS = 20_000
-private const val MAX_ACCOUNT_FIELD_LENGTH = 128
 private const val MAX_PASSWORD_LENGTH = 512
 private const val MAX_AVS_LENGTH = 4 * 1024
 private const val MAX_ERROR_MESSAGE_LENGTH = 240
-private const val MAX_FAVORITE_SYNC_ITEMS = 200
-private const val MAX_FAVORITE_SYNC_PAGES = 10
-private const val MAX_FAVORITE_AUTHORS = 12
-private const val OFFICIAL_FAVORITE_PAGE_SIZE = 20
-// Kept at file scope because the favorite parser lives outside JmGateway's
-// companion object and must apply the same bounds to untrusted server data.
-private const val MAX_FAVORITE_TITLE_LENGTH = 500
-private const val MAX_FAVORITE_DESCRIPTION_LENGTH = 50_000
-private const val MAX_FAVORITE_FIELD_LENGTH = 512
-
+private val imageSequencePattern = Regex("\\d+")
+private val numericChapterTitlePattern = Regex("^\\d+(?:\\.\\d+)?$")
 /** JM 官方移动端协议适配器。 */
 class JmGateway(context: Context) {
     private val appContext = context.applicationContext
     private val sourcePreferences = appContext.getSharedPreferences(SOURCE_PREFERENCES_NAME, Context.MODE_PRIVATE)
     private val initialOfficialDomains = loadOfficialDomains()
     private val initialSourceSnapshot = loadSourceSnapshot(initialOfficialDomains)
-    private val cookies = MemoryCookieJar()
+    private val cookies = MemoryCookieJar(::updateAuthenticatedSessionFromCookie)
     private val client = OkHttpClient.Builder()
         .cookieJar(cookies)
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -138,6 +130,13 @@ class JmGateway(context: Context) {
         .callTimeout(SOURCE_PROBE_CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false)
         .build()
+    private val removeRouteChangeListener = SystemVpnMonitor.registerRouteChangeListener {
+        client.dispatcher.cancelAll()
+        sourceProbeClient.dispatcher.cancelAll()
+        client.connectionPool.evictAll()
+        sourceProbeClient.connectionPool.evictAll()
+        warmedImageHosts.clear()
+    }
     private val cacheDir = File(appContext.cacheDir, "jm-pure-pages").apply { mkdirs() }
     private val mainHandler = Handler(Looper.getMainLooper())
     private val maxConcurrentImageWork = imageWorkPermits(context)
@@ -164,6 +163,7 @@ class JmGateway(context: Context) {
     private val hedgePageWaiters = ConcurrentHashMap<String, AtomicInteger>()
     private val turboPageWaiters = ConcurrentHashMap<String, AtomicInteger>()
     private val visiblePageRequestCount = AtomicInteger()
+    private val pageNetworkPriority = PageNetworkPriorityGate()
     private val bitmapCache = object : LruCache<String, Bitmap>(bitmapCacheSizeKb(context)) {
         override fun sizeOf(key: String, value: Bitmap): Int =
             (value.allocationByteCount / 1024).coerceAtLeast(1)
@@ -180,14 +180,17 @@ class JmGateway(context: Context) {
                 size > PAGE_ASPECT_RATIO_CACHE_LIMIT
         },
     )
-    private val cookieMutex = Mutex()
+    // Different API hosts must initialize in parallel or the secondary host in
+    // a hedged request remains blocked behind a stalled primary connection.
+    private val cookieInitLocks = List(COOKIE_INIT_LOCK_STRIPES) { Mutex() }
     private val domainDiscoveryMutex = Mutex()
     private val sourceRefreshMutex = Mutex()
     private val scrambleMutex = Mutex()
     private val sourceStateLock = Any()
     private val initializedCookieHosts = ConcurrentHashMap.newKeySet<String>()
     private val failedImageHosts = ConcurrentHashMap<String, Long>()
-    private val warmedImageHosts = ConcurrentHashMap.newKeySet<String>()
+    private val warmedImageHosts = ConcurrentHashMap<String, Long>()
+    private val unavailableFeatureHosts = ConcurrentHashMap<String, Long>()
     @Volatile private var officialDomains: List<String> = initialOfficialDomains
     @Volatile private var sourceSnapshot: JmSourceSnapshot = initialSourceSnapshot
     @Volatile private var domains: List<String> = initialSourceSnapshot.endpoints.map(JmSourceEndpoint::host)
@@ -262,12 +265,14 @@ class JmGateway(context: Context) {
     /** Stop gateway-owned work when the ViewModel is permanently destroyed. */
     fun close() {
         if (!closed.compareAndSet(0, 1)) return
+        removeRouteChangeListener()
         cacheScope.cancel()
         mainHandler.removeCallbacksAndMessages(null)
         pageLoadsInFlight.values.forEach { it.cancel() }
         sourceLoadsInFlight.values.forEach { it.cancel() }
         pageLoadsInFlight.clear()
         sourceLoadsInFlight.clear()
+        unavailableFeatureHosts.clear()
         pageProgressCallbacks.clear()
         pageAspectRatioCallbacks.clear()
         bitmapCache.evictAll()
@@ -286,7 +291,15 @@ class JmGateway(context: Context) {
             preferredImageHost?.let(::add)
             addAll(rotatedImageDomains(chapterId))
         }.distinct().take(IMAGE_WARMUP_HOST_COUNT).forEach { host ->
-            if (!warmedImageHosts.add(host)) return@forEach
+            val warmedAt = SystemClock.elapsedRealtime()
+            val previousWarmup = warmedImageHosts[host]
+            if (isImageWarmupFresh(previousWarmup, warmedAt)) return@forEach
+            val reserved = if (previousWarmup == null) {
+                warmedImageHosts.putIfAbsent(host, warmedAt) == null
+            } else {
+                warmedImageHosts.replace(host, previousWarmup, warmedAt)
+            }
+            if (!reserved) return@forEach
             cacheScope.launch {
                 var call: okhttp3.Call? = null
                 try {
@@ -302,10 +315,10 @@ class JmGateway(context: Context) {
                     runInterruptible(Dispatchers.IO) { warmupCall.execute().close() }
                 } catch (error: CancellationException) {
                     call?.cancel()
-                    warmedImageHosts.remove(host)
+                    warmedImageHosts.remove(host, warmedAt)
                     throw error
                 } catch (_: Exception) {
-                    warmedImageHosts.remove(host)
+                    warmedImageHosts.remove(host, warmedAt)
                 }
             }
         }
@@ -316,6 +329,7 @@ class JmGateway(context: Context) {
         updateOfficialList: Boolean = true,
     ): JmSourceSnapshot = sourceRefreshMutex.withLock {
         if (closed.get() != 0) throw CancellationException("JM 网关已关闭")
+        if (force) unavailableFeatureHosts.clear()
         val candidates = (if (updateOfficialList) discoverDomains(force) else domains)
             .distinct()
             .take(MAX_SOURCE_PROBE_CANDIDATES)
@@ -368,8 +382,24 @@ class JmGateway(context: Context) {
         }
     }
 
-    suspend fun home(): List<JmRanking> = withContext(Dispatchers.IO) {
-        (category("0", "mv_t") + category("0", "mr")).distinctBy(JmRanking::id).take(40)
+    suspend fun home(): List<JmRanking> = supervisorScope {
+        suspend fun load(order: String): Result<List<JmRanking>> = try {
+            Result.success(category("0", order))
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            Result.failure(error)
+        }
+        val today = async { load("mv_t") }
+        val latest = async { load("mr") }
+        val (todayResult, latestResult) = awaitAll(today, latest)
+        if (todayResult.isFailure && latestResult.isFailure) {
+            throw todayResult.exceptionOrNull() ?: latestResult.exceptionOrNull() ?: JmSourceException()
+        }
+        mergeHomeRankings(
+            todayResult.getOrDefault(emptyList()),
+            latestResult.getOrDefault(emptyList()),
+        )
     }
 
     suspend fun category(slug: String, order: String = "mr", page: Int = 1): List<JmRanking> =
@@ -378,49 +408,58 @@ class JmGateway(context: Context) {
     suspend fun categoryPage(slug: String, order: String = "mr", page: Int = 1): JmRankingPage {
         val safeSlug = slug.trim().take(MAX_OPTION_ID_LENGTH).ifBlank { "0" }
         val safePage = page.coerceIn(1, MAX_OFFICIAL_PAGE)
+        val safeOrder = order.allowedOrder()
+        val featureKey = safeOrder.takeIf { safePage == 1 && it in timeLimitedRankingOrders }
+            ?.let { "time-ranking:$it" }
         val payload = requestJson(
-            "/categories/filter?page=$safePage&order=&c=${encode(safeSlug)}&o=${order.allowedOrder()}",
+            path = "/categories/filter?page=$safePage&order=&c=${encode(safeSlug)}&o=$safeOrder",
+            featureKey = featureKey,
+            featureValidator = { candidate -> candidate.hasUsableRankingPayload("content") },
         )
-        val items = payload.rankingItems("JM 分类")
-        val reportedTotal = payload.long("total")
-        val pageSize = payload.pageSize(OFFICIAL_LIST_PAGE_SIZE)
-        val total = normalizedPagedTotal(safePage, pageSize, items.size, reportedTotal)
-        return JmRankingPage(
-            page = safePage,
-            total = total,
-            items = items,
-            hasMore = payload.hasMorePage(safePage, items.size, reportedTotal),
-        )
+        return withContext(Dispatchers.Default) {
+            val items = payload.rankingItems("JM 分类")
+            val reportedTotal = payload.long("total")
+            val pageSize = payload.pageSize(OFFICIAL_LIST_PAGE_SIZE)
+            val total = normalizedPagedTotal(safePage, pageSize, items.size, reportedTotal)
+            JmRankingPage(
+                page = safePage,
+                total = total,
+                items = items,
+                hasMore = payload.hasMorePage(safePage, items.size, reportedTotal),
+            )
+        }
     }
 
     suspend fun categories(): List<JmCategory> = categoryCatalog().categories
 
     suspend fun categoryCatalog(): JmCategoryCatalog = try {
         val payload = requestJson("/categories")
-        val categories = payload.array("categories").objectsOrValues(MAX_CATALOG_ITEMS).mapNotNull { item ->
-            val obj = item as? JSONObject ?: return@mapNotNull null
-            val name = obj.string("name").trim().take(MAX_TITLE_LENGTH)
-            val slug = obj.string("slug").trim().take(MAX_OPTION_ID_LENGTH).ifBlank { "0" }
-            if (name.isBlank()) null else JmCategory(
-                obj.string("id").trim().take(MAX_OPTION_ID_LENGTH).ifBlank { slug },
-                name,
-                slug,
-                obj.long("total_albums")?.coerceAtLeast(0L),
-                obj.string("type").trim().take(MAX_OPTION_ID_LENGTH).ifBlank { "slug" },
-            )
-        }.distinctBy(JmCategory::slug).ifEmpty { fallbackCategories }
-        val tagGroups = payload.array("blocks").objectsOrValues(MAX_TAG_GROUPS).mapNotNull { item ->
-            val obj = item as? JSONObject ?: return@mapNotNull null
-            val tags = obj.stringList("content", MAX_LIST_ITEMS)
-                .map { it.trim().take(MAX_FIELD_LENGTH) }
-                .filter(String::isNotBlank)
-                .distinct()
-            if (tags.isEmpty()) null else JmTagGroup(
-                obj.string("title").trim().take(MAX_TITLE_LENGTH).ifBlank { "标签" },
-                tags,
-            )
-        }.distinctBy(JmTagGroup::title)
-        JmCategoryCatalog(categories, tagGroups)
+        withContext(Dispatchers.Default) {
+            val categories = payload.array("categories").objectsOrValues(MAX_CATALOG_ITEMS).mapNotNull { item ->
+                val obj = item as? JSONObject ?: return@mapNotNull null
+                val name = obj.string("name").trim().take(MAX_TITLE_LENGTH)
+                val slug = obj.string("slug").trim().take(MAX_OPTION_ID_LENGTH).ifBlank { "0" }
+                if (name.isBlank()) null else JmCategory(
+                    obj.string("id").trim().take(MAX_OPTION_ID_LENGTH).ifBlank { slug },
+                    name,
+                    slug,
+                    obj.long("total_albums")?.coerceAtLeast(0L),
+                    obj.string("type").trim().take(MAX_OPTION_ID_LENGTH).ifBlank { "slug" },
+                )
+            }.distinctBy(JmCategory::slug).ifEmpty { fallbackCategories }
+            val tagGroups = payload.array("blocks").objectsOrValues(MAX_TAG_GROUPS).mapNotNull { item ->
+                val obj = item as? JSONObject ?: return@mapNotNull null
+                val tags = obj.stringList("content", MAX_LIST_ITEMS)
+                    .map { it.trim().take(MAX_FIELD_LENGTH) }
+                    .filter(String::isNotBlank)
+                    .distinct()
+                if (tags.isEmpty()) null else JmTagGroup(
+                    obj.string("title").trim().take(MAX_TITLE_LENGTH).ifBlank { "标签" },
+                    tags,
+                )
+            }.distinctBy(JmTagGroup::title)
+            JmCategoryCatalog(categories, tagGroups)
+        }
     } catch (error: CancellationException) {
         throw error
     } catch (_: Exception) {
@@ -428,30 +467,36 @@ class JmGateway(context: Context) {
     }
 
     suspend fun weekCatalog(): JmWeekCatalog {
-        val payload = requestJson("/week")
-        val categories = payload.array("categories").objectsOrValues(MAX_CATALOG_ITEMS).mapNotNull { item ->
-            val obj = item as? JSONObject ?: return@mapNotNull null
-            val id = obj.string("id").trim().take(MAX_OPTION_ID_LENGTH)
-                .takeIf(String::isNotBlank) ?: return@mapNotNull null
-            val title = obj.string("title").trim().take(MAX_TITLE_LENGTH)
-                .ifBlank { obj.string("time").trim().take(MAX_TITLE_LENGTH) }
-                .ifBlank { id }
-            JmWeekOption(id, title)
-        }.distinctBy(JmWeekOption::id)
-        val typeArray = payload.array("type").takeIf { it.length() > 0 } ?: payload.array("types")
-        val types = typeArray.objectsOrValues(MAX_CATALOG_ITEMS).mapNotNull { item ->
-            val obj = item as? JSONObject ?: return@mapNotNull null
-            val id = obj.string("id").trim().take(MAX_OPTION_ID_LENGTH)
-                .takeIf(String::isNotBlank) ?: return@mapNotNull null
-            JmWeekOption(
-                id,
-                obj.string("title").trim().take(MAX_TITLE_LENGTH)
-                    .ifBlank { obj.string("name").trim().take(MAX_TITLE_LENGTH) }
-                    .ifBlank { id },
-            )
-        }.distinctBy(JmWeekOption::id)
-        if (categories.isEmpty() || types.isEmpty()) throw JmSourceException()
-        return JmWeekCatalog(categories, types)
+        val payload = requestJson(
+            path = "/week",
+            featureKey = FEATURE_WEEK_CATALOG,
+            featureValidator = JSONObject::hasUsableWeekCatalogPayload,
+        )
+        return withContext(Dispatchers.Default) {
+            val categories = payload.array("categories").objectsOrValues(MAX_CATALOG_ITEMS).mapNotNull { item ->
+                val obj = item as? JSONObject ?: return@mapNotNull null
+                val id = obj.string("id").trim().take(MAX_OPTION_ID_LENGTH)
+                    .takeIf(String::isNotBlank) ?: return@mapNotNull null
+                val title = obj.string("title").trim().take(MAX_TITLE_LENGTH)
+                    .ifBlank { obj.string("time").trim().take(MAX_TITLE_LENGTH) }
+                    .ifBlank { id }
+                JmWeekOption(id, title)
+            }.distinctBy(JmWeekOption::id)
+            val typeArray = payload.array("type").takeIf { it.length() > 0 } ?: payload.array("types")
+            val types = typeArray.objectsOrValues(MAX_CATALOG_ITEMS).mapNotNull { item ->
+                val obj = item as? JSONObject ?: return@mapNotNull null
+                val id = obj.string("id").trim().take(MAX_OPTION_ID_LENGTH)
+                    .takeIf(String::isNotBlank) ?: return@mapNotNull null
+                JmWeekOption(
+                    id,
+                    obj.string("title").trim().take(MAX_TITLE_LENGTH)
+                        .ifBlank { obj.string("name").trim().take(MAX_TITLE_LENGTH) }
+                        .ifBlank { id },
+                )
+            }.distinctBy(JmWeekOption::id)
+            if (categories.isEmpty() || types.isEmpty()) throw JmSourceException()
+            JmWeekCatalog(categories, types)
+        }
     }
 
     suspend fun week(categoryId: String, typeId: String, page: Int = 1): JmRankingPage {
@@ -461,18 +506,22 @@ class JmGateway(context: Context) {
         require(safeTypeId.isNotBlank()) { "每周必看类型无效" }
         val safePage = page.coerceIn(1, MAX_OFFICIAL_PAGE)
         val payload = requestJson(
-            "/week/filter?page=$safePage&id=${encode(safeCategoryId)}&type=${encode(safeTypeId)}",
+            path = "/week/filter?page=$safePage&id=${encode(safeCategoryId)}&type=${encode(safeTypeId)}",
+            featureKey = FEATURE_WEEK_RANKING.takeIf { safePage == 1 },
+            featureValidator = { candidate -> candidate.hasUsableRankingPayload("list") },
         )
-        val items = payload.rankingItemsFrom("list", "JM 每周必看", preferResultImage = true)
-        val reportedTotal = payload.long("total")
-        val pageSize = payload.pageSize(OFFICIAL_LIST_PAGE_SIZE)
-        val total = normalizedPagedTotal(safePage, pageSize, items.size, reportedTotal)
-        return JmRankingPage(
-            page = safePage,
-            total = total,
-            items = items,
-            hasMore = payload.hasMorePage(safePage, items.size, reportedTotal),
-        )
+        return withContext(Dispatchers.Default) {
+            val items = payload.rankingItemsFrom("list", "JM 每周必看", preferResultImage = true)
+            val reportedTotal = payload.long("total")
+            val pageSize = payload.pageSize(OFFICIAL_LIST_PAGE_SIZE)
+            val total = normalizedPagedTotal(safePage, pageSize, items.size, reportedTotal)
+            JmRankingPage(
+                page = safePage,
+                total = total,
+                items = items,
+                hasMore = payload.hasMorePage(safePage, items.size, reportedTotal),
+            )
+        }
     }
 
     suspend fun discoverDomains(force: Boolean = false): List<String> {
@@ -531,59 +580,66 @@ class JmGateway(context: Context) {
         require(normalized.isNotBlank()) { "请输入搜索内容" }
         val safePage = page.coerceIn(1, MAX_OFFICIAL_PAGE)
         val payload = requestJson("/search?main_tag=${mainTag.coerceIn(0, 4)}&search_query=${encode(normalized)}&page=$safePage&o=${order.allowedSearchOrder()}&t=a")
-        val items = payload.rankingItems("JM 搜索", preferResultImage = true)
-        val reportedTotal = payload.long("total")
-        val size = payload.pageSize(OFFICIAL_SEARCH_PAGE_SIZE)
-        val total = normalizedPagedTotal(safePage, size, items.size, reportedTotal)
-        val redirectAid = payload.string("redirect_aid").takeIf { it.matches(Regex("\\d{1,12}")) }
-        return JmSearchPage(
-            query = payload.string("search_query").trim().take(160).ifBlank { normalized },
-            page = safePage,
-            total = total,
-            redirectAid = redirectAid,
-            items = items,
-            hasMore = hasMoreSearchResults(safePage, size, items.size, reportedTotal, redirectAid),
-        )
+        return withContext(Dispatchers.Default) {
+            val items = payload.rankingItems("JM 搜索", preferResultImage = true)
+            val reportedTotal = payload.long("total")
+            val size = payload.pageSize(OFFICIAL_SEARCH_PAGE_SIZE)
+            val total = normalizedPagedTotal(safePage, size, items.size, reportedTotal)
+            val redirectAid = payload.string("redirect_aid").takeIf(safeNumericId::matches)
+            JmSearchPage(
+                query = payload.string("search_query").trim().take(160).ifBlank { normalized },
+                page = safePage,
+                total = total,
+                redirectAid = redirectAid,
+                items = items,
+                hasMore = hasMoreSearchResults(safePage, size, items.size, reportedTotal, redirectAid),
+            )
+        }
     }
 
     suspend fun comic(id: String): JmComic {
-        require(id.matches(Regex("\\d{1,12}"))) { "JM 编号无效" }
+        require(id.matches(safeNumericId)) { "JM 编号无效" }
         val data = requestJson("/album?id=$id")
-        val actualId = data.string("id").takeIf(safeNumericId::matches) ?: id
-        val series = data.array("series").objectsOrValues(MAX_SERIES_ITEMS).mapIndexedNotNull { index, element ->
-            val item = element as? JSONObject ?: return@mapIndexedNotNull null
-            val chapterId = item.string("id").takeIf { it.matches(Regex("\\d{1,12}")) } ?: return@mapIndexedNotNull null
-            val sort = item.int("sort")?.takeIf { it > 0 } ?: index + 1
-            JmChapter(chapterId, sort, formatChapterTitle(item.string("name"), sort))
-        }.distinctBy(JmChapter::id)
-            .sortedWith(compareBy(JmChapter::index, JmChapter::id))
-            .ifEmpty { listOf(JmChapter(actualId, 1, "第 1 话")) }
-        return JmComic(
-            actualId,
-            data.string("name").take(MAX_TITLE_LENGTH).ifBlank { "JM$actualId" },
-            data.string("description").take(MAX_DESCRIPTION_LENGTH),
-            coverUrl(actualId),
-            data.stringList("author", MAX_LIST_ITEMS).map { it.take(MAX_FIELD_LENGTH) }.filter(String::isNotBlank).distinct().take(MAX_LIST_ITEMS),
-            data.stringList("tags", MAX_LIST_ITEMS).map { it.take(MAX_FIELD_LENGTH) }.filter(String::isNotBlank).distinct().take(MAX_LIST_ITEMS),
-            series,
-            data.long("total_views"),
-            data.long("likes"),
-        )
+        return withContext(Dispatchers.Default) {
+            val actualId = data.string("id").takeIf(safeNumericId::matches) ?: id
+            val series = data.array("series").objectsOrValues(MAX_SERIES_ITEMS).mapIndexedNotNull { index, element ->
+                val item = element as? JSONObject ?: return@mapIndexedNotNull null
+                val chapterId = item.string("id").takeIf(safeNumericId::matches) ?: return@mapIndexedNotNull null
+                val sort = item.int("sort")?.takeIf { it > 0 } ?: index + 1
+                JmChapter(chapterId, sort, formatChapterTitle(item.string("name"), sort))
+            }.distinctBy(JmChapter::id)
+                .sortedWith(compareBy(JmChapter::index, JmChapter::id))
+                .ifEmpty { listOf(JmChapter(actualId, 1, "第 1 话")) }
+            JmComic(
+                actualId,
+                data.string("name").take(MAX_TITLE_LENGTH).ifBlank { "JM$actualId" },
+                data.string("description").take(MAX_DESCRIPTION_LENGTH),
+                coverUrl(actualId),
+                data.stringList("author", MAX_LIST_ITEMS).map { it.take(MAX_FIELD_LENGTH) }.filter(String::isNotBlank).distinct().take(MAX_LIST_ITEMS),
+                data.stringList("tags", MAX_LIST_ITEMS).map { it.take(MAX_FIELD_LENGTH) }.filter(String::isNotBlank).distinct().take(MAX_LIST_ITEMS),
+                series,
+                data.long("total_views"),
+                data.long("likes"),
+            )
+        }
     }
 
-    /** Read the official, anonymous forum for an album. Posting is intentionally out of scope. */
-    suspend fun comments(albumId: String, page: Int = 1): JmCommentPage {
-        require(albumId.matches(Regex("\\d{1,12}"))) { "JM 编号无效" }
+    /** Read the official, anonymous forum for one chapter/photo. Posting is out of scope. */
+    suspend fun comments(chapterId: String, page: Int = 1): JmCommentPage {
+        require(chapterId.matches(safeNumericId)) { "JM 编号无效" }
         val safePage = page.coerceIn(1, MAX_OFFICIAL_PAGE)
         val payload = requestJson(
-            "/forum?page=$safePage&aid=${encode(albumId)}&mode=manhua",
+            "/forum?page=$safePage&aid=${encode(chapterId)}&mode=manhua",
         )
-        val parsed = parseJmCommentPage(payload, safePage)
-        return parsed.copy(
-            comments = parsed.comments.map { comment ->
-                comment.withAvatarHost(domains.firstOrNull())
-            },
-        )
+        val avatarHost = domains.firstOrNull()
+        return withContext(Dispatchers.Default) {
+            val parsed = parseJmCommentPage(payload, safePage)
+            parsed.copy(
+                comments = parsed.comments.map { comment ->
+                    comment.withAvatarHost(avatarHost)
+                },
+            )
+        }
     }
 
     /** Sign in through the official JM mobile API. Passwords never leave this call. */
@@ -649,15 +705,17 @@ class JmGateway(context: Context) {
         requireAuthenticated()
         val safePage = page.coerceIn(1, MAX_OFFICIAL_PAGE)
         val payload = requestAuthenticatedJson("/favorite?page=$safePage&folder_id=0&o=mr")
-        requireAuthenticatedPayload(payload)
-        return parseFavoritePage(
-            payload,
-            safePage,
-            ::coverUrl,
-        )
+        return withContext(Dispatchers.Default) {
+            requireAuthenticatedPayload(payload)
+            parseFavoritePage(
+                payload,
+                safePage,
+                ::coverUrl,
+            )
+        }
     }
 
-    suspend fun allFavorites(maxPages: Int = MAX_FAVORITE_SYNC_PAGES): List<JmFavoriteItem> {
+    suspend fun allFavorites(maxPages: Int = MAX_FAVORITE_SYNC_PAGES): List<JmFavoriteItem> = withContext(Dispatchers.Default) {
         requireAuthenticated()
         val result = ArrayList<JmFavoriteItem>()
         var page = 1
@@ -667,13 +725,13 @@ class JmGateway(context: Context) {
             if (!current.hasMore || current.items.isEmpty()) break
             page++
         }
-        return result.distinctBy(JmFavoriteItem::id).take(MAX_FAVORITE_SYNC_ITEMS)
+        result.distinctBy(JmFavoriteItem::id).take(MAX_FAVORITE_SYNC_ITEMS)
     }
 
     /** The official endpoint toggles based on the current server state. */
     suspend fun toggleFavorite(albumId: String) {
         requireAuthenticated()
-        require(albumId.matches(Regex("\\d{1,12}"))) { "JM 编号无效" }
+        require(albumId.matches(safeNumericId)) { "JM 编号无效" }
         requireMutationSucceeded(
             requestPostJson(
                 path = "/favorite",
@@ -686,7 +744,7 @@ class JmGateway(context: Context) {
     /** Official album like toggle, kept in the same authenticated request chain. */
     suspend fun toggleLike(albumId: String) {
         requireAuthenticated()
-        require(albumId.matches(Regex("\\d{1,12}"))) { "JM 编号无效" }
+        require(albumId.matches(safeNumericId)) { "JM 编号无效" }
         requireMutationSucceeded(
             requestPostJson(
                 path = "/like",
@@ -725,40 +783,42 @@ class JmGateway(context: Context) {
     }
 
     suspend fun chapter(id: String): JmChapterPages {
-        require(id.matches(Regex("\\d{1,12}"))) { "章节编号无效" }
+        require(id.matches(safeNumericId)) { "章节编号无效" }
         chapterCache[id]?.let { return it }
         val lock = chapterLocks[lockStripeIndex(id, chapterLocks.size)]
         return lock.withLock {
             chapterCache[id]?.let { return@withLock it }
-            coroutineScope {
-                val speculativeScramble = id.toLongOrNull()
-                    ?.takeIf { it >= DEFAULT_SCRAMBLE_ID.toLong() }
-                    ?.let { async { fetchScramble(id) } }
-                try {
-                    val data = requestJson("/chapter?id=$id")
-                    val photoId = data.string("id").takeIf(safeNumericId::matches) ?: id
-                    val title = data.string("name").take(MAX_TITLE_LENGTH).ifBlank { "第 1 话" }
-                    val serverScramble = data.string("scramble_id").takeIf(safeNumericId::matches)
-                    val scramble = when {
-                        serverScramble != null -> serverScramble.also { speculativeScramble?.cancel() }
-                        photoId.toLongOrNull()?.let { it < DEFAULT_SCRAMBLE_ID.toLong() } == true ->
-                            DEFAULT_SCRAMBLE_ID.also { speculativeScramble?.cancel() }
-                        photoId == id -> speculativeScramble?.await() ?: fetchScramble(photoId)
-                        else -> fetchScramble(photoId).also { speculativeScramble?.cancel() }
+            withContext(Dispatchers.Default) {
+                coroutineScope {
+                    val speculativeScramble = id.toLongOrNull()
+                        ?.takeIf { it >= DEFAULT_SCRAMBLE_ID.toLong() }
+                        ?.let { async { fetchScramble(id) } }
+                    try {
+                        val data = requestJson("/chapter?id=$id")
+                        val photoId = data.string("id").takeIf(safeNumericId::matches) ?: id
+                        val title = data.string("name").take(MAX_TITLE_LENGTH).ifBlank { "第 1 话" }
+                        val serverScramble = data.string("scramble_id").takeIf(safeNumericId::matches)
+                        val scramble = when {
+                            serverScramble != null -> serverScramble.also { speculativeScramble?.cancel() }
+                            photoId.toLongOrNull()?.let { it < DEFAULT_SCRAMBLE_ID.toLong() } == true ->
+                                DEFAULT_SCRAMBLE_ID.also { speculativeScramble?.cancel() }
+                            photoId == id -> speculativeScramble?.await() ?: fetchScramble(photoId)
+                            else -> fetchScramble(photoId).also { speculativeScramble?.cancel() }
+                        }
+                        val hosts = rotatedImageDomains(photoId)
+                        val imageArray = data.array("images")
+                        if (imageArray.length() > MAX_CHAPTER_PAGE_ITEMS) throw JmSourceException()
+                        val files = normalizeChapterImageFiles(
+                            imageArray.objectsOrValues(MAX_CHAPTER_PAGE_ITEMS).mapNotNull { it.primitiveContent() },
+                        )
+                        val refererHost = domains.firstOrNull() ?: builtInDomains.first()
+                        val pages = files.mapIndexed { index, file -> JmPage(index + 1, photoId, file, scramble, "https://${hosts.first()}/media/photos/$photoId/$file", hosts.drop(1).map { "https://$it/media/photos/$photoId/$file" }, "https://$refererHost/") }
+                        if (pages.isEmpty()) throw JmSourceException()
+                        JmChapterPages(photoId, title, pages).also { chapterCache[id] = it }
+                    } catch (error: Throwable) {
+                        speculativeScramble?.cancel()
+                        throw error
                     }
-                    val hosts = rotatedImageDomains(photoId)
-                    val imageArray = data.array("images")
-                    if (imageArray.length() > MAX_CHAPTER_PAGE_ITEMS) throw JmSourceException()
-                    val files = normalizeChapterImageFiles(
-                        imageArray.objectsOrValues(MAX_CHAPTER_PAGE_ITEMS).mapNotNull { it.primitiveContent() },
-                    )
-                    val refererHost = domains.firstOrNull() ?: builtInDomains.first()
-                    val pages = files.mapIndexed { index, file -> JmPage(index + 1, photoId, file, scramble, "https://${hosts.first()}/media/photos/$photoId/$file", hosts.drop(1).map { "https://$it/media/photos/$photoId/$file" }, "https://$refererHost/") }
-                    if (pages.isEmpty()) throw JmSourceException()
-                    JmChapterPages(photoId, title, pages).also { chapterCache[id] = it }
-                } catch (error: Throwable) {
-                    speculativeScramble?.cancel()
-                    throw error
                 }
             }
         }
@@ -799,19 +859,51 @@ class JmGateway(context: Context) {
         }
     }
 
-    private suspend fun prefetchPageSource(page: JmPage, profile: PageDecodeProfile) {
-        if (page.localPath != null) return
+    /**
+     * Downloads one page into the durable raw cache without decoding it. Used by the full-chapter
+     * preload mode so a large chapter cannot fill the bitmap heap while still eliminating future
+     * network waits.
+     */
+    suspend fun preloadPageSource(
+        page: JmPage,
+        quality: ReaderImageQuality = ReaderImageQuality.Medium,
+        turboMode: Boolean = false,
+    ) {
+        prefetchPageSource(
+            page = page,
+            profile = pageDecodeProfile(quality, turboMode),
+            parallelNetwork = true,
+            durableCache = true,
+        )
+    }
+
+    private suspend fun prefetchPageSource(
+        page: JmPage,
+        profile: PageDecodeProfile,
+        parallelNetwork: Boolean = profile.turboMode,
+        durableCache: Boolean = false,
+    ) = withContext(Dispatchers.IO) {
+        if (page.localPath != null) return@withContext
         val generation = pageCacheGeneration.get()
         val key = pageCacheKey(page, profile)
         val sourceKey = pageSourceCacheKey(page)
-        if (bitmapCache.get(key)?.takeUnless(Bitmap::isRecycled) != null) return
-        if (isValidDecodedPageFile(File(cacheDir, "$key.webp"))) return
-        val rawCacheFile = File(cacheDir, "$sourceKey.source")
-        if (rawCacheFile.length() in 1..MAX_PAGE_BYTES.toLong()) {
-            rawCacheFile.setLastModified(System.currentTimeMillis())
-            return
+        if (bitmapCache.get(key)?.takeUnless(Bitmap::isRecycled) != null) return@withContext
+        val decodedCacheFiles = listOf(
+            File(cacheDir, "$key.webp"),
+            File(cacheDir, "${legacyPageCacheKey(page, profile)}.webp"),
+        ).distinctBy(File::getAbsolutePath)
+        if (decodedCacheFiles.any(::isValidDecodedPageFile)) return@withContext
+        val rawCacheFile = listOf(
+            File(cacheDir, "$sourceKey.source"),
+            File(cacheDir, "${legacyPageSourceCacheKey(page)}.source"),
+        ).distinctBy(File::getAbsolutePath).firstOrNull { file ->
+            file.length() in 1..MAX_PAGE_BYTES.toLong()
         }
-        if (profile.turboMode) incrementPageWaiter(turboPageWaiters, sourceKey)
+        if (rawCacheFile != null) {
+            rawCacheFile.setLastModified(System.currentTimeMillis())
+            return@withContext
+        }
+        if (parallelNetwork) incrementPageWaiter(turboPageWaiters, sourceKey)
         try {
             requestSourceBytes(
                 page = page,
@@ -819,9 +911,10 @@ class JmGateway(context: Context) {
                 generation = generation,
                 hedgeImageHosts = false,
                 hedgeDelayMillis = profile.hedgeDelayMillis,
+                durableCache = durableCache,
             )
         } finally {
-            if (profile.turboMode) decrementPageWaiter(turboPageWaiters, sourceKey)
+            if (parallelNetwork) decrementPageWaiter(turboPageWaiters, sourceKey)
         }
     }
 
@@ -960,30 +1053,42 @@ class JmGateway(context: Context) {
             bitmapCache.get(key)?.takeUnless(Bitmap::isRecycled)?.let { return@withContext it }
             val decodedCacheFile = File(cacheDir, "$key.webp")
             val rawCacheFile = File(cacheDir, "$sourceKey.source")
+            val decodedCacheCandidates = listOf(
+                decodedCacheFile,
+                File(cacheDir, "${legacyPageCacheKey(page, profile)}.webp"),
+            ).distinctBy(File::getAbsolutePath)
+            val rawCacheCandidates = listOf(
+                rawCacheFile,
+                File(cacheDir, "${legacyPageSourceCacheKey(page)}.source"),
+            ).distinctBy(File::getAbsolutePath)
 
             page.localPath?.let { localPath ->
                 return@withContext withImageDecodeTurn(key) {
                     decodeFilePage(localPath, key, profile, generation) ?: throw JmSourceException()
                 }.also { cacheBitmapIfCurrent(key, it, generation) }
             }
-            decodeFilePageWithTurn(decodedCacheFile, key, profile, generation)?.let { bitmap ->
-                decodedCacheFile.setLastModified(System.currentTimeMillis())
-                cacheBitmapIfCurrent(key, bitmap, generation)
-                return@withContext bitmap
-            }
-            decodeRawPageFileWithTurn(rawCacheFile, page, key, profile, generation)?.let { bitmap ->
-                rawCacheFile.setLastModified(System.currentTimeMillis())
-                cacheBitmapIfCurrent(key, bitmap, generation)
-                if (!profile.turboMode) {
-                    scheduleDecodedPageCacheWrite(
-                        key,
-                        decodedCacheFile,
-                        bitmap,
-                        profile.cacheWebpQuality,
-                        generation,
-                    )
+            decodedCacheCandidates.forEach { candidate ->
+                decodeFilePageWithTurn(candidate, key, profile, generation)?.let { bitmap ->
+                    candidate.setLastModified(System.currentTimeMillis())
+                    cacheBitmapIfCurrent(key, bitmap, generation)
+                    return@withContext bitmap
                 }
-                return@withContext bitmap
+            }
+            rawCacheCandidates.forEach { candidate ->
+                decodeRawPageFileWithTurn(candidate, page, key, profile, generation)?.let { bitmap ->
+                    candidate.setLastModified(System.currentTimeMillis())
+                    cacheBitmapIfCurrent(key, bitmap, generation)
+                    if (!profile.turboMode) {
+                        scheduleDecodedPageCacheWrite(
+                            key,
+                            decodedCacheFile,
+                            bitmap,
+                            profile.cacheWebpQuality,
+                            generation,
+                        )
+                    }
+                    return@withContext bitmap
+                }
             }
 
             val bytes = requestSourceBytes(
@@ -1021,6 +1126,7 @@ class JmGateway(context: Context) {
         hedgeImageHosts: Boolean,
         hedgeDelayMillis: Long,
         onProgress: (Long, Long) -> Unit = { _, _ -> },
+        durableCache: Boolean = false,
     ): ByteArray {
         incrementPageWaiter(sourceLoadWaiters, sourceKey)
         try {
@@ -1048,12 +1154,18 @@ class JmGateway(context: Context) {
                 deferred.start()
             }
             if (existing != null) created.cancel()
-            return selected.await().also { bytes ->
-                // Schedule from the caller's generation as well as the producer's
-                // generation. A request that joined a reused in-flight load after
-                // cache cleanup must still be able to repopulate the new cache.
-                scheduleRawPageCacheWrite(sourceKey, File(cacheDir, "$sourceKey.source"), bytes, generation)
+            val bytes = selected.await()
+            // Persist from the caller's generation as well as the producer's generation. A
+            // request that joined a reused in-flight load after cache cleanup must still be able
+            // to repopulate the new cache. Full-chapter preloading waits for the write so queued
+            // pages cannot outrun the single disk writer and silently lose their cache entry.
+            val cacheFile = File(cacheDir, "$sourceKey.source")
+            if (durableCache) {
+                persistRawPageCache(sourceKey, cacheFile, bytes, generation)
+            } else {
+                scheduleRawPageCacheWrite(sourceKey, cacheFile, bytes, generation)
             }
+            return bytes
         } finally {
             if (decrementPageWaiter(sourceLoadWaiters, sourceKey)) {
                 cancelUnobservedSourceLoadAfterGrace(sourceKey)
@@ -1090,14 +1202,36 @@ class JmGateway(context: Context) {
         val decodedKey = pageCacheKey(page, profile)
         val sourceKey = pageSourceCacheKey(page)
         val decodedCacheFile = File(cacheDir, "$decodedKey.webp")
-        val generation = pageCacheGeneration.get()
-        if (isValidDecodedPageFile(decodedCacheFile)) {
+        val decodedCacheCandidates = listOf(
+            decodedCacheFile,
+            File(cacheDir, "${legacyPageCacheKey(page, profile)}.webp"),
+        ).distinctBy(File::getAbsolutePath)
+        if (decodedCacheCandidates.any(::isValidDecodedPageFile)) {
             awaitVisiblePageIdle()
-            target.parentFile?.mkdirs()
-            decodedCacheFile.copyTo(target, overwrite = true)
-            target.setLastModified(System.currentTimeMillis())
-            return@withContext
+            val copiedFromCache = diskCacheMutex.withLock {
+                val cachedFile = decodedCacheCandidates.firstOrNull(::isValidDecodedPageFile)
+                    ?: return@withLock false
+                try {
+                    target.parentFile?.mkdirs()
+                    cachedFile.copyTo(target, overwrite = true)
+                    if (!isValidDecodedPageFile(target)) {
+                        target.delete()
+                        false
+                    } else {
+                        val now = System.currentTimeMillis()
+                        cachedFile.setLastModified(now)
+                        target.setLastModified(now)
+                        true
+                    }
+                } catch (error: IOException) {
+                    target.delete()
+                    if (cachedFile.isFile) throw error
+                    false
+                }
+            }
+            if (copiedFromCache) return@withContext
         }
+        val generation = pageCacheGeneration.get()
         val decoded = requestPage(
             page,
             profile = profile,
@@ -1175,18 +1309,7 @@ class JmGateway(context: Context) {
         }
         cacheScope.launch {
             try {
-                val temporary = File(cacheDir, "$key.$generation.tmp")
-                try {
-                    temporary.outputStream().buffered().use { output -> output.write(bytes) }
-                    val cacheWritten = diskCacheMutex.withLock {
-                        if (generation != pageCacheGeneration.get()) return@withLock false
-                        if (!temporary.renameTo(file)) temporary.copyTo(file, overwrite = true)
-                        true
-                    }
-                    if (cacheWritten) trimPageCacheIfNeeded()
-                } finally {
-                    temporary.delete()
-                }
+                writeRawPageCache(key, file, bytes, generation)
             } finally {
                 rawCacheWriteLimiter.release()
                 pageCacheWritesInFlight.remove(writeId)
@@ -1259,6 +1382,48 @@ class JmGateway(context: Context) {
     private fun cacheBitmapIfCurrent(key: String, bitmap: Bitmap, generation: Int) {
         if (generation == pageCacheGeneration.get() && closed.get() == 0) {
             bitmapCache.put(key, bitmap)
+        }
+    }
+
+    private suspend fun persistRawPageCache(key: String, file: File, bytes: ByteArray, generation: Int) {
+        val writeId = "$generation:$key"
+        while (true) {
+            if (file.length() in 1..MAX_PAGE_BYTES.toLong()) return
+            if (generation != pageCacheGeneration.get() || closed.get() != 0) return
+            if (pageCacheWritesInFlight.add(writeId)) break
+            delay(RAW_CACHE_WRITE_POLL_MILLIS)
+        }
+        try {
+            rawCacheWriteLimiter.withPermit {
+                writeRawPageCache(key, file, bytes, generation)
+            }
+        } finally {
+            pageCacheWritesInFlight.remove(writeId)
+        }
+    }
+
+    private suspend fun writeRawPageCache(
+        key: String,
+        file: File,
+        bytes: ByteArray,
+        generation: Int,
+    ) {
+        if (
+            closed.get() != 0 ||
+            generation != pageCacheGeneration.get() ||
+            file.length() in 1..MAX_PAGE_BYTES.toLong()
+        ) return
+        val temporary = File(cacheDir, "$key.$generation.tmp")
+        try {
+            temporary.outputStream().buffered().use { output -> output.write(bytes) }
+            val cacheWritten = diskCacheMutex.withLock {
+                if (closed.get() != 0 || generation != pageCacheGeneration.get()) return@withLock false
+                if (!temporary.renameTo(file)) temporary.copyTo(file, overwrite = true)
+                true
+            }
+            if (cacheWritten) trimPageCacheIfNeeded()
+        } finally {
+            temporary.delete()
         }
     }
 
@@ -1380,9 +1545,9 @@ class JmGateway(context: Context) {
     private suspend fun <T> withPageNetworkTurn(key: String, block: suspend () -> T): T {
         while (true) {
             if (isPageVisible(key)) {
-                return block()
+                return runPageNetwork(key, block)
             }
-            while (visiblePageRequestCount.get() > 0 && !isPageVisible(key)) {
+            while (shouldPauseBackgroundNetwork(key)) {
                 delay(BACKGROUND_PRIORITY_POLL_MILLIS)
             }
             if (isPageVisible(key)) continue
@@ -1396,14 +1561,26 @@ class JmGateway(context: Context) {
                 continue
             }
             try {
-                if (visiblePageRequestCount.get() > 0 && !isPageVisible(key)) continue
+                if (shouldPauseBackgroundNetwork(key)) continue
                 if (isPageVisible(key)) continue
-                return block()
+                return runPageNetwork(key, block)
             } finally {
                 limiter.release()
             }
         }
     }
+
+    private suspend fun <T> runPageNetwork(key: String, block: suspend () -> T): T {
+        pageNetworkPriority.enter(key)
+        return try {
+            block()
+        } finally {
+            pageNetworkPriority.leave(key)
+        }
+    }
+
+    private fun shouldPauseBackgroundNetwork(key: String): Boolean =
+        pageNetworkPriority.shouldPauseBackground(key, ::isPageVisible)
 
     @OptIn(ExperimentalCoroutinesApi::class)
     private suspend fun fetchImageHedged(
@@ -1535,26 +1712,21 @@ class JmGateway(context: Context) {
         if (total > MAX_PAGE_BYTES) throw JmSourceException()
         return withContext(Dispatchers.IO) {
             body.byteStream().use { input ->
-                val buffer = ByteArray(32 * 1024)
+                val buffer = ByteArray(PAGE_NETWORK_READ_CHUNK_BYTES)
                 val expected = total.toInt().takeIf { total in 1..MAX_PAGE_BYTES.toLong() }
                 if (expected != null) {
                     val bytes = ByteArray(expected)
                     var done = 0
                     while (done < expected) {
-                        while (visiblePageRequestCount.get() > 0 && !isPageVisible(key)) {
+                        while (shouldPauseBackgroundNetwork(key)) {
                             delay(BACKGROUND_PRIORITY_POLL_MILLIS)
                         }
+                        val chunkSize = minOf(PAGE_NETWORK_READ_CHUNK_BYTES, expected - done)
                         val read = runInterruptible(Dispatchers.IO) {
-                            input.read(bytes, done, expected - done)
+                            readPageInputChunk(input, bytes, done, chunkSize)
                         }
-                        val progressed = if (read == 0) {
-                            runInterruptible(Dispatchers.IO) { input.read() }
-                        } else {
-                            read
-                        }
-                        if (progressed < 0) break
-                        if (read == 0) bytes[done] = progressed.toByte()
-                        done += if (read == 0) 1 else progressed
+                        if (read < 0) break
+                        done += read
                         onProgress(done.toLong(), total)
                     }
                     if (done != expected) throw JmSourceException()
@@ -1564,22 +1736,14 @@ class JmGateway(context: Context) {
                 val sink = java.io.ByteArrayOutputStream(16 * 1024)
                 var done = 0L
                 while (true) {
-                    while (visiblePageRequestCount.get() > 0 && !isPageVisible(key)) {
+                    while (shouldPauseBackgroundNetwork(key)) {
                         delay(BACKGROUND_PRIORITY_POLL_MILLIS)
                     }
-                    val read = runInterruptible(Dispatchers.IO) { input.read(buffer) }
-                    val progressed = if (read == 0) {
-                        runInterruptible(Dispatchers.IO) { input.read() }
-                    } else {
-                        read
-                    }
-                    if (progressed < 0) break
-                    if (read == 0) {
-                        buffer[0] = progressed.toByte()
-                    }
-                    done += if (read == 0) 1 else progressed
+                    val read = runInterruptible(Dispatchers.IO) { readPageInputChunk(input, buffer) }
+                    if (read < 0) break
+                    done += read
                     if (done > MAX_PAGE_BYTES) throw JmSourceException()
-                    sink.write(buffer, 0, if (read == 0) 1 else progressed)
+                    sink.write(buffer, 0, read)
                     onProgress(done, total)
                 }
                 sink.toByteArray()
@@ -1919,13 +2083,19 @@ class JmGateway(context: Context) {
         DEFAULT_SCRAMBLE_ID
     }
 
-    private suspend fun requestJson(path: String): JSONObject = withContext(Dispatchers.IO) {
+    private suspend fun requestJson(
+        path: String,
+        featureKey: String? = null,
+        featureValidator: (JSONObject) -> Boolean = { true },
+    ): JSONObject = withContext(Dispatchers.IO) {
         if (closed.get() != 0) throw CancellationException("JM 网关已关闭")
-        val attempted = domains.take(MAX_API_CANDIDATES)
-        requestAcrossDomains(path, attempted)?.let { return@withContext it }
+        val tracker = featureKey?.let { FeatureRequestTracker(it, featureValidator) }
+        val attempted = prioritizeFeatureDomains(domains, tracker).take(MAX_API_CANDIDATES)
+        requestAcrossDomains(path, attempted, tracker)?.let { return@withContext it }
         val refreshed = discoverDomains()
         val attemptedSet = attempted.toHashSet()
-        requestAcrossDomains(path, refreshed.filterNot(attemptedSet::contains))?.let { return@withContext it }
+        requestAcrossDomains(path, refreshed.filterNot(attemptedSet::contains), tracker)?.let { return@withContext it }
+        tracker?.fallback()?.let { return@withContext it }
         throw JmSourceException()
     }
 
@@ -1940,13 +2110,20 @@ class JmGateway(context: Context) {
     private suspend fun requestAuthenticatedJson(path: String): JSONObject = withContext(Dispatchers.IO) {
         if (closed.get() != 0) throw CancellationException("JM 网关已关闭")
         var authError: JmAuthException? = null
+        var authFailures = 0
+        var otherFailures = 0
 
         suspend fun tryDomains(candidates: List<String>): JSONObject? {
             for (domain in candidates.take(MAX_API_CANDIDATES)) {
                 val result = requestDomainJson(path, domain)
                 result.getOrNull()?.let { return it }
                 result.exceptionOrNull()?.let { error ->
-                    if (error is JmAuthException && authError == null) authError = error
+                    if (error is JmAuthException) {
+                        authFailures++
+                        if (authError == null) authError = error
+                    } else {
+                        otherFailures++
+                    }
                 }
             }
             return null
@@ -1959,7 +2136,11 @@ class JmGateway(context: Context) {
             .getOrDefault(emptyList())
         val attemptedSet = attempted.toHashSet()
         tryDomains(refreshed.filterNot(attemptedSet::contains))?.let { return@withContext it }
-        throw (authError ?: JmSourceException())
+        throw if (shouldInvalidateRestoredSession(authFailures, otherFailures)) {
+            authError ?: JmAuthException("JM 登录已失效，请重新登录")
+        } else {
+            JmSourceException()
+        }
     }
 
     private suspend fun requestPostJson(
@@ -2040,39 +2221,57 @@ class JmGateway(context: Context) {
         }.distinct()
     }
 
-    private suspend fun requestAcrossDomains(path: String, candidates: List<String>): JSONObject? {
-        val domains = candidates.take(MAX_API_CANDIDATES)
+    private suspend fun requestAcrossDomains(
+        path: String,
+        candidates: List<String>,
+        tracker: FeatureRequestTracker? = null,
+    ): JSONObject? {
+        val domains = prioritizeFeatureDomains(candidates, tracker).take(MAX_API_CANDIDATES)
         val (manualSelectionEnabled, manualPreferredHost) = synchronized(sourceStateLock) {
             (!autoSelectSource) to preferredSourceHost
         }
         if (manualSelectionEnabled && manualPreferredHost != null) {
+            val preferredAvailable = manualPreferredHost.takeUnless { host ->
+                tracker != null && isFeatureHostUnavailable(tracker.featureKey, host)
+            }
             val manuallyOrdered = buildList {
-                if (manualPreferredHost in domains) add(manualPreferredHost)
-                addAll(domains.filterNot { it == manualPreferredHost })
+                preferredAvailable?.takeIf { it in domains }?.let(::add)
+                addAll(domains.filterNot { it == preferredAvailable })
             }.distinct().take(MAX_API_CANDIDATES)
             manuallyOrdered.forEach { domain ->
-                requestDomainJson(path, domain).getOrNull()?.let { return it }
+                acceptedFeaturePayload(domain, requestDomainJson(path, domain), tracker)?.let { return it }
             }
             return null
         }
         if (domains.size >= 2) {
-            raceDomainJson(path, domains[0], domains[1])?.let { return it }
+            raceDomainJson(path, domains[0], domains[1], tracker)?.let { return it }
         } else {
-            return domains.firstOrNull()?.let { requestDomainJson(path, it).getOrNull() }
+            return domains.firstOrNull()?.let { domain ->
+                acceptedFeaturePayload(domain, requestDomainJson(path, domain), tracker)
+            }
         }
         for (domain in domains.drop(2)) {
-            requestDomainJson(path, domain).getOrNull()?.let { return it }
+            acceptedFeaturePayload(domain, requestDomainJson(path, domain), tracker)?.let { return it }
         }
         return null
     }
 
-    private suspend fun raceDomainJson(path: String, primaryDomain: String, secondaryDomain: String): JSONObject? =
+    private suspend fun raceDomainJson(
+        path: String,
+        primaryDomain: String,
+        secondaryDomain: String,
+        tracker: FeatureRequestTracker? = null,
+    ): JSONObject? =
         supervisorScope {
             val primary = async { requestDomainJson(path, primaryDomain) }
             val earlyPrimary = withTimeoutOrNull(API_HEDGE_DELAY_MILLIS) { primary.await() }
             if (earlyPrimary != null) {
-                earlyPrimary.getOrNull()?.let { return@supervisorScope it }
-                return@supervisorScope requestDomainJson(path, secondaryDomain).getOrNull()
+                acceptedFeaturePayload(primaryDomain, earlyPrimary, tracker)?.let { return@supervisorScope it }
+                return@supervisorScope acceptedFeaturePayload(
+                    secondaryDomain,
+                    requestDomainJson(path, secondaryDomain),
+                    tracker,
+                )
             }
 
             val secondary = async { requestDomainJson(path, secondaryDomain) }
@@ -2080,12 +2279,56 @@ class JmGateway(context: Context) {
                 primary.onAwait { it to secondary }
                 secondary.onAwait { it to primary }
             }
-            firstResult.getOrNull()?.let { result ->
+            val firstDomain = if (other === secondary) primaryDomain else secondaryDomain
+            val otherDomain = if (other === secondary) secondaryDomain else primaryDomain
+            acceptedFeaturePayload(firstDomain, firstResult, tracker)?.let { result ->
                 other.cancel()
                 return@supervisorScope result
             }
-            other.await().getOrNull()
+            acceptedFeaturePayload(otherDomain, other.await(), tracker)
         }
+
+    private fun acceptedFeaturePayload(
+        domain: String,
+        result: Result<JSONObject>,
+        tracker: FeatureRequestTracker?,
+    ): JSONObject? {
+        val payload = result.getOrNull() ?: return null
+        if (tracker == null || tracker.accepts(payload)) {
+            tracker?.let { feature ->
+                unavailableFeatureHosts.remove(featureHostKey(feature.featureKey, domain))
+                feature.rejectedHostSnapshot().forEach { rejectedHost ->
+                    unavailableFeatureHosts[featureHostKey(feature.featureKey, rejectedHost)] =
+                        SystemClock.elapsedRealtime()
+                }
+            }
+            return payload
+        }
+        tracker.reject(domain, payload)
+        return null
+    }
+
+    private fun prioritizeFeatureDomains(
+        candidates: List<String>,
+        tracker: FeatureRequestTracker?,
+    ): List<String> {
+        val distinct = candidates.distinct()
+        if (tracker == null) return distinct
+        val (available, unavailable) = distinct.partition { host ->
+            !isFeatureHostUnavailable(tracker.featureKey, host)
+        }
+        return available + unavailable
+    }
+
+    private fun isFeatureHostUnavailable(featureKey: String, host: String): Boolean {
+        val key = featureHostKey(featureKey, host)
+        val markedAt = unavailableFeatureHosts[key] ?: return false
+        val unavailable = SystemClock.elapsedRealtime() - markedAt < FEATURE_UNAVAILABLE_TTL_MILLIS
+        if (!unavailable) unavailableFeatureHosts.remove(key, markedAt)
+        return unavailable
+    }
+
+    private fun featureHostKey(featureKey: String, host: String): String = "$featureKey|$host"
 
     private suspend fun requestDomainJson(
         path: String,
@@ -2120,7 +2363,7 @@ class JmGateway(context: Context) {
     private suspend fun ensureCookies(domain: String) {
         installSessionCookie(domain)
         if (domain in initializedCookieHosts) return
-        cookieMutex.withLock {
+        cookieInitLocks[lockStripeIndex(domain, cookieInitLocks.size)].withLock {
             installSessionCookie(domain)
             if (domain in initializedCookieHosts) return@withLock
             val initialized = runCatching {
@@ -2140,7 +2383,7 @@ class JmGateway(context: Context) {
         val avs = authenticatedSession?.avs?.takeIf { it.isNotBlank() } ?: return
         val url = "https://$domain/".toHttpUrlOrNull() ?: return
         runCatching {
-            cookies.saveFromResponse(
+            cookies.install(
                 url,
                 listOf(
                     Cookie.Builder()
@@ -2152,6 +2395,15 @@ class JmGateway(context: Context) {
                 ),
             )
         }
+    }
+
+    private fun updateAuthenticatedSessionFromCookie(cookie: Cookie) {
+        if (!cookie.name.equals("AVS", ignoreCase = true)) return
+        val domain = cookie.domain.lowercase()
+        if (domain !in domains && domain !in officialDomains) return
+        val updatedAvs = cookie.value.takeIf { it.isNotBlank() && it.length <= MAX_AVS_LENGTH } ?: return
+        val current = authenticatedSession ?: return
+        if (current.avs != updatedAvs) authenticatedSession = current.copy(avs = updatedAvs)
     }
 
     private fun normalizeDomain(raw: String?): String? {
@@ -2372,7 +2624,7 @@ class JmGateway(context: Context) {
         preferResultImage: Boolean = false,
     ): List<JmRanking> = array(key).objectsOrValues(MAX_RANKING_ITEMS).mapIndexedNotNull { index, element ->
         val item = element as? JSONObject ?: return@mapIndexedNotNull null
-        val id = item.string("id").takeIf { it.matches(Regex("\\d{1,12}")) } ?: return@mapIndexedNotNull null
+        val id = item.string("id").takeIf(safeNumericId::matches) ?: return@mapIndexedNotNull null
         val title = item.string("name").take(MAX_TITLE_LENGTH).ifBlank { return@mapIndexedNotNull null }
         val supporting = item.obj("category").string("title").ifBlank { item.string("author") }.take(MAX_FIELD_LENGTH)
         JmRanking(
@@ -2414,6 +2666,9 @@ class JmGateway(context: Context) {
         private const val SOURCE_PROBE_READ_TIMEOUT_SECONDS = 4L
         private const val SOURCE_PROBE_CALL_TIMEOUT_SECONDS = 6L
         private const val API_HEDGE_DELAY_MILLIS = 450L
+        private const val FEATURE_UNAVAILABLE_TTL_MILLIS = 15L * 60L * 1_000L
+        private const val FEATURE_WEEK_CATALOG = "week-catalog"
+        private const val FEATURE_WEEK_RANKING = "week-ranking"
         private const val SOURCE_PREFERENCES_NAME = "comicplus_pure_sources"
         private const val SOURCE_OFFICIAL_DOMAINS_KEY = "official_domains"
         private const val SOURCE_ENDPOINTS_KEY = "source_endpoints"
@@ -2451,9 +2706,11 @@ class JmGateway(context: Context) {
         private const val MAX_STITCHED_SOURCE_PIXELS = 16_000_000L
         private const val MAX_REGION_SAMPLE_SIZE = 32
         private const val IMAGE_WARMUP_HOST_COUNT = 2
+        private const val IMAGE_WARMUP_REUSE_MILLIS = 4L * 60L * 1_000L
         private const val MIN_BITMAP_CACHE_KB = 16 * 1024
         private const val MAX_BITMAP_CACHE_KB = 64 * 1024
         private const val CHAPTER_LOCK_STRIPES = 8
+        private const val COOKIE_INIT_LOCK_STRIPES = 16
         private const val CHAPTER_CACHE_LIMIT = 24
         private const val PAGE_ASPECT_RATIO_CACHE_LIMIT = 256
         private const val PAGE_CACHE_TRIM_INTERVAL = 16
@@ -2464,6 +2721,8 @@ class JmGateway(context: Context) {
         private const val IMAGE_HEDGE_DELAY_MILLIS = 100L
         private const val TURBO_IMAGE_HEDGE_DELAY_MILLIS = 45L
         private const val BACKGROUND_PRIORITY_POLL_MILLIS = 24L
+        private const val PAGE_NETWORK_READ_CHUNK_BYTES = 32 * 1024
+        private const val RAW_CACHE_WRITE_POLL_MILLIS = 16L
         private const val DECODED_CACHE_WRITE_DELAY_MILLIS = 4_000L
         private const val UNOBSERVED_PAGE_LOAD_GRACE_MILLIS = 1_500L
         private const val SOURCE_LOAD_REUSE_MILLIS = 400L
@@ -2476,14 +2735,20 @@ class JmGateway(context: Context) {
         private val discoveryUrls = listOf("https://rup4a04-c01.tos-ap-southeast-1.bytepluses.com/newsvr-2025.txt", "https://rup4a04-c02.tos-cn-hongkong.bytepluses.com/newsvr-2025.txt", "https://rup4a04-c03.tos-cn-beijing.bytepluses.com.cn/newsvr-2025.txt")
         private val imageDomains = listOf("cdn-msp.jmapiproxy1.cc", "cdn-msp.jmapiproxy2.cc", "cdn-msp2.jmapiproxy2.cc", "cdn-msp3.jmapiproxy2.cc", "cdn-msp.jmapinodeudzn.net", "cdn-msp3.jmapinodeudzn.net")
         private val officialOrders = setOf("mr", "mv", "mv_m", "mv_w", "mv_t", "mp", "tf")
+        private val timeLimitedRankingOrders = setOf("mv_m", "mv_w", "mv_t")
         private val officialSearchOrders = setOf("mr", "mv", "mp", "tf")
         private val safeImageFile = Regex("^[A-Za-z0-9_-]{1,128}\\.(?:jpg|jpeg|png|webp|gif)$", RegexOption.IGNORE_CASE)
-        private val safeNumericId = Regex("^\\d{1,12}$")
         private val safeHost = Regex("^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
         private val ipLiteral = Regex("^(?:\\d{1,3}\\.){3}\\d{1,3}$|:")
         private val scrambleRegex = Regex("var\\s+scramble_id\\s*=\\s*(\\d+);")
         private fun epochSeconds() = (System.currentTimeMillis() / 1000L).toString()
-        private fun md5(value: String) = MessageDigest.getInstance("MD5").digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
+        internal fun isImageWarmupFresh(lastWarmedAt: Long?, now: Long): Boolean =
+            lastWarmedAt != null && now >= lastWarmedAt && now - lastWarmedAt < IMAGE_WARMUP_REUSE_MILLIS
+        internal fun shouldInvalidateRestoredSession(authFailures: Int, otherFailures: Int): Boolean =
+            authFailures > 0 && otherFailures == 0
+        private fun md5(value: String) = encodeLowerHex(
+            MessageDigest.getInstance("MD5").digest(value.toByteArray()),
+        )
         @SuppressLint("GetInstance")
         private fun protocolDecrypt(encoded: String, timestamp: String, secret: String): String {
             val encrypted = Base64.getMimeDecoder().decode(encoded)
@@ -2593,9 +2858,11 @@ class JmGateway(context: Context) {
             }
         }
         private fun imageWorkPermits(context: Context): Int {
-            val memoryMb = (context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).memoryClass
-            return if (memoryMb < 384) 1 else 2
+            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            return imageWorkPermits(activityManager.memoryClass, activityManager.isLowRamDevice)
         }
+        internal fun imageWorkPermits(memoryMb: Int, isLowRamDevice: Boolean): Int =
+            if (isLowRamDevice || memoryMb < 512) 1 else 2
         internal fun segmentationCount(scrambleId: String, aid: String, fileName: String): Int {
             val scramble = scrambleId.toLongOrNull() ?: return 0
             val numericAid = aid.toLongOrNull() ?: return 0
@@ -2688,11 +2955,12 @@ class JmGateway(context: Context) {
                 url.username.isEmpty() && url.password.isEmpty() &&
                 url.host in imageDomains && raw.length <= MAX_FIELD_LENGTH * 4
         }
-        private fun imageSequence(fileName: String) = Regex("\\d+").find(fileName)?.value?.toLongOrNull() ?: Long.MAX_VALUE
+        private fun imageSequence(fileName: String) =
+            imageSequencePattern.find(fileName)?.value?.toLongOrNull() ?: Long.MAX_VALUE
         private fun formatChapterTitle(raw: String, sort: Int): String {
             val name = raw.trim().take(MAX_TITLE_LENGTH)
             if (name.isBlank()) return "第 $sort 话"
-            if (name.matches(Regex("^\\d+(?:\\.\\d+)?$"))) return "第 $name 话"
+            if (name.matches(numericChapterTitlePattern)) return "第 $name 话"
             return (if (name.contains('第') || name.contains('话') || name.contains('話') || name.contains('章')) {
                 name
             } else {
@@ -2700,10 +2968,17 @@ class JmGateway(context: Context) {
             }).take(MAX_TITLE_LENGTH)
         }
         private fun encode(value: String) = URLEncoder.encode(value, Charsets.UTF_8.name()).replace("+", "%20")
-        private fun sha256(value: String) = MessageDigest.getInstance("SHA-256").digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
+        private fun sha256(value: String) = encodeLowerHex(
+            MessageDigest.getInstance("SHA-256").digest(value.toByteArray()),
+        )
         private fun pageCacheKey(page: JmPage, profile: PageDecodeProfile) =
+            sha256("v6|${profile.cacheToken}|${pageContentIdentity(page)}|${page.scrambleId}")
+        private fun pageSourceCacheKey(page: JmPage) =
+            sha256("v4|${pageContentIdentity(page)}|${page.scrambleId}")
+        private fun legacyPageCacheKey(page: JmPage, profile: PageDecodeProfile) =
             sha256("v5|${profile.cacheToken}|${page.url}|${page.scrambleId}")
-        private fun pageSourceCacheKey(page: JmPage) = sha256("v3|${page.url}|${page.scrambleId}")
+        private fun legacyPageSourceCacheKey(page: JmPage) =
+            sha256("v3|${page.url}|${page.scrambleId}")
         private val fallbackCategories = listOf(JmCategory("0", "最新A漫", "0"), JmCategory("1", "同人", "doujin"), JmCategory("2", "单本", "single"), JmCategory("3", "短篇", "short"), JmCategory("4", "韩漫", "hanman"))
 
         fun imageRequestHeaders(referer: String = "https://18comic.vip/"): Map<String, String> = mapOf(
@@ -2716,287 +2991,5 @@ class JmGateway(context: Context) {
     }
 }
 
-class JmSourceException : IOException("JM 官方源暂时不可用")
-
 private class BackgroundImageWorkPreempted : RuntimeException()
-
-internal fun orderSourceEndpoints(
-    endpoints: List<JmSourceEndpoint>,
-    autoSelect: Boolean,
-    preferredHosts: List<String> = endpoints.map(JmSourceEndpoint::host),
-): List<JmSourceEndpoint> {
-    val preferredOrder = preferredHosts.withIndex().associate { (index, host) -> host to index }
-    val stableOrder = endpoints.sortedWith(
-        compareBy<JmSourceEndpoint>({ preferredOrder[it.host] ?: Int.MAX_VALUE }, { it.host }),
-    )
-    if (!autoSelect || stableOrder.none { it.latencyMs != null }) return stableOrder
-    return stableOrder.sortedWith(
-        compareBy<JmSourceEndpoint>({ it.latencyMs == null }, { it.latencyMs ?: Long.MAX_VALUE }),
-    )
-}
-
-internal class MemoryCookieJar : CookieJar {
-    private val values = ConcurrentHashMap<String, List<Cookie>>()
-
-    fun clear() {
-        values.clear()
-    }
-
-    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-        val now = System.currentTimeMillis()
-        val boundedIncoming = cookies.filter { cookie ->
-            cookie.name.length <= MAX_COOKIE_NAME_LENGTH &&
-                cookie.value.length <= MAX_COOKIE_VALUE_LENGTH &&
-                cookie.domain.length <= MAX_COOKIE_DOMAIN_LENGTH &&
-                cookie.path.length <= MAX_COOKIE_PATH_LENGTH
-        }
-        values.compute(url.host) { _, existing ->
-            val replacements = boundedIncoming.mapTo(HashSet()) { cookie -> cookie.identity() }
-            (existing.orEmpty().filterNot { it.identity() in replacements } + boundedIncoming)
-                .filter { it.expiresAt > now }
-                .takeLast(MAX_COOKIES_PER_HOST)
-        }
-    }
-    override fun loadForRequest(url: HttpUrl): List<Cookie> {
-        val now = System.currentTimeMillis()
-        val current = values[url.host].orEmpty()
-        val valid = current.filter { it.expiresAt > now }
-        if (valid.size != current.size) values.replace(url.host, current, valid)
-        return valid.filter { it.matches(url) }
-    }
-}
-
-private const val MAX_COOKIES_PER_HOST = 64
-private const val MAX_COOKIE_NAME_LENGTH = 128
-private const val MAX_COOKIE_VALUE_LENGTH = 4 * 1024
-private const val MAX_COOKIE_DOMAIN_LENGTH = 253
-private const val MAX_COOKIE_PATH_LENGTH = 512
-
-private fun Cookie.identity(): String = "$name|$domain|$path"
-
-private fun JSONObject.string(key: String): String = optString(key).takeUnless { it == "null" }.orEmpty()
-private fun JSONObject.int(key: String): Int? = parseJsonInt(opt(key))
-private fun JSONObject.long(key: String): Long? = when (val value = opt(key)) {
-    is Number -> parseCompactLong(value.toString())
-    is String -> parseCompactLong(value)
-    else -> null
-}
-private fun JSONObject.array(key: String): JSONArray = optJSONArray(key) ?: JSONArray()
-private fun JSONObject.obj(key: String): JSONObject = optJSONObject(key) ?: JSONObject()
-private fun JSONObject.stringList(key: String, limit: Int = 200): List<String> =
-    array(key).objectsOrValues(limit).mapNotNull { it.primitiveContent() }
-private fun JSONArray.objectsOrValues(limit: Int = MAX_JSON_ARRAY_ITEMS): List<Any?> = buildList(minOf(length(), limit.coerceAtLeast(0))) {
-    for (index in 0 until minOf(length(), limit.coerceAtLeast(0))) add(opt(index))
-}
-private fun Any?.primitiveContent(): String? = this?.toString()?.takeUnless { it == "null" }
-
-internal fun parseFavoritePage(
-    payload: JSONObject,
-    page: Int = 1,
-    coverResolver: (String) -> String = { id -> "https://cover.invalid/$id.jpg" },
-): JmFavoritePage {
-    val root = payload.optJSONObject("data") ?: payload
-    val safePage = page.coerceIn(1, MAX_OFFICIAL_PAGE)
-    val items = firstJsonArray(root, "list", "content", "data", "albums", "favorites", "photos")
-        ?.objectsOrValues(MAX_FAVORITE_SYNC_ITEMS)
-        ?.mapNotNull { value ->
-            val item = value as? JSONObject ?: return@mapNotNull null
-            val id = firstJsonString(item, "id", "aid", "album_id")
-                .take(MAX_ACCOUNT_FIELD_LENGTH)
-                .takeIf { it.matches(Regex("\\d{1,12}")) }
-                ?: return@mapNotNull null
-            val title = firstJsonString(item, "name", "title")
-                .take(MAX_FAVORITE_TITLE_LENGTH)
-                .ifBlank { "JM$id" }
-            val rawCover = firstJsonString(item, "image", "cover", "photo", "img", "image_url")
-            JmFavoriteItem(
-                id = id,
-                title = title,
-                description = firstJsonString(item, "description", "desc").take(MAX_FAVORITE_DESCRIPTION_LENGTH),
-                coverUrl = normalizeFavoriteImage(rawCover, id, coverResolver),
-                authors = favoriteAuthors(item),
-            )
-        }
-        ?.distinctBy(JmFavoriteItem::id)
-        .orEmpty()
-    val reportedTotal = firstJsonLong(root, "total", "count")
-    return JmFavoritePage(
-        page = safePage,
-        total = JmGateway.normalizedPagedTotal(safePage, OFFICIAL_FAVORITE_PAGE_SIZE, items.size, reportedTotal),
-        items = items,
-        hasMore = JmGateway.hasMorePagedResults(safePage, OFFICIAL_FAVORITE_PAGE_SIZE, items.size, reportedTotal),
-    )
-}
-
-private fun favoriteAuthors(item: JSONObject): List<String> {
-    val values = item.opt("author").takeUnless { it == null || it == JSONObject.NULL } ?: item.opt("authors")
-    return when (values) {
-        is JSONArray -> values.objectsOrValues(MAX_FAVORITE_AUTHORS)
-            .mapNotNull(Any?::primitiveContent)
-            .map { it.take(MAX_FAVORITE_FIELD_LENGTH) }
-            .filter(String::isNotBlank)
-        is String -> values.split(',', '、', ';')
-            .map { it.trim().take(MAX_FAVORITE_FIELD_LENGTH) }
-            .filter(String::isNotBlank)
-        else -> emptyList()
-    }.distinct().take(MAX_FAVORITE_AUTHORS)
-}
-
-private fun normalizeFavoriteImage(raw: String, id: String, coverResolver: (String) -> String): String? {
-    val value = raw.trim()
-    val fallback = coverResolver(id)
-    if (value.isBlank()) return fallback
-    JmGateway.normalizeRemoteHttpsUrl(value)?.let { return it }
-    val fallbackHost = fallback.toHttpUrlOrNull()?.host ?: return null
-    if (value.startsWith('/') && !value.contains("..") && !value.contains('?') && !value.contains('#')) {
-        return "https://$fallbackHost$value"
-    }
-    return if (value.matches(Regex("^[A-Za-z0-9_-]{1,128}\\.(?:jpg|jpeg|png|webp)$", RegexOption.IGNORE_CASE))) {
-        "https://$fallbackHost/media/albums/$value"
-    } else {
-        null
-    }
-}
-
-/**
- * The forum payload has changed field casing over time (CID vs cid, replys vs replies),
- * so keep the compatibility rules in one parser instead of leaking them into the UI.
- */
-internal fun parseJmCommentPage(payload: JSONObject, page: Int = 1): JmCommentPage {
-    val root = payload.optJSONObject("data") ?: payload
-    val items = firstJsonArray(root, "list", "comments", "content", "data")
-        ?.objectsOrValues(MAX_COMMENT_ITEMS)
-        ?.mapIndexedNotNull { index, value ->
-            (value as? JSONObject)?.let { parseJmComment(it, "${page.coerceAtLeast(1)}-${index + 1}", 0) }
-        }
-        ?.distinctBy(JmComment::id)
-        .orEmpty()
-    val reportedTotal = firstJsonLong(root, "total", "count")
-    val safePage = page.coerceIn(1, MAX_OFFICIAL_PAGE)
-    val total = JmGateway.normalizedPagedTotal(
-        page = safePage,
-        pageSize = OFFICIAL_COMMENT_PAGE_SIZE,
-        loaded = items.size,
-        reportedTotal = reportedTotal,
-    )
-    return JmCommentPage(
-        page = safePage,
-        total = total,
-        comments = items,
-        hasMore = JmGateway.hasMorePagedResults(
-            page = page,
-            pageSize = OFFICIAL_COMMENT_PAGE_SIZE,
-            loaded = items.size,
-            total = reportedTotal,
-        ),
-    )
-}
-
-private const val MAX_COMMENT_REPLY_DEPTH = 2
-private const val OFFICIAL_COMMENT_PAGE_SIZE = 10
-private const val MAX_COMMENT_ITEMS = 50
-private const val MAX_COMMENT_REPLIES = 50
-private const val MAX_COMMENT_TEXT_LENGTH = 20_000
-private const val MAX_COMMENT_FIELD_LENGTH = 512
-private const val MAX_JSON_ARRAY_ITEMS = 20_000
-private const val MAX_EMBEDDED_JSON_ARRAY_CHARS = 512 * 1024
-
-private fun parseJmComment(value: JSONObject, fallbackId: String, depth: Int): JmComment {
-    val id = firstJsonString(value, "CID", "cid", "comment_id", "id")
-        .take(MAX_COMMENT_FIELD_LENGTH)
-        .ifBlank { fallbackId }
-    val replies = if (depth >= MAX_COMMENT_REPLY_DEPTH) {
-        emptyList()
-    } else {
-        firstJsonArray(value, "replys", "replies", "reply")
-            ?.objectsOrValues(MAX_COMMENT_REPLIES)
-            ?.mapIndexedNotNull { index, child ->
-                (child as? JSONObject)?.let { parseJmComment(it, "$id-r${index + 1}", depth + 1) }
-            }
-            .orEmpty()
-    }
-    return JmComment(
-        id = id,
-        userId = firstJsonString(value, "UID", "uid", "user_id").take(MAX_COMMENT_FIELD_LENGTH).takeIf(String::isNotBlank),
-        albumId = firstJsonString(value, "AID", "aid", "album_id").take(MAX_COMMENT_FIELD_LENGTH).takeIf(String::isNotBlank),
-        username = firstJsonString(value, "username", "user_name", "name").take(MAX_COMMENT_FIELD_LENGTH),
-        nickname = firstJsonString(value, "nickname", "display_name").take(MAX_COMMENT_FIELD_LENGTH),
-        content = firstJsonString(value, "content", "comment", "text").take(MAX_COMMENT_TEXT_LENGTH),
-        avatarUrl = firstJsonString(value, "photo", "avatar", "avatar_url")
-            .take(MAX_COMMENT_FIELD_LENGTH)
-            .takeIf(String::isNotBlank),
-        createdAt = firstJsonString(value, "addtime", "update_at", "created_at", "time").take(MAX_COMMENT_FIELD_LENGTH),
-        likes = (firstJsonLong(value, "likes", "like", "like_count") ?: 0L).coerceAtLeast(0L),
-        parentId = firstJsonString(value, "parent_CID", "parent_cid", "parent_id")
-            .take(MAX_COMMENT_FIELD_LENGTH)
-            .takeIf(String::isNotBlank),
-        spoiler = firstJsonString(value, "spoiler", "is_spoiler") in setOf("1", "true", "TRUE", "yes"),
-        replies = replies,
-    )
-}
-
-private fun JmComment.withAvatarHost(host: String?): JmComment = copy(
-    avatarUrl = avatarUrl?.trim()?.let { raw ->
-        when {
-            raw.startsWith("https://", ignoreCase = true) -> JmGateway.normalizeRemoteHttpsUrl(raw)
-            host.isNullOrBlank() -> null
-            else -> {
-                val safeHost = JmGateway.normalizeRemoteDomain(host) ?: return@let null
-                val path = if (raw.startsWith('/')) raw else "/media/users/${raw.trimStart('/')}"
-                if (path.length > MAX_COMMENT_FIELD_LENGTH ||
-                    path.contains("..") || path.contains('\\') || path.contains('?') || path.contains('#')
-                ) null else "https://$safeHost$path"
-            }
-        }
-    },
-    replies = replies.map { reply -> reply.withAvatarHost(host) },
-)
-
-private fun firstJsonArray(value: JSONObject, vararg keys: String): JSONArray? {
-    keys.forEach { key ->
-        value.optJSONArray(key)?.let { return it }
-        val encoded = value.optString(key).trim()
-        if (encoded.startsWith("[") && encoded.length <= MAX_EMBEDDED_JSON_ARRAY_CHARS) {
-            runCatching { JSONArray(encoded) }.getOrNull()?.let { return it }
-        }
-    }
-    return null
-}
-
-private fun firstJsonString(value: JSONObject, vararg keys: String): String =
-    keys.asSequence()
-        .map { value.string(it).trim() }
-        .firstOrNull(String::isNotBlank)
-        .orEmpty()
-
-private fun firstJsonLong(value: JSONObject, vararg keys: String): Long? =
-    keys.asSequence()
-        .mapNotNull { value.long(it) }
-        .firstOrNull()
-
-internal fun parseJsonInt(value: Any?): Int? {
-    val parsed = when (value) {
-        is Number, is String -> value.toString().trim().toLongOrNull()
-        else -> null
-    } ?: return null
-    return parsed.takeIf { it in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong() }?.toInt()
-}
-
-internal fun parseCompactLong(raw: String): Long? {
-    val normalized = raw.replace(",", "").trim()
-    normalized.toLongOrNull()?.let { return it }
-    val match = Regex("^([0-9]+(?:\\.[0-9]+)?)([KMB万億亿]?)$", RegexOption.IGNORE_CASE)
-        .matchEntire(normalized) ?: return null
-    val number = match.groupValues[1].toDoubleOrNull() ?: return null
-    val multiplier = when (match.groupValues[2].uppercase()) {
-        "K" -> 1_000L
-        "M" -> 1_000_000L
-        "B" -> 1_000_000_000L
-        "万" -> 10_000L
-        "億", "亿" -> 100_000_000L
-        else -> 1L
-    }
-    val result = number * multiplier
-    return result.takeIf(Double::isFinite)?.takeIf { it <= Long.MAX_VALUE }?.toLong()
-}
 

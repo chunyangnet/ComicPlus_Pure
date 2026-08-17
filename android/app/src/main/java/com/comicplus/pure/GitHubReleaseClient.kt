@@ -31,6 +31,10 @@ class GitHubReleaseClient(
         .build(),
 ) {
     private val closed = AtomicBoolean(false)
+    private val removeRouteChangeListener = SystemVpnMonitor.registerRouteChangeListener {
+        client.dispatcher.cancelAll()
+        client.connectionPool.evictAll()
+    }
 
     suspend fun latest(): GitHubRelease = withContext(Dispatchers.IO) {
         if (closed.get()) throw CancellationException("更新客户端已关闭")
@@ -60,6 +64,7 @@ class GitHubReleaseClient(
 
     fun close() {
         if (!closed.compareAndSet(false, true)) return
+        removeRouteChangeListener()
         client.dispatcher.cancelAll()
         client.connectionPool.evictAll()
         client.dispatcher.executorService.shutdown()

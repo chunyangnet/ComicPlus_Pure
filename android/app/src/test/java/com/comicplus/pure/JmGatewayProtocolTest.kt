@@ -90,6 +90,11 @@ class JmGatewayProtocolTest {
     }
 
     @Test
+    fun lowerHexEncodingHandlesSignedBytesWithoutFormattingAllocations() {
+        assertEquals("000f10ff", encodeLowerHex(byteArrayOf(0x00, 0x0f, 0x10, 0xff.toByte())))
+    }
+
+    @Test
     fun metadataTextCannotCreateExtraFields() {
         assertEquals("标题 副标题", sanitizeMetadataText("标题\r\n副标题"))
     }
@@ -109,6 +114,22 @@ class JmGatewayProtocolTest {
         assertEquals(null, parseJsonInt(Int.MAX_VALUE.toLong() + 1L))
         assertEquals(null, parseJsonInt(Long.MAX_VALUE))
         assertEquals(null, parseJsonInt("1.5"))
+    }
+
+    @Test
+    fun jsonAliasHelpersSkipBlankValuesAndBoundEmbeddedArrays() {
+        val payload = JSONObject()
+            .put("blank", "   ")
+            .put("fallback", "  usable  ")
+            .put("embedded", "[1,2,3]")
+
+        assertEquals("usable", firstJsonString(payload, "blank", "fallback"))
+        assertEquals(
+            listOf("1", "2"),
+            firstJsonArray(payload, "embedded")
+                ?.objectsOrValues(limit = 2)
+                ?.mapNotNull(Any?::primitiveContent),
+        )
     }
 
     @Test
@@ -315,10 +336,89 @@ class JmGatewayProtocolTest {
     }
 
     @Test
+    fun cookieJarReplacesTheSameCookieIdentityWithoutDuplicates() {
+        val jar = MemoryCookieJar()
+        val url = "https://example.com/setting".toHttpUrl()
+        fun cookie(value: String) = Cookie.Builder()
+            .name("AVS")
+            .value(value)
+            .domain("example.com")
+            .path("/")
+            .build()
+
+        jar.saveFromResponse(url, listOf(cookie("old")))
+        jar.saveFromResponse(url, listOf(cookie("new")))
+
+        assertEquals(listOf("new"), jar.loadForRequest(url).map { it.value })
+    }
+
+    @Test
+    fun cookieJarPublishesRotatedSessionCookies() {
+        val updates = mutableListOf<String>()
+        val jar = MemoryCookieJar { cookie ->
+            if (cookie.name == "AVS") updates += cookie.value
+        }
+        val url = "https://example.com/setting".toHttpUrl()
+
+        jar.saveFromResponse(
+            url,
+            listOf(
+                Cookie.Builder()
+                    .name("AVS")
+                    .value("rotated-session")
+                    .domain("example.com")
+                    .path("/")
+                    .build(),
+            ),
+        )
+
+        assertEquals(listOf("rotated-session"), updates)
+    }
+
+    @Test
+    fun manuallyInstalledSessionCookieDoesNotLookLikeServerRotation() {
+        val updates = mutableListOf<String>()
+        val jar = MemoryCookieJar { cookie -> updates += cookie.value }
+        val url = "https://example.com/setting".toHttpUrl()
+        val cookie = Cookie.Builder()
+            .name("AVS")
+            .value("restored-session")
+            .domain("example.com")
+            .path("/")
+            .build()
+
+        jar.install(url, listOf(cookie))
+
+        assertEquals(emptyList<String>(), updates)
+        assertEquals(listOf("restored-session"), jar.loadForRequest(url).map { it.value })
+    }
+
+    @Test
     fun chapterImageOrderingDoesNotDropFilesWithSameOrMissingSequence() {
         assertEquals(
             listOf("1.jpg", "1.png", "cover.webp", "extra.jpeg"),
             JmGateway.normalizeChapterImageFiles(listOf("extra.jpeg", "1.png", "cover.webp", "1.jpg", "1.JPG")),
+        )
+    }
+
+    @Test
+    fun mirroredComicPagesShareOneLogicalCacheIdentity() {
+        val firstMirror = JmPage(
+            index = 1,
+            photoId = "123",
+            fileName = "00001.jpg",
+            scrambleId = "220980",
+            url = "https://cdn-msp.jmapiproxy1.cc/media/photos/123/00001.jpg",
+            referer = "https://example.com/",
+        )
+        val secondMirror = firstMirror.copy(
+            url = "https://cdn-msp.jmapiproxy2.cc/media/photos/123/00001.jpg",
+        )
+
+        assertEquals(pageContentIdentity(firstMirror), pageContentIdentity(secondMirror))
+        assertEquals(
+            false,
+            pageContentIdentity(firstMirror) == pageContentIdentity(firstMirror.copy(fileName = "00002.jpg")),
         )
     }
 
@@ -334,4 +434,69 @@ class JmGatewayProtocolTest {
             parseJmCommentPage(JSONObject("""{"list":[{"CID":"1"}]}"""), page = 1).hasMore,
         )
     }
+
+    @Test
+    fun imageConnectionWarmupExpiresBeforeIdleConnectionsAreReaped() {
+        assertEquals(false, JmGateway.isImageWarmupFresh(null, now = 100L))
+        assertEquals(true, JmGateway.isImageWarmupFresh(lastWarmedAt = 100L, now = 239_999L))
+        assertEquals(false, JmGateway.isImageWarmupFresh(lastWarmedAt = 100L, now = 240_100L))
+        assertEquals(false, JmGateway.isImageWarmupFresh(lastWarmedAt = 200L, now = 100L))
+    }
+
+    @Test
+    fun restoredSessionIsOnlyInvalidatedWhenEveryReachableResultRejectsAuthentication() {
+        assertEquals(true, JmGateway.shouldInvalidateRestoredSession(authFailures = 2, otherFailures = 0))
+        assertEquals(false, JmGateway.shouldInvalidateRestoredSession(authFailures = 1, otherFailures = 1))
+        assertEquals(false, JmGateway.shouldInvalidateRestoredSession(authFailures = 0, otherFailures = 3))
+    }
+
+    @Test
+    fun imageDecodeConcurrencyProtectsLowMemoryDevices() {
+        assertEquals(1, JmGateway.imageWorkPermits(memoryMb = 384, isLowRamDevice = false))
+        assertEquals(1, JmGateway.imageWorkPermits(memoryMb = 512, isLowRamDevice = true))
+        assertEquals(2, JmGateway.imageWorkPermits(memoryMb = 512, isLowRamDevice = false))
+    }
+
+    @Test
+    fun homeFeedMergeKeepsPriorityOrderAndRemovesDuplicates() {
+        val first = listOf(ranking("1"), ranking("2"))
+        val second = listOf(ranking("2"), ranking("3"))
+
+        assertEquals(listOf("1", "2", "3"), mergeHomeRankings(first, second).map(JmRanking::id))
+    }
+
+    @Test
+    fun rankingCapabilityRequiresAtLeastOneUsableItem() {
+        assertEquals(false, JSONObject("""{"content":[]}""").hasUsableRankingPayload("content"))
+        assertEquals(
+            false,
+            JSONObject("""{"content":[{"id":"bad","name":"Broken"}]}""")
+                .hasUsableRankingPayload("content"),
+        )
+        assertEquals(
+            true,
+            JSONObject("""{"content":[{"id":"123","name":"Supported"}]}""")
+                .hasUsableRankingPayload("content"),
+        )
+    }
+
+    @Test
+    fun weeklyCapabilityAcceptsTypeAndTypesPayloadVariants() {
+        assertEquals(
+            true,
+            JSONObject("""{"categories":[{"id":"1"}],"type":[{"id":"2"}]}""")
+                .hasUsableWeekCatalogPayload(),
+        )
+        assertEquals(
+            true,
+            JSONObject("""{"data":{"categories":[{"id":"1"}],"types":[{"id":"2"}]}}""")
+                .hasUsableWeekCatalogPayload(),
+        )
+        assertEquals(
+            false,
+            JSONObject("""{"categories":[],"types":[]}""").hasUsableWeekCatalogPayload(),
+        )
+    }
+
+    private fun ranking(id: String) = JmRanking(id = id, title = "Comic $id", coverUrl = null)
 }

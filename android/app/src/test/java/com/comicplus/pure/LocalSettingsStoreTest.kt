@@ -1,5 +1,6 @@
 package com.comicplus.pure
 
+import com.comicplus.app.ui.ReaderPrefetchMode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -39,5 +40,17 @@ class LocalSettingsStoreTest {
         assertEquals(true to false, LocalSettingsStore.normalizeReaderModes(true, true))
         assertEquals(false to true, LocalSettingsStore.normalizeReaderModes(false, true))
         assertEquals(true to false, LocalSettingsStore.normalizeReaderModes(true, false))
+    }
+
+    @Test
+    fun dataSaverDowngradesPersistedUltraAggressivePreloading() {
+        assertEquals(
+            ReaderPrefetchMode.Conservative,
+            LocalSettingsStore.normalizeReaderPrefetchMode(ReaderPrefetchMode.UltraAggressive, dataSaver = true),
+        )
+        assertEquals(
+            ReaderPrefetchMode.UltraAggressive,
+            LocalSettingsStore.normalizeReaderPrefetchMode(ReaderPrefetchMode.UltraAggressive, dataSaver = false),
+        )
     }
 }

@@ -37,6 +37,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -61,8 +62,6 @@ import com.comicplus.app.ui.theme.InkSoft
 import com.comicplus.app.ui.theme.Muted
 import com.comicplus.app.ui.theme.SurfaceSoft
 import com.comicplus.app.ui.theme.White
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filter
 
 private data class JmSearchScope(val id: Int, val label: String)
 private data class JmSearchOrder(val id: String, val label: String)
@@ -225,20 +224,24 @@ private fun SearchResultList(
     favoriteKeys: Set<String>,
     onToggleFavorite: (ComicUiItem) -> Unit,
 ) {
-	val listState = rememberLazyListState()
-	LaunchedEffect(listState, state.hasMore, state.loadingMore, state.items.size, state.error) {
-		if (!state.hasMore || state.loadingMore || state.items.isEmpty() || state.error != null) return@LaunchedEffect
-		snapshotFlow {
-			val info = listState.layoutInfo
-			val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: 0
-			lastVisible >= info.totalItemsCount - 5
-		}
-			.distinctUntilChanged()
-			.filter { it }
-			.collect { onLoadMore() }
-	}
+    val listState = rememberLazyListState()
+    val currentCanLoadMore = rememberUpdatedState(
+        state.items.isNotEmpty() && state.hasMore && !state.loadingMore && state.error == null,
+    )
+    val currentOnLoadMore = rememberUpdatedState(onLoadMore)
+    // Loading and item-count changes must not restart this collector: if the
+    // viewport is still near the end, a restart would immediately chain pages.
+    LaunchedEffect(listState, state.query, state.mainTag, state.order) {
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+            info.totalItemsCount > 0 && lastVisible >= info.totalItemsCount - 5
+        }.collect { nearEnd ->
+            if (nearEnd && currentCanLoadMore.value) currentOnLoadMore.value()
+        }
+    }
     LazyColumn(
-		state = listState,
+        state = listState,
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(horizontal = CpDimens.screenPadding, vertical = 4.dp),
     ) {

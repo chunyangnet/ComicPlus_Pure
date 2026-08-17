@@ -41,6 +41,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -48,6 +49,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -58,7 +60,9 @@ import com.comicplus.app.data.source.SourceChapterDto
 import com.comicplus.app.ui.ComicResolveUiState
 import com.comicplus.app.ui.JmCommentUiItem
 import com.comicplus.app.ui.JmCommentsUiState
+import com.comicplus.app.ui.LocalFavoritePendingKeys
 import com.comicplus.app.ui.markdownToAnnotatedString
+import com.comicplus.app.ui.rememberDelayedBusyIndicator
 import com.comicplus.app.ui.components.ComicCover
 import com.comicplus.app.ui.components.CpDimens
 import com.comicplus.app.ui.components.FavoriteButton
@@ -76,6 +80,8 @@ import com.comicplus.app.ui.theme.Muted
 import com.comicplus.app.ui.theme.SurfaceSoft
 import com.comicplus.app.ui.theme.White
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 @Composable
 fun ComicDetailScreen(
@@ -87,6 +93,10 @@ fun ComicDetailScreen(
     onBack: () -> Unit,
     onShare: (ComicResolveUiState.Ready) -> Unit,
     onRead: (ComicResolveUiState.Ready, SourceChapterDto) -> Unit,
+    onContinueReading: (ComicResolveUiState.Ready, SourceChapterDto, Int) -> Unit = { detail, chapter, _ ->
+        onRead(detail, chapter)
+    },
+    onSelectCommentChapter: (SourceChapterDto) -> Unit = {},
     modifier: Modifier = Modifier,
     downloadedChapterIds: Set<String> = emptySet(),
     downloadProgress: Map<String, Float> = emptyMap(),
@@ -98,6 +108,9 @@ fun ComicDetailScreen(
     onLoadMoreComments: () -> Unit = {},
 ) {
     BackHandler(onBack = onBack)
+    val favoritePending = (state as? ComicResolveUiState.Ready)?.let { ready ->
+        "${ready.source}:${ready.jmId}" in LocalFavoritePendingKeys.current
+    } == true
     Scaffold(
         modifier = modifier.fillMaxSize(),
         containerColor = Canvas,
@@ -107,6 +120,7 @@ fun ComicDetailScreen(
                 onShare = (state as? ComicResolveUiState.Ready)?.let { ready -> { onShare(ready) } },
                 isFavorite = (state as? ComicResolveUiState.Ready)?.let { isFavorite },
                 onToggleFavorite = (state as? ComicResolveUiState.Ready)?.let { ready -> { onToggleFavorite(ready) } },
+                favoritePending = favoritePending,
             )
         },
     ) { padding ->
@@ -128,6 +142,8 @@ fun ComicDetailScreen(
                 chapterDescending = chapterDescending,
                 onChapterDescendingChange = onChapterDescendingChange,
                 onRead = onRead,
+                onContinueReading = onContinueReading,
+                onSelectCommentChapter = onSelectCommentChapter,
                 downloadedChapterIds = downloadedChapterIds,
                 downloadProgress = downloadProgress,
                 onDownload = onDownload,
@@ -149,6 +165,7 @@ private fun DetailTopBar(
     onShare: (() -> Unit)?,
     isFavorite: Boolean?,
     onToggleFavorite: (() -> Unit)?,
+    favoritePending: Boolean,
 ) {
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 0.dp, shadowElevation = 1.dp) {
         Row(
@@ -172,6 +189,7 @@ private fun DetailTopBar(
                     icon = if (isFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
                     contentDescription = if (isFavorite) "取消收藏" else "加入收藏",
                     onClick = onToggleFavorite,
+                    loading = favoritePending,
                 )
             }
             if (onShare != null) {
@@ -192,9 +210,11 @@ private fun DetailTopBarAction(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     contentDescription: String,
     onClick: () -> Unit,
+    loading: Boolean = false,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
+    val showLoading = rememberDelayedBusyIndicator(loading)
     Surface(
         modifier = Modifier
             .size(40.dp)
@@ -205,10 +225,24 @@ private fun DetailTopBarAction(
     ) {
         IconButton(
             onClick = onClick,
+            enabled = !loading,
             interactionSource = interactionSource,
             modifier = Modifier.fillMaxSize(),
         ) {
-            Icon(icon, contentDescription = contentDescription, tint = Ink, modifier = Modifier.size(20.dp))
+            if (showLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    color = MaterialTheme.colorScheme.primary,
+                    strokeWidth = 2.dp,
+                )
+            } else {
+                Icon(
+                    icon,
+                    contentDescription = if (loading) "收藏同步中" else contentDescription,
+                    tint = Ink,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
         }
     }
 }
@@ -222,6 +256,8 @@ private fun DetailReady(
     onChapterDescendingChange: (Boolean) -> Unit,
     reduceMotion: Boolean,
     onRead: (ComicResolveUiState.Ready, SourceChapterDto) -> Unit,
+    onContinueReading: (ComicResolveUiState.Ready, SourceChapterDto, Int) -> Unit,
+    onSelectCommentChapter: (SourceChapterDto) -> Unit,
     downloadedChapterIds: Set<String>,
     downloadProgress: Map<String, Float>,
     onDownload: (ComicResolveUiState.Ready, SourceChapterDto) -> Unit,
@@ -237,9 +273,11 @@ private fun DetailReady(
             listOf(SourceChapterDto(sourceChapterId = state.jmId, index = 1, title = "第 1 话"))
         }
     }
-    val resumableChapterId = state.resumeChapterId?.takeIf { resumeId ->
-        autoResumeReading && chapters.any { it.sourceChapterId == resumeId }
-    }
+    val readingEntry = remember(chapters, state.resumeChapterId, state.resumePageIndex) {
+        resolveReadingEntry(chapters, state.resumeChapterId, state.resumePageIndex)
+    } ?: return
+    val savedChapter = readingEntry.chapter.takeIf { readingEntry.resumed }
+    val resumableChapterId = savedChapter?.sourceChapterId?.takeIf { autoResumeReading }
     var selectedChapterId by rememberSaveable(state.jmId) {
         mutableStateOf(resumableChapterId ?: chapters.first().sourceChapterId)
     }
@@ -251,17 +289,21 @@ private fun DetailReady(
     LaunchedEffect(chapterDescending, state.jmId) {
         descending = chapterDescending
     }
-    val selectedChapter = chapters.firstOrNull { it.sourceChapterId == selectedChapterId } ?: chapters.first()
-    val ranges = remember(chapters, descending) { buildChapterRanges(chapters, descending) }
+    val entryChapter = readingEntry.chapter
+    val entryPageIndex = readingEntry.pageIndex
+    val chapterCatalog = remember(chapters, descending) {
+        buildDetailChapterCatalog(chapters, descending)
+    }
+    val ranges = chapterCatalog.ranges
     var selectedRangeKey by rememberSaveable(state.jmId) {
         mutableStateOf(ranges.firstOrNull()?.key.orEmpty())
     }
-    LaunchedEffect(ranges, selectedChapterId) {
-        if (ranges.none { it.key == selectedRangeKey }) selectedRangeKey = ranges.firstOrNull()?.key.orEmpty()
-        ranges.firstOrNull { range -> range.chapters.any { it.sourceChapterId == selectedChapterId } }
-            ?.let { selectedRangeKey = it.key }
+    LaunchedEffect(chapterCatalog, selectedChapterId) {
+        selectedRangeKey = chapterCatalog.rangeKeyByChapterId[selectedChapterId]
+            ?: selectedRangeKey.takeIf(chapterCatalog.rangesByKey::containsKey)
+            ?: ranges.firstOrNull()?.key.orEmpty()
     }
-    val selectedRange = ranges.firstOrNull { it.key == selectedRangeKey } ?: ranges.first()
+    val selectedRange = chapterCatalog.rangesByKey[selectedRangeKey] ?: ranges.first()
     val visibleChapters = remember(chapters, selectedRange, query, descending) {
         val keyword = query.trim()
         val base = if (keyword.isBlank()) selectedRange.chapters else chapters.filter {
@@ -274,14 +316,35 @@ private fun DetailReady(
     val scope = rememberCoroutineScope()
     var selectedSection by rememberSaveable(state.jmId) { mutableStateOf(DetailSection.Chapters.name) }
     val section = DetailSection.entries.firstOrNull { it.name == selectedSection } ?: DetailSection.Chapters
-    val visibleComments = comments.takeIf { it.comicId == state.jmId }
-        ?: JmCommentsUiState(comicId = state.jmId, loading = true)
+    val selectedCommentChapter = chapterCatalog.chaptersById[selectedChapterId] ?: chapters.first()
+    val visibleComments = comments.takeIf {
+        it.comicId == state.jmId && it.chapterId == selectedCommentChapter.sourceChapterId
+    } ?: JmCommentsUiState(
+        comicId = state.jmId,
+        chapterId = selectedCommentChapter.sourceChapterId,
+        loading = true,
+    )
     val chapterContentStartIndex = if (ranges.size > 1 && query.isBlank()) 5 else 4
     LaunchedEffect(selectedRangeKey, query, descending) {
         if (section == DetailSection.Chapters && chapterListState.firstVisibleItemIndex > chapterContentStartIndex) {
             chapterListState.scrollToItem(chapterContentStartIndex)
         }
     }
+    LaunchedEffect(section, state.jmId, selectedCommentChapter.sourceChapterId) {
+        if (section == DetailSection.Comments) {
+            onSelectCommentChapter(selectedCommentChapter)
+            commentListState.scrollToItem(0)
+        }
+    }
+    CommentListLoadMoreEffect(
+        listState = commentListState,
+        contentKey = "${state.jmId}:${selectedCommentChapter.sourceChapterId}",
+        enabled = section == DetailSection.Comments && visibleComments.loaded && visibleComments.items.isNotEmpty(),
+        loading = visibleComments.loadingMore,
+        hasMore = visibleComments.hasMore,
+        error = visibleComments.error,
+        onLoadMore = onLoadMoreComments,
+    )
 
     Scaffold(
         modifier = modifier,
@@ -294,9 +357,9 @@ private fun DetailReady(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Column(Modifier.weight(1f)) {
-                            Text("当前章节", color = Muted, style = MaterialTheme.typography.labelSmall)
+                            Text(if (savedChapter != null) "上次阅读" else "开始章节", color = Muted, style = MaterialTheme.typography.labelSmall)
                             Text(
-                                selectedChapter.title,
+                                entryChapter.title,
                                 color = Ink,
                                 style = MaterialTheme.typography.labelLarge,
                                 maxLines = 1,
@@ -305,7 +368,7 @@ private fun DetailReady(
                         }
                         Spacer(Modifier.width(14.dp))
                         Button(
-                            onClick = { onRead(state, selectedChapter) },
+                            onClick = { onContinueReading(state, entryChapter, entryPageIndex) },
                             modifier = Modifier.height(48.dp),
                             shape = RoundedCornerShape(CpDimens.controlRadius),
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
@@ -313,9 +376,7 @@ private fun DetailReady(
                         ) {
                             Text(
                                 if (
-                                    autoResumeReading &&
-                                    selectedChapter.sourceChapterId == state.resumeChapterId &&
-                                    state.resumePageIndex > 0
+                                    savedChapter != null
                                 ) {
                                     "继续阅读"
                                 } else {
@@ -429,8 +490,9 @@ private fun DetailReady(
                             selected = chapter.sourceChapterId == selectedChapterId,
                             onClick = {
                                 selectedChapterId = chapter.sourceChapterId
-                                ranges.firstOrNull { range -> range.chapters.any { it.sourceChapterId == chapter.sourceChapterId } }
-                                    ?.let { selectedRangeKey = it.key }
+                                chapterCatalog.rangeKeyByChapterId[chapter.sourceChapterId]
+                                    ?.let { selectedRangeKey = it }
+                                onRead(state, chapter)
                             },
                             downloaded = chapter.sourceChapterId in downloadedChapterIds,
                             progress = downloadProgress[chapter.sourceChapterId],
@@ -448,8 +510,27 @@ private fun DetailReady(
                 }
 
                 DetailSection.Comments -> {
+                    item(key = "comment-chapter-selector", contentType = "comment-chapter-selector") {
+                        Text(
+                            "评论章节",
+                            modifier = Modifier.padding(start = CpDimens.screenPadding, top = 12.dp, bottom = 7.dp),
+                            color = Muted,
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                        PillRow(
+                            labels = chapterCatalog.chapterLabels,
+                            selectedIndex = chapterCatalog.chapterIndicesById[selectedCommentChapter.sourceChapterId] ?: 0,
+                            onSelected = { index ->
+                                chapters.getOrNull(index)?.let { chapter ->
+                                    selectedChapterId = chapter.sourceChapterId
+                                }
+                            },
+                            contentPadding = PaddingValues(horizontal = CpDimens.screenPadding),
+                        )
+                        Spacer(Modifier.height(4.dp))
+                    }
                     item(key = "comment-heading", contentType = "comment-heading") {
-                        OfficialCommentsHeader(visibleComments)
+                        OfficialCommentsHeader(visibleComments, selectedCommentChapter.title)
                     }
                     when {
                         visibleComments.loading && visibleComments.items.isEmpty() -> item(
@@ -514,20 +595,21 @@ private enum class DetailSection(val label: String) {
 @Composable
 private fun OfficialCommentsHeader(
     state: JmCommentsUiState,
+    chapterTitle: String,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = CpDimens.screenPadding, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {
-            Text("官方评论", color = Ink, style = MaterialTheme.typography.titleLarge)
+            Text("${chapterTitle.ifBlank { "本章" }}评论", color = Ink, style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.height(3.dp))
             Text(
                 when {
-                    state.loading -> "正在读取 JM 官方评论"
+                    state.loading -> "正在读取本章 JM 官方评论"
                     state.total > 0L -> "共 ${formatCommentCount(state.total)} 条"
-                    state.loaded -> "JM 官方评论"
-                    else -> "JM 官方论坛"
+                    state.loaded -> "本章暂时没有评论"
+                    else -> "JM 官方章节评论"
                 },
                 color = Muted,
                 style = MaterialTheme.typography.bodySmall,
@@ -543,7 +625,7 @@ private fun OfficialCommentsHeader(
 }
 
 @Composable
-private fun OfficialCommentItem(
+internal fun OfficialCommentItem(
     comment: JmCommentUiItem,
     modifier: Modifier = Modifier,
     replyDepth: Int = 0,
@@ -671,16 +753,33 @@ private fun CommentReplyList(
     replyDepth: Int,
     modifier: Modifier = Modifier,
 ) {
+    var expanded by rememberSaveable(parentId, replies.size) {
+        mutableStateOf(replies.size <= INITIAL_VISIBLE_COMMENT_REPLIES)
+    }
+    val visibleReplies = remember(replies, expanded) {
+        if (expanded) replies else replies.take(INITIAL_VISIBLE_COMMENT_REPLIES)
+    }
     Column(modifier) {
-        replies.forEachIndexed { index, reply ->
+        visibleReplies.forEachIndexed { index, reply ->
             key("$parentId:${reply.id}:$index") {
                 OfficialCommentItem(
                     comment = reply,
                     replyDepth = replyDepth + 1,
                 )
             }
-            if (index < replies.lastIndex) {
+            if (index < visibleReplies.lastIndex) {
                 Spacer(Modifier.fillMaxWidth().height(1.dp).background(Line.copy(alpha = .72f)))
+            }
+        }
+        if (replies.size > INITIAL_VISIBLE_COMMENT_REPLIES) {
+            TextButton(
+                onClick = { expanded = !expanded },
+                modifier = Modifier.align(Alignment.Start),
+            ) {
+                Text(
+                    if (expanded) "收起回复" else "展开其余 ${replies.size - visibleReplies.size} 条回复",
+                    style = MaterialTheme.typography.labelMedium,
+                )
             }
         }
     }
@@ -716,14 +815,27 @@ private fun CommentAvatar(
 @Composable
 private fun CommentText(content: String, compact: Boolean) {
     val source = content.ifBlank { "（无文字内容）" }
-    val text = remember(source) {
-        markdownToAnnotatedString(source)
+    val text = if (source.length <= ASYNC_COMMENT_MARKDOWN_THRESHOLD) {
+        remember(source) { markdownToAnnotatedString(source) }
+    } else {
+        val rendered by produceState<AnnotatedString?>(initialValue = null, key1 = source) {
+            value = withContext(Dispatchers.Default) { markdownToAnnotatedString(source) }
+        }
+        rendered
     }
-    Text(
-        text = text,
-        color = InkSoft,
-        style = if (compact) MaterialTheme.typography.bodySmall else MaterialTheme.typography.bodyMedium,
-    )
+    if (text == null) {
+        Text(
+            text = "正在排版评论…",
+            color = Muted,
+            style = MaterialTheme.typography.labelSmall,
+        )
+    } else {
+        Text(
+            text = text,
+            color = InkSoft,
+            style = if (compact) MaterialTheme.typography.bodySmall else MaterialTheme.typography.bodyMedium,
+        )
+    }
 }
 
 @Composable
@@ -764,7 +876,7 @@ private fun SpoilerPlaceholder(onReveal: () -> Unit) {
 }
 
 @Composable
-private fun CommentListSkeleton(reduceMotion: Boolean, modifier: Modifier = Modifier) {
+internal fun CommentListSkeleton(reduceMotion: Boolean, modifier: Modifier = Modifier) {
     val brush = rememberShimmerBrush(animated = !reduceMotion)
     Column(modifier.padding(horizontal = CpDimens.screenPadding)) {
         repeat(4) {
@@ -785,7 +897,7 @@ private fun CommentListSkeleton(reduceMotion: Boolean, modifier: Modifier = Modi
 }
 
 @Composable
-private fun CommentStateMessage(
+internal fun CommentStateMessage(
     message: String,
     modifier: Modifier = Modifier,
     actionLabel: String? = null,
@@ -823,7 +935,7 @@ private fun CommentStateMessage(
 }
 
 @Composable
-private fun CommentListFooter(
+internal fun CommentListFooter(
     loading: Boolean,
     hasMore: Boolean,
     error: String?,
@@ -854,12 +966,6 @@ private fun CommentListFooter(
     }
 }
 
-private fun formatCommentCount(value: Long): String = when {
-    value >= 100_000_000L -> "${value / 100_000_000L}亿+"
-    value >= 10_000L -> "${value / 10_000L}万+"
-    else -> value.coerceAtLeast(0L).toString()
-}
-
 @Composable
 private fun ComicDetailHeader(
     state: ComicResolveUiState.Ready,
@@ -867,6 +973,9 @@ private fun ComicDetailHeader(
     onToggleFavorite: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val favoriteKey = "${state.source}:${state.jmId}"
+    val favoritePending = favoriteKey in LocalFavoritePendingKeys.current
+    val showFavoriteLoading = rememberDelayedBusyIndicator(favoritePending)
     Row(modifier = modifier.fillMaxWidth().padding(top = 14.dp), verticalAlignment = Alignment.Top) {
         Box(
             Modifier.width(104.dp).height(139.dp).clip(RoundedCornerShape(CpDimens.cardRadius)),
@@ -882,6 +991,7 @@ private fun ComicDetailHeader(
                 onClick = onToggleFavorite,
                 modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
                 compact = true,
+                favoriteKey = favoriteKey,
             )
         }
         Spacer(Modifier.width(17.dp))
@@ -913,7 +1023,7 @@ private fun ComicDetailHeader(
             }
             Spacer(Modifier.height(9.dp))
             Surface(
-                modifier = Modifier.clickable(onClick = onToggleFavorite),
+                modifier = Modifier.clickable(enabled = !favoritePending, onClick = onToggleFavorite),
                 shape = CircleShape,
                 color = if (isFavorite) MaterialTheme.colorScheme.primaryContainer else SurfaceSoft,
             ) {
@@ -921,15 +1031,27 @@ private fun ComicDetailHeader(
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(
-                        if (isFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
-                        contentDescription = null,
-                        tint = if (isFavorite) MaterialTheme.colorScheme.primary else InkSoft,
-                        modifier = Modifier.size(16.dp),
-                    )
+                    if (showFavoriteLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(15.dp),
+                            color = MaterialTheme.colorScheme.primary,
+                            strokeWidth = 1.8.dp,
+                        )
+                    } else {
+                        Icon(
+                            if (isFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                            contentDescription = null,
+                            tint = if (isFavorite) MaterialTheme.colorScheme.primary else InkSoft,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
                     Spacer(Modifier.width(5.dp))
                     Text(
-                        if (isFavorite) "已收藏" else "加入收藏",
+                        when {
+                            showFavoriteLoading -> "同步中"
+                            isFavorite -> "已收藏"
+                            else -> "加入收藏"
+                        },
                         color = if (isFavorite) MaterialTheme.colorScheme.onPrimaryContainer else InkSoft,
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold,
@@ -939,15 +1061,24 @@ private fun ComicDetailHeader(
         }
     }
     if (state.description.isNotBlank()) {
-        Spacer(Modifier.height(17.dp))
-        val description = remember(state.description) { markdownToAnnotatedString(state.description) }
-        Text(
-            text = description,
-            color = InkSoft,
-            style = MaterialTheme.typography.bodyMedium,
-        )
+        val description by produceState<AnnotatedString?>(initialValue = null, key1 = state.description) {
+            value = withContext(Dispatchers.Default) {
+                markdownToAnnotatedString(state.description)
+            }
+        }
+        description?.let { rendered ->
+            Spacer(Modifier.height(17.dp))
+            Text(
+                text = rendered,
+                color = InkSoft,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
     }
 }
+
+private const val INITIAL_VISIBLE_COMMENT_REPLIES = 3
+private const val ASYNC_COMMENT_MARKDOWN_THRESHOLD = 2_000
 
 @Composable
 private fun ChapterRow(
@@ -1058,31 +1189,5 @@ private fun DetailError(state: ComicResolveUiState.Error, onBack: () -> Unit, mo
             }
         }
     }
-}
-
-private data class ChapterRange(
-    val key: String,
-    val label: String,
-    val chapters: List<SourceChapterDto>,
-)
-
-private fun buildChapterRanges(chapters: List<SourceChapterDto>, descending: Boolean): List<ChapterRange> {
-    val sorted = chapters.sortedBy(SourceChapterDto::index)
-    val chunkSize = when {
-        sorted.size <= 40 -> sorted.size.coerceAtLeast(1)
-        sorted.size <= 120 -> 30
-        sorted.size <= 300 -> 50
-        else -> 100
-    }
-    val ranges = sorted.chunked(chunkSize).map { chunk ->
-        val first = chunk.first().index
-        val last = chunk.last().index
-        ChapterRange(
-            key = "$first-$last",
-            label = if (first == last) "$first" else "$first–$last",
-            chapters = if (descending) chunk.asReversed() else chunk,
-        )
-    }
-    return if (descending) ranges.asReversed() else ranges
 }
 

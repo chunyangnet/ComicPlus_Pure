@@ -119,6 +119,7 @@ data class JmCommentUiItem(
 @Immutable
 data class JmCommentsUiState(
     val comicId: String = "",
+    val chapterId: String = "",
     val items: List<JmCommentUiItem> = emptyList(),
     val page: Int = 0,
     val total: Long = 0L,
@@ -250,7 +251,7 @@ data class AppSettings(
 enum class ReaderMode { Vertical, Paged }
 enum class ReaderDirection { LeftToRight, RightToLeft }
 enum class ReaderImageQuality { Low, Medium, High }
-enum class ReaderPrefetchMode { Conservative, Smart, Aggressive, Custom }
+enum class ReaderPrefetchMode { Conservative, Smart, Aggressive, UltraAggressive, Custom }
 
 fun readerBrightnessFraction(value: Int): Float? = value.takeIf { it in 1..100 }?.div(100f)
 
@@ -268,6 +269,7 @@ internal fun effectiveReaderPrefetchPages(
         ReaderPrefetchMode.Conservative -> configuredPages.coerceIn(0, 2)
         ReaderPrefetchMode.Smart -> configuredPages.coerceIn(0, 6)
         ReaderPrefetchMode.Aggressive -> configuredPages.coerceAtLeast(5).coerceIn(0, 6)
+        ReaderPrefetchMode.UltraAggressive -> 6
         ReaderPrefetchMode.Custom -> configuredPages.coerceIn(0, 6)
     }
     val velocityBoost = when {
@@ -317,6 +319,7 @@ data class PureUiState(
     val sourceStatus: JmSourceUiState = JmSourceUiState(),
     val appUpdate: AppUpdateUiState = AppUpdateUiState(),
     val favorites: List<ComicUiItem> = emptyList(),
+    val favoritePendingKeys: Set<String> = emptySet(),
     val history: List<ReadingHistoryItem> = emptyList(),
 )
 

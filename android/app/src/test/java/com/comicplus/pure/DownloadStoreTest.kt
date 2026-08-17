@@ -65,6 +65,29 @@ class DownloadStoreTest {
     }
 
     @Test
+    fun resumeCleanupRemovesNonCanonicalAndStalePageFiles() {
+        withTemporaryDirectory { root ->
+            File(root, "000001.webp").writeBytes(byteArrayOf(1))
+            File(root, "000002.webp").writeBytes(byteArrayOf(2))
+            File(root, "1.webp").writeBytes(byteArrayOf(1))
+            File(root, "000003.webp").writeBytes(byteArrayOf(3))
+            File(root, "000001.webp.tmp").writeBytes(byteArrayOf(1))
+            File(root, "meta.txt").writeText("stale")
+            File(root, "junk").mkdirs()
+
+            cleanupPartialPageFiles(root, expectedPages = 2)
+
+            assertTrue(File(root, "000001.webp").isFile)
+            assertTrue(File(root, "000002.webp").isFile)
+            assertFalse(File(root, "1.webp").exists())
+            assertFalse(File(root, "000003.webp").exists())
+            assertFalse(File(root, "000001.webp.tmp").exists())
+            assertFalse(File(root, "meta.txt").exists())
+            assertFalse(File(root, "junk").exists())
+        }
+    }
+
+    @Test
     fun failedInstallRestoresBackupEvenWhenIncompleteFinalExists() {
         withTemporaryDirectory { root ->
             val final = File(root, "final").apply { mkdirs() }

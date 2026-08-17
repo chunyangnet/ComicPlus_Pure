@@ -1,11 +1,14 @@
 package com.comicplus.app.ui
 
+import com.comicplus.app.data.source.DirectReaderPage
 import com.comicplus.app.ui.screens.pagerPageToReadingIndex
 import com.comicplus.app.ui.screens.readerPagedPrefetchIndices
 import com.comicplus.app.ui.screens.readerPrefetchPlan
 import com.comicplus.app.ui.screens.readerPrefetchIndices
 import com.comicplus.app.ui.screens.readingIndexToPagerPage
 import com.comicplus.app.ui.screens.shouldPreloadNextChapter
+import com.comicplus.app.ui.screens.verticalListIndexForPosition
+import com.comicplus.app.ui.screens.verticalPagePositionByDelta
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -75,6 +78,28 @@ class ReaderPrefetchTest {
     }
 
     @Test
+    fun ultraAggressiveKeepsTheLargestNearPageWindowUnlessDataSaverIsEnabled() {
+        assertEquals(
+            6,
+            effectiveReaderPrefetchPages(
+                configuredPages = 1,
+                dataSaver = false,
+                memoryClassMb = 768,
+                mode = ReaderPrefetchMode.UltraAggressive,
+            ),
+        )
+        assertEquals(
+            1,
+            effectiveReaderPrefetchPages(
+                configuredPages = 6,
+                dataSaver = true,
+                memoryClassMb = 768,
+                mode = ReaderPrefetchMode.UltraAggressive,
+            ),
+        )
+    }
+
+    @Test
     fun pagedPrefetchKeepsThePreviousPageWarm() {
         assertEquals(listOf(5, 3, 6), readerPagedPrefetchIndices(4, 8, 3))
         assertEquals(listOf(1, 2), readerPagedPrefetchIndices(0, 8, 2))
@@ -127,4 +152,46 @@ class ReaderPrefetchTest {
         assertEquals(true, shouldPreloadNextChapter(currentPageIndex = 0, pageCount = 1, distance = 0))
         assertEquals(false, shouldPreloadNextChapter(currentPageIndex = 0, pageCount = 0, distance = 6))
     }
+
+    @Test
+    fun verticalChapterJumpsIncludeInsertedCommentRows() {
+        val segments = listOf(
+            segment("10", 3, chapterIndex = 0),
+            segment("20", 2, chapterIndex = 1),
+            segment("30", 4, chapterIndex = 2),
+        )
+
+        assertEquals(0, verticalListIndexForPosition(segments, "10", 0))
+        assertEquals(4, verticalListIndexForPosition(segments, "20", 0))
+        assertEquals(7, verticalListIndexForPosition(segments, "30", 0))
+        assertEquals(10, verticalListIndexForPosition(segments, "30", 3))
+    }
+
+    @Test
+    fun verticalHardwarePagingSkipsChapterBoundaryRows() {
+        val segments = listOf(
+            segment("10", 2, chapterIndex = 0),
+            segment("20", 2, chapterIndex = 1),
+        )
+
+        assertEquals("20" to 0, verticalPagePositionByDelta(segments, "10", 1, 1))
+        assertEquals("10" to 1, verticalPagePositionByDelta(segments, "20", 0, -1))
+        assertEquals("20" to 1, verticalPagePositionByDelta(segments, "20", 1, 5))
+    }
+
+    private fun segment(chapterId: String, pageCount: Int, chapterIndex: Int) = ReaderChapterSegment(
+        chapterId = chapterId,
+        chapterTitle = "Chapter $chapterId",
+        chapterIndex = chapterIndex,
+        pages = List(pageCount) { index ->
+            DirectReaderPage(
+                index = index + 1,
+                photoId = chapterId,
+                fileName = "${index + 1}.jpg",
+                scrambleId = "0",
+                url = "https://example.com/$chapterId/${index + 1}.jpg",
+                referer = "https://example.com/",
+            )
+        },
+    )
 }

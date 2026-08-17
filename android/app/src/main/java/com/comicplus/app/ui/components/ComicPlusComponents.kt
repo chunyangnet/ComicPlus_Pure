@@ -38,6 +38,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import com.comicplus.app.ui.icons.ComicPlusIcons as Icons
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -76,6 +77,9 @@ import coil3.size.Scale
 import com.comicplus.pure.JmGateway
 import com.comicplus.app.ui.ComicUiItem
 import com.comicplus.app.ui.LocalComicPlusReduceMotion
+import com.comicplus.app.ui.LocalFavoritePendingKeys
+import com.comicplus.app.ui.key
+import com.comicplus.app.ui.rememberDelayedBusyIndicator
 import com.comicplus.app.ui.theme.Bronze
 import com.comicplus.app.ui.theme.Gold
 import com.comicplus.app.ui.theme.Ink
@@ -85,6 +89,7 @@ import com.comicplus.app.ui.theme.Muted
 import com.comicplus.app.ui.theme.Silver
 import com.comicplus.app.ui.theme.SurfaceSoft
 import com.comicplus.app.ui.theme.White
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 object CpDimens {
     val screenPadding = 18.dp
@@ -467,6 +472,7 @@ fun ComicPosterCard(
                     isFavorite = isFavorite,
                     onClick = onToggleFavorite,
                     modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
+                    favoriteKey = comic.key,
                 )
             }
         }
@@ -544,6 +550,7 @@ fun RankingRow(
                         onClick = onToggleFavorite,
                         modifier = Modifier.align(Alignment.TopEnd).padding(4.dp),
                         compact = true,
+                        favoriteKey = comic.key,
                     )
                 }
             }
@@ -577,8 +584,11 @@ fun FavoriteButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     compact: Boolean = false,
+    favoriteKey: String? = null,
 ) {
     val reduceMotion = LocalComicPlusReduceMotion.current
+    val loading = favoriteKey?.let { it in LocalFavoritePendingKeys.current } == true
+    val showLoading = rememberDelayedBusyIndicator(loading)
     val containerColor by animateColorAsState(
         targetValue = if (isFavorite) {
             MaterialTheme.colorScheme.primary.copy(alpha = .94f)
@@ -595,13 +605,25 @@ fun FavoriteButton(
         color = containerColor,
         shadowElevation = if (isFavorite) 3.dp else 1.dp,
     ) {
-        IconButton(onClick = onClick, modifier = Modifier.fillMaxSize()) {
-            Icon(
-                imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
-                contentDescription = if (isFavorite) "取消收藏" else "加入收藏",
-                tint = White,
-                modifier = Modifier.size(if (compact) 15.dp else 19.dp),
-            )
+        IconButton(onClick = onClick, enabled = !loading, modifier = Modifier.fillMaxSize()) {
+            if (showLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(if (compact) 14.dp else 18.dp),
+                    color = White,
+                    strokeWidth = if (compact) 1.7.dp else 2.dp,
+                )
+            } else {
+                Icon(
+                    imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                    contentDescription = when {
+                        loading -> "收藏同步中"
+                        isFavorite -> "取消收藏"
+                        else -> "加入收藏"
+                    },
+                    tint = White,
+                    modifier = Modifier.size(if (compact) 15.dp else 19.dp),
+                )
+            }
         }
     }
 }
@@ -625,17 +647,18 @@ fun ComicCover(
         }.build()
     }
     val decodeSize = remember(measuredSize) { optimizedCoverDecodeSize(measuredSize) }
-    val request = remember(context, coverUrl, headers, decodeSize) {
+    val cacheIdentity = remember(coverUrl) { canonicalCoverCacheIdentity(coverUrl) }
+    val request = remember(context, coverUrl, cacheIdentity, headers, decodeSize) {
         if (decodeSize == IntSize.Zero) null else {
             ImageRequest.Builder(context)
                 .data(coverUrl)
                 .httpHeaders(headers)
                 // Keep one stable memory entry per URL/size pair even when the
                 // surrounding list item is recomposed or moved off-screen.
-                .memoryCacheKey("cover:$coverUrl:${decodeSize.width}x${decodeSize.height}")
+                .memoryCacheKey("cover:$cacheIdentity:${decodeSize.width}x${decodeSize.height}")
                 // Disk stores the fetched source and can be reused for cards,
                 // rankings, and the larger detail header.
-                .diskCacheKey("cover:$coverUrl")
+                .diskCacheKey("cover:$cacheIdentity")
                 .size(decodeSize.width, decodeSize.height)
                 .scale(Scale.FILL)
                 .precision(Precision.INEXACT)
@@ -653,6 +676,20 @@ fun ComicCover(
                 modifier = Modifier.fillMaxSize(),
             )
         }
+    }
+}
+
+private val JM_COVER_CACHE_PATH = Regex(
+    "^/media/albums/[A-Za-z0-9_-]{1,128}\\.(?:jpg|jpeg|png|webp)$",
+    RegexOption.IGNORE_CASE,
+)
+
+internal fun canonicalCoverCacheIdentity(url: String): String {
+    val parsed = url.toHttpUrlOrNull() ?: return url
+    if (!JM_COVER_CACHE_PATH.matches(parsed.encodedPath)) return url
+    return buildString {
+        append(parsed.encodedPath)
+        parsed.encodedQuery?.let { query -> append('?').append(query) }
     }
 }
 

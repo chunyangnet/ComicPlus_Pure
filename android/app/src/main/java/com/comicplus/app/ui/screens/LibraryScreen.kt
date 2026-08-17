@@ -205,6 +205,7 @@ private fun HistoryRow(
                     onClick = onToggleFavorite,
                     modifier = Modifier.align(Alignment.TopEnd).padding(4.dp),
                     compact = true,
+                    favoriteKey = entry.comic.key,
                 )
             }
             Spacer(Modifier.width(12.dp))

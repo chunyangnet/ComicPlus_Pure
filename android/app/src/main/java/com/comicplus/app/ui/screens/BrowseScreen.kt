@@ -43,6 +43,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -74,8 +75,6 @@ import com.comicplus.app.ui.theme.Ink
 import com.comicplus.app.ui.theme.InkSoft
 import com.comicplus.app.ui.theme.Muted
 import com.comicplus.app.ui.theme.SurfaceSoft
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filter
 
 @Composable
 fun CategoryScreen(
@@ -302,15 +301,20 @@ private fun CategoryGrid(
         return
     }
     val gridState = rememberLazyGridState()
-    LaunchedEffect(gridState, state.hasMore, state.loadingMore, state.items.size, state.error) {
+    val currentCanLoadMore = rememberUpdatedState(
+        state.hasMore && !state.loadingMore && state.error == null,
+    )
+    val currentOnLoadMore = rememberUpdatedState(onLoadMore)
+    // Keep page-state changes out of the effect keys so completing one page
+    // cannot restart the collector and automatically drain following pages.
+    LaunchedEffect(gridState, state.selectedSlug, state.order) {
         snapshotFlow {
             val info = gridState.layoutInfo
             val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
             info.totalItemsCount > 0 && lastVisible >= info.totalItemsCount - 6
+        }.collect { nearEnd ->
+            if (nearEnd && currentCanLoadMore.value) currentOnLoadMore.value()
         }
-            .distinctUntilChanged()
-            .filter { nearEnd -> nearEnd && state.hasMore && !state.loadingMore && state.error == null }
-            .collect { onLoadMore() }
     }
     LazyVerticalGrid(
         columns = GridCells.Adaptive(92.dp),
@@ -369,6 +373,7 @@ private fun CategoryComicCard(
                 onClick = onToggleFavorite,
                 modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
                 compact = true,
+                favoriteKey = comic.key,
             )
         }
         Spacer(Modifier.height(8.dp))

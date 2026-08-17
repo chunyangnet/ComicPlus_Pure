@@ -63,12 +63,7 @@ class DownloadStore(context: Context) {
             require(expectedPages in 1..MAX_DOWNLOAD_PAGES) { "Invalid page count" }
             partialChapterDir(comicId, chapterId).apply {
                 if (!exists() && !mkdirs()) throw JmSourceException()
-                listFiles().orEmpty().forEach { file ->
-                    val index = file.nameWithoutExtension.toIntOrNull()
-                    if (file.isFile && (file.extension.equals("tmp", ignoreCase = true) || index !in 1..expectedPages)) {
-                        file.delete()
-                    }
-                }
+                cleanupPartialPageFiles(this, expectedPages)
             }
         }
     }
@@ -136,13 +131,18 @@ class DownloadStore(context: Context) {
     fun isRunning(id: String) = running[id] == true
 
     private fun partialChapterDir(comicId: String, chapterId: String) =
-        File(File(root, comicId), ".$chapterId.$CURRENT_DECODE_VERSION.partial")
+        workChapterDir(comicId, chapterId, "partial")
 
     private fun commitChapterDir(comicId: String, chapterId: String) =
-        File(File(root, comicId), ".$chapterId.$CURRENT_DECODE_VERSION.commit")
+        workChapterDir(comicId, chapterId, "commit")
 
     private fun backupChapterDir(comicId: String, chapterId: String) =
-        File(File(root, comicId), ".$chapterId.$CURRENT_DECODE_VERSION.backup")
+        workChapterDir(comicId, chapterId, "backup")
+
+    private fun workChapterDir(comicId: String, chapterId: String, kind: String): File {
+        require(isSafeId(comicId) && isSafeId(chapterId)) { "Invalid JM download id" }
+        return File(File(root, comicId), ".$chapterId.$CURRENT_DECODE_VERSION.$kind")
+    }
 
     private fun installCompletedDirectory(
         partialDir: File,
@@ -320,9 +320,27 @@ internal fun listPageFiles(directory: File): List<File> = directory
     .orEmpty()
     .sortedBy(File::getName)
 
+/** Remove stale/corrupt entries before a chapter download is resumed. */
+internal fun cleanupPartialPageFiles(directory: File, expectedPages: Int) {
+    require(expectedPages in 1..MAX_DOWNLOAD_PAGES) { "Invalid page count" }
+    directory.listFiles().orEmpty().forEach { file ->
+        if (!isCanonicalPageFile(file, expectedPages)) file.deleteRecursively()
+    }
+}
+
+private fun isCanonicalPageFile(file: File, expectedPages: Int): Boolean {
+    if (!file.isFile || !file.extension.equals("webp", ignoreCase = true)) return false
+    val index = file.nameWithoutExtension.toIntOrNull() ?: return false
+    return index in 1..expectedPages &&
+        file.name.equals(canonicalPageFileName(index), ignoreCase = true) &&
+        file.length() in 1..MAX_PAGE_FILE_BYTES
+}
+
+private fun canonicalPageFileName(index: Int): String = String.format(Locale.US, "%06d.webp", index)
+
 internal fun hasCompletePageSet(pages: List<File>, expected: Int): Boolean =
     pages.size == expected && pages.withIndex().all { (offset, page) ->
-        page.name.equals(String.format(Locale.US, "%06d.webp", offset + 1), ignoreCase = true) &&
+        page.name.equals(canonicalPageFileName(offset + 1), ignoreCase = true) &&
             page.length() in 1..MAX_PAGE_FILE_BYTES
     }
 
@@ -330,10 +348,10 @@ private fun File.readTextOrNull(): String? = runCatching {
     if (isFile && length() in 1..MAX_META_BYTES) readText() else null
 }.getOrNull()
 
-private fun isSafeId(value: String): Boolean = value.matches(Regex("\\d{1,12}"))
+private fun isSafeId(value: String): Boolean = value.matches(SAFE_DOWNLOAD_ID)
 
 internal fun sanitizeMetadataText(value: String): String =
-    value.replace(Regex("[\\r\\n\\u0000]+"), " ").trim().take(MAX_META_TEXT_LENGTH)
+    value.replace(META_CONTROL_CHARACTERS, " ").trim().take(MAX_META_TEXT_LENGTH)
 
 private const val META_FILE_NAME = "meta.txt"
 private const val MAX_META_BYTES = 16 * 1024L
@@ -342,6 +360,8 @@ private const val MAX_DOWNLOAD_PAGES = 20_000
 private const val MAX_PAGE_FILE_BYTES = 40L * 1024L * 1024L
 private const val STALE_WORK_DIRECTORY_MILLIS = 14L * 24L * 60L * 60L * 1_000L
 private const val CURRENT_DECODE_VERSION = "decode-v4"
+private val SAFE_DOWNLOAD_ID = Regex("^\\d{1,12}$")
+private val META_CONTROL_CHARACTERS = Regex("[\\r\\n\\u0000]+")
 private val WORK_DIRECTORY_NAME = Regex("^\\.(\\d{1,12})\\.[A-Za-z0-9_-]+\\.(?:partial|commit)$")
 private val BACKUP_DIRECTORY_NAME = Regex("^\\.(\\d{1,12})\\.[A-Za-z0-9_-]+\\.backup$")
 

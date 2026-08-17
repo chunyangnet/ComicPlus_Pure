@@ -19,26 +19,39 @@ class LocalSettingsStore(context: Context) {
             storedTurboMode,
             storedDataSaver,
         )
+        val storedPrefetchPages = preferences.getInt("prefetch", 3).coerceIn(0, 6)
+        val storedPrefetchMode = preferences.getString("prefetch_mode", null)
+            ?.let { runCatching { ReaderPrefetchMode.valueOf(it) }.getOrNull() }
+            ?: when (storedPrefetchPages) {
+                0 -> ReaderPrefetchMode.Conservative
+                5, 6 -> ReaderPrefetchMode.Aggressive
+                else -> ReaderPrefetchMode.Smart
+            }
+        val normalizedPrefetchMode = normalizeReaderPrefetchMode(storedPrefetchMode, normalizedDataSaver)
+        val normalizedPrefetchPages = if (
+            normalizedPrefetchMode != storedPrefetchMode && normalizedDataSaver
+        ) 1 else storedPrefetchPages
         // Older/corrupt preference files can contain both flags. Persist the
         // normalized pair so the contradiction is not reintroduced on restart.
-        if (storedTurboMode != normalizedTurboMode || storedDataSaver != normalizedDataSaver) {
+        if (
+            storedTurboMode != normalizedTurboMode ||
+            storedDataSaver != normalizedDataSaver ||
+            storedPrefetchMode != normalizedPrefetchMode ||
+            storedPrefetchPages != normalizedPrefetchPages
+        ) {
             preferences.edit {
                 putBoolean("reader_turbo_mode", normalizedTurboMode)
                 putBoolean("data_saver", normalizedDataSaver)
+                putString("prefetch_mode", normalizedPrefetchMode.name)
+                putInt("prefetch", normalizedPrefetchPages)
             }
         }
         return AppSettings(
             paletteKey = preferences.getString("palette", "ocean").orEmpty().take(MAX_SETTING_TEXT_LENGTH).ifBlank { "ocean" },
             darkMode = preferences.getBoolean("dark_mode", false),
             chapterDescending = preferences.getBoolean("chapter_descending", false),
-            readerPrefetchPages = preferences.getInt("prefetch", 3).coerceIn(0, 6),
-            readerPrefetchMode = preferences.getString("prefetch_mode", null)
-                ?.let { runCatching { ReaderPrefetchMode.valueOf(it) }.getOrNull() }
-                ?: when (preferences.getInt("prefetch", 3).coerceIn(0, 6)) {
-                    0 -> ReaderPrefetchMode.Conservative
-                    5, 6 -> ReaderPrefetchMode.Aggressive
-                    else -> ReaderPrefetchMode.Smart
-                },
+            readerPrefetchPages = normalizedPrefetchPages,
+            readerPrefetchMode = normalizedPrefetchMode,
             readerPageSpacingDp = preferences.getInt("page_spacing", 0).coerceIn(0, 16),
             readerMode = preferences.getString("reader_mode", ReaderMode.Vertical.name)
                 ?.let { runCatching { ReaderMode.valueOf(it) }.getOrNull() } ?: ReaderMode.Vertical,
@@ -165,6 +178,15 @@ class LocalSettingsStore(context: Context) {
 
         internal fun normalizeReaderModes(readerTurboMode: Boolean, dataSaver: Boolean): Pair<Boolean, Boolean> =
             if (readerTurboMode && dataSaver) true to false else readerTurboMode to dataSaver
+
+        internal fun normalizeReaderPrefetchMode(
+            mode: ReaderPrefetchMode,
+            dataSaver: Boolean,
+        ): ReaderPrefetchMode = if (dataSaver && mode == ReaderPrefetchMode.UltraAggressive) {
+            ReaderPrefetchMode.Conservative
+        } else {
+            mode
+        }
 
         internal fun parseStoredProgress(
             raw: String,

@@ -67,6 +67,7 @@ import com.comicplus.app.ui.AppSettings
 import com.comicplus.app.ui.ComicResolveUiState
 import com.comicplus.app.ui.ComicUiItem
 import com.comicplus.app.ui.LocalComicPlusReduceMotion
+import com.comicplus.app.ui.LocalFavoritePendingKeys
 import com.comicplus.app.ui.ReaderUiState
 import com.comicplus.app.ui.key
 import com.comicplus.app.ui.screens.CategoryScreen
@@ -120,7 +121,10 @@ fun PureApp() {
         GlobalSystemBars(
             readerVisible = state.reader !is ReaderUiState.Idle,
         )
-        CompositionLocalProvider(LocalComicPlusReduceMotion provides state.settings.reduceMotion) {
+        CompositionLocalProvider(
+            LocalComicPlusReduceMotion provides state.settings.reduceMotion,
+            LocalFavoritePendingKeys provides state.favoritePendingKeys,
+        ) {
             Box(Modifier.fillMaxSize()) {
                 when {
                     state.reader !is ReaderUiState.Idle -> ReaderScreen(
@@ -131,12 +135,16 @@ fun PureApp() {
                         prefetchPage = viewModel::prefetchReaderPage,
                         cachedPage = viewModel::cachedReaderPage,
                         onSelectChapter = viewModel::selectReaderChapter,
-                        loadChapterSegment = viewModel::loadReaderChapterSegment,
-                        onRetryChapter = viewModel::retryReaderChapter,
-                        onProgressChange = viewModel::recordReaderProgress,
-                        onSettingsChange = viewModel::updateSettings,
-                        onRefreshSources = { viewModel.refreshSources(force = true, updateOfficialList = true) },
-                        onClose = viewModel::closeReader,
+                         loadChapterSegment = viewModel::loadReaderChapterSegment,
+                         onRetryChapter = viewModel::retryReaderChapter,
+                         onProgressChange = viewModel::recordReaderProgress,
+                         onSettingsChange = viewModel::updateSettings,
+                         onRefreshSources = { viewModel.refreshSources(force = true, updateOfficialList = true) },
+                         comments = state.comments,
+                         onOpenComments = viewModel::openComments,
+                         onRetryComments = viewModel::retryComments,
+                         onLoadMoreComments = viewModel::loadMoreComments,
+                         onClose = viewModel::closeReader,
                     )
 
                     state.detail !is ComicResolveUiState.Idle -> {
@@ -150,12 +158,14 @@ fun PureApp() {
                             onBack = viewModel::dismissDetail,
                             onShare = { detail -> shareComic(context, detail) { message -> scope.launch { snackbar.showSnackbar(message) } } },
                             onRead = { detail, chapter ->
-                                val initialPageIndex = if (
-                                    state.settings.autoResumeReading &&
-                                    detail.resumeChapterId == chapter.sourceChapterId
-                                ) detail.resumePageIndex else 0
-                                viewModel.openReader(detail, chapter, initialPageIndex)
+                                // Tapping a chapter is an explicit request for
+                                // that chapter, so it starts at its first page.
+                                viewModel.openReader(detail, chapter, initialPageIndex = 0)
                             },
+                             onContinueReading = { detail, chapter, initialPageIndex ->
+                                 viewModel.openReader(detail, chapter, initialPageIndex)
+                             },
+                             onSelectCommentChapter = viewModel::selectCommentsChapter,
                             downloadedChapterIds = state.downloads.filter { it.comicId == ready?.jmId && it.complete }.mapTo(mutableSetOf()) { it.chapterId },
                             downloadProgress = state.downloadProgress.mapKeys { it.key.substringAfter(':') },
                             onDownload = viewModel::downloadChapter,

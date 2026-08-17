@@ -183,10 +183,11 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 SegmentedControl(
-                    labels = listOf("省内存", "智能", "积极", "自定义"),
+                    labels = listOf("省内存", "智能", "积极", "超激进", "自定义"),
                     selected = when (settings.readerPrefetchMode) {
                         ReaderPrefetchMode.Conservative -> "省内存"
                         ReaderPrefetchMode.Aggressive -> "积极"
+                        ReaderPrefetchMode.UltraAggressive -> "超激进"
                         ReaderPrefetchMode.Custom -> "自定义"
                         ReaderPrefetchMode.Smart -> "智能"
                     },
@@ -194,12 +195,14 @@ fun SettingsScreen(
                         val mode = when (label) {
                             "省内存" -> ReaderPrefetchMode.Conservative
                             "积极" -> ReaderPrefetchMode.Aggressive
+                            "超激进" -> ReaderPrefetchMode.UltraAggressive
                             "自定义" -> ReaderPrefetchMode.Custom
                             else -> ReaderPrefetchMode.Smart
                         }
                         val pages = when (mode) {
                             ReaderPrefetchMode.Conservative -> 1
                             ReaderPrefetchMode.Aggressive -> 5
+                            ReaderPrefetchMode.UltraAggressive -> 6
                             ReaderPrefetchMode.Smart -> 3
                             ReaderPrefetchMode.Custom -> settings.readerPrefetchPages
                         }
@@ -211,6 +214,7 @@ fun SettingsScreen(
                     when (settings.readerPrefetchMode) {
                         ReaderPrefetchMode.Conservative -> "只保温相邻 1 页，优先降低内存和流量占用"
                         ReaderPrefetchMode.Aggressive -> "前后页并行保温，适合网速快且连续阅读"
+                        ReaderPrefetchMode.UltraAggressive -> "立即缓存整章源图，快速滑动时只需解码，流量和存储占用最高"
                         ReaderPrefetchMode.Custom -> "按下方页数保温，并自动避让前台页面"
                         ReaderPrefetchMode.Smart -> "根据翻页速度、方向和设备内存自动调整"
                     },

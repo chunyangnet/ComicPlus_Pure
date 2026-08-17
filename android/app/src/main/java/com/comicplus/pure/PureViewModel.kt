@@ -16,17 +16,16 @@ import com.comicplus.app.ui.ComicResolveUiState
 import com.comicplus.app.ui.ComicUiItem
 import com.comicplus.app.ui.JmSearchUiState
 import com.comicplus.app.ui.JmBrowseOptionUi
-import com.comicplus.app.ui.JmCommentUiItem
 import com.comicplus.app.ui.JmCommentsUiState
 import com.comicplus.app.ui.JmAccountStatus
 import com.comicplus.app.ui.JmAccountUiState
 import com.comicplus.app.ui.JmTagGroupUi
 import com.comicplus.app.ui.JmSourceUiState
-import com.comicplus.app.ui.JmSourceUiItem
 import com.comicplus.app.ui.PureUiState
 import com.comicplus.app.ui.RankingsUiState
 import com.comicplus.app.ui.ReaderUiState
 import com.comicplus.app.ui.ReaderChapterSegment
+import com.comicplus.app.ui.ReaderPrefetchMode
 import com.comicplus.app.ui.ReadingHistoryItem
 import com.comicplus.app.ui.key
 import kotlinx.coroutines.Job
@@ -40,10 +39,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import java.util.Collections
-import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
@@ -58,11 +56,6 @@ class PureViewModel(
     private val libraryStore: LibraryStore = LibraryStore(),
     private val sessionStore: JmSessionStore? = null,
 ) : ViewModel() {
-    private data class CachedCommentPage(
-        val page: JmCommentPage,
-        val cachedAt: Long,
-    )
-
     private data class ReaderProgressSnapshot(
         val comicId: String,
         val chapterId: String,
@@ -91,6 +84,7 @@ class PureViewModel(
         ),
     )
     val state: StateFlow<PureUiState> = _state.asStateFlow()
+    private val chapterPreloader = JmChapterPreloader(viewModelScope, gateway) { _state.value.settings }
 
     private var homeJob: Job? = null
     private var categoryCatalogJob: Job? = null
@@ -105,6 +99,7 @@ class PureViewModel(
     private var accountJob: Job? = null
     private var readerJob: Job? = null
     private var readerWarmupJob: Job? = null
+    private var readerWarmupChapterId: String? = null
     private var lastProgressSignature: String? = null
     private val progressWriteLock = ReentrantLock()
     private val progressPersistGeneration = AtomicLong()
@@ -116,6 +111,7 @@ class PureViewModel(
     private val favoritesPersistGeneration = AtomicLong()
     private val historyPersistGeneration = AtomicLong()
     private var settingsSaveJob: Job? = null
+    private var historySaveJob: Job? = null
     private var sourceRefreshJob: Job? = null
     private var sourceScheduleJob: Job? = null
     private var updateCheckJob: Job? = null
@@ -132,33 +128,35 @@ class PureViewModel(
     private val typeRankingRequestGeneration = AtomicLong()
     private val sourceRefreshRequestGeneration = AtomicLong()
     private val updateCheckRequestGeneration = AtomicLong()
-    private val comicCache = Collections.synchronizedMap(
-        object : LinkedHashMap<String, JmComic>(COMIC_CACHE_LIMIT, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, JmComic>?): Boolean =
-                size > COMIC_CACHE_LIMIT
-        },
-    )
-    private val commentCache = Collections.synchronizedMap(
-        object : LinkedHashMap<String, CachedCommentPage>(COMMENT_CACHE_LIMIT, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedCommentPage>?): Boolean =
-                size > COMMENT_CACHE_LIMIT
-        },
-    )
+    private val comicCache = SynchronizedLruCache<String, JmComic>(maxEntries = COMIC_CACHE_LIMIT)
+    private val commentCache = CommentPageCache()
     private val downloadLimiter = Semaphore(permits = 2)
+    // The server-side favorite toggle is stateful. Serialize it with manual favorite sync so an
+    // older full snapshot cannot overwrite a newer optimistic toggle.
+    private val favoriteOperationLimiter = Semaphore(permits = 1)
     private val favoriteOperations = ConcurrentHashMap.newKeySet<String>()
+    private val favoriteOperationGeneration = AtomicLong()
 
     init {
         viewModelScope.launch {
             downloadStore.items.collect { downloads -> _state.update { it.copy(downloads = downloads) } }
         }
-        viewModelScope.launch { downloadStore.refresh() }
-        sessionStore?.load()?.let { session ->
-            accountJob = viewModelScope.launch { restoreAccount(session) }
+        sessionStore?.let { store ->
+            accountJob = viewModelScope.launch {
+                withContext(Dispatchers.IO) { store.load() }?.let { session -> restoreAccount(session) }
+            }
         }
         refreshHome()
-        loadCategories()
-        loadRankings()
+        viewModelScope.launch {
+            awaitInitialHomePriorityWindow()
+            downloadStore.refresh()
+        }
+        viewModelScope.launch {
+            awaitInitialHomePriorityWindow()
+            loadCategories()
+        }
         sourceScheduleJob = viewModelScope.launch {
+            awaitInitialHomePriorityWindow()
             val settings = _state.value.settings
             if (settings.autoSelectSource || settings.autoUpdateSourceList) {
                 refreshSources(force = false, updateOfficialList = settings.autoUpdateSourceList)
@@ -187,7 +185,8 @@ class PureViewModel(
             runCatching { gateway.home() }
                 .onSuccess { items ->
                     if (requestGeneration != homeRequestGeneration.get()) return@onSuccess
-                    val uiItems = items.map(JmRanking::toUiItem)
+                    val uiItems = mapRankingItems(items)
+                    if (requestGeneration != homeRequestGeneration.get()) return@onSuccess
                     _state.update {
                         it.copy(
                             home = uiItems,
@@ -233,12 +232,13 @@ class PureViewModel(
             }
             runCatching { gateway.category("0", order) }
                 .onSuccess { items ->
+                    val uiItems = mapRankingItems(items)
                     _state.update { state ->
                         if (requestGeneration != rankingRequestGeneration.get() || state.rankings.jmOrder != order) return@update state
                         state.copy(
                             rankings = state.rankings.copy(
                                 jmOrder = order,
-                                jmItems = items.map(JmRanking::toUiItem),
+                                jmItems = uiItems,
                                 jmLoading = false,
                                 jmLoaded = true,
                             ),
@@ -284,12 +284,14 @@ class PureViewModel(
             runCatching { gateway.weekCatalog() }
                 .onSuccess { catalog ->
                     if (requestGeneration != weeklyCatalogRequestGeneration.get()) return@onSuccess
-                    val categoryOptions = catalog.categories
-                        .map { JmBrowseOptionUi(it.id, it.title) }
-                        .distinctBy(JmBrowseOptionUi::id)
-                    val typeOptions = catalog.types
-                        .map { JmBrowseOptionUi(it.id, it.title) }
-                        .distinctBy(JmBrowseOptionUi::id)
+                    val (categoryOptions, typeOptions) = withContext(Dispatchers.Default) {
+                        catalog.categories
+                            .map { JmBrowseOptionUi(it.id, it.title) }
+                            .distinctBy(JmBrowseOptionUi::id) to catalog.types
+                            .map { JmBrowseOptionUi(it.id, it.title) }
+                            .distinctBy(JmBrowseOptionUi::id)
+                    }
+                    if (requestGeneration != weeklyCatalogRequestGeneration.get()) return@onSuccess
                     if (categoryOptions.isEmpty() || typeOptions.isEmpty()) {
                         _state.update { state ->
                             if (requestGeneration != weeklyCatalogRequestGeneration.get()) return@update state
@@ -395,6 +397,7 @@ class PureViewModel(
             }
             runCatching { gateway.week(categoryId, typeId) }
                 .onSuccess { page ->
+                    val uiItems = mapRankingItems(page.items)
                     _state.update { state ->
                         if (requestGeneration != weeklyRequestGeneration.get()) return@update state
                         val weekly = state.officialBrowse.weekly
@@ -402,7 +405,7 @@ class PureViewModel(
                         state.copy(
                             officialBrowse = state.officialBrowse.copy(
                                 weekly = weekly.copy(
-                                    items = page.items.map(JmRanking::toUiItem),
+                                    items = uiItems,
                                     total = page.total,
                                     loading = false,
                                     loaded = true,
@@ -459,6 +462,7 @@ class PureViewModel(
             }
             runCatching { gateway.categoryPage(safeSlug, order) }
                 .onSuccess { page ->
+                    val uiItems = mapRankingItems(page.items)
                     _state.update { state ->
                         if (requestGeneration != typeRankingRequestGeneration.get()) return@update state
                         val ranking = state.officialBrowse.typeRanking
@@ -466,7 +470,7 @@ class PureViewModel(
                         state.copy(
                             officialBrowse = state.officialBrowse.copy(
                                 typeRanking = ranking.copy(
-                                    items = page.items.map(JmRanking::toUiItem),
+                                    items = uiItems,
                                     total = page.total,
                                     loading = false,
                                     loaded = true,
@@ -501,12 +505,16 @@ class PureViewModel(
             }
             runCatching { gateway.categoryCatalog() }
                 .onSuccess { catalog ->
+                    val (categories, tagGroups) = withContext(Dispatchers.Default) {
+                        catalog.categories.map(JmCategory::toDirectCategory) to
+                            catalog.tagGroups.map { group -> JmTagGroupUi(group.title, group.tags) }
+                    }
                     _state.update {
                         if (requestGeneration != categoryCatalogRequestGeneration.get()) return@update it
                         it.copy(
-                            categories = catalog.categories.map(JmCategory::toDirectCategory),
+                            categories = categories,
                             officialBrowse = it.officialBrowse.copy(
-                                tagGroups = catalog.tagGroups.map { group -> JmTagGroupUi(group.title, group.tags) },
+                                tagGroups = tagGroups,
                                 catalogLoading = false,
                                 catalogLoaded = true,
                             ),
@@ -554,6 +562,7 @@ class PureViewModel(
             }
             runCatching { gateway.categoryPage(normalizedSlug, order, page = 1) }
                 .onSuccess { result ->
+                    val mapped = mapRankingItems(result.items, distinct = true)
                     _state.update { state ->
                         val category = state.category
                         if (requestGeneration != categoryRequestGeneration.get() ||
@@ -568,7 +577,6 @@ class PureViewModel(
                                 ),
                             )
                         }
-                        val mapped = result.items.map(JmRanking::toUiItem).distinctBy(ComicUiItem::key)
                         state.copy(
                             category = category.copy(
                                 items = mapped,
@@ -617,6 +625,7 @@ class PureViewModel(
         categoryJob = viewModelScope.launch {
             runCatching { gateway.categoryPage(slug, order, nextPage) }
                 .onSuccess { result ->
+                    val incoming = mapRankingItems(result.items)
                     _state.update { state ->
                         val category = state.category
                         if (requestGeneration != categoryRequestGeneration.get() ||
@@ -631,14 +640,16 @@ class PureViewModel(
                                 ),
                             )
                         }
-                        val incoming = result.items.map(JmRanking::toUiItem)
                         val merged = mergeComicPage(category.items, incoming)
                         state.copy(
                             category = category.copy(
                                 items = merged,
                                 page = result.page,
                                 loadingMore = false,
-                                hasMore = result.hasMore && incoming.isNotEmpty() && merged.size > category.items.size,
+                                // `merged` was already materialised above. Reuse its
+                                // size instead of allocating a second merged list.
+                                hasMore = result.hasMore && incoming.isNotEmpty() &&
+                                    merged.size > category.items.size,
                                 error = null,
                             ),
                         )
@@ -700,6 +711,7 @@ class PureViewModel(
             }
             runCatching { gateway.search(normalizedQuery, safePage, safeMainTag, order) }
                 .onSuccess { result ->
+                    val incoming = mapRankingItems(result.items, distinct = safePage == 1)
                     _state.update { state ->
                         if (requestGeneration != searchRequestGeneration.get()) return@update state
                         val previous = state.search
@@ -713,17 +725,26 @@ class PureViewModel(
                                 ),
                             )
                         }
+                        val merged = if (safePage == 1) {
+                            incoming
+                        } else {
+                            mergeComicPage(previous.items, incoming)
+                        }
                         state.copy(
                             search = previous.copy(
                                 query = result.query,
                                 mainTag = safeMainTag,
                                 order = order,
-                                items = if (safePage == 1) result.items.map(JmRanking::toUiItem).distinctBy(ComicUiItem::key)
-                                else mergeComicPage(previous.items, result.items.map(JmRanking::toUiItem)),
+                                items = merged,
                                 page = result.page,
                                 total = result.total,
                                 redirectAid = result.redirectAid,
-                                hasMore = result.hasMore,
+                                hasMore = if (safePage == 1) {
+                                    result.hasMore && merged.isNotEmpty()
+                                } else {
+                                    result.hasMore && incoming.isNotEmpty() &&
+                                        merged.size > previous.items.size
+                                },
                                 loading = false,
                                 loadingMore = false,
                             ),
@@ -770,6 +791,7 @@ class PureViewModel(
         detailJob?.cancel()
         commentsJob?.cancel()
         readerWarmupJob?.cancel()
+        readerWarmupChapterId = null
         detailJob = viewModelScope.launch {
             _state.update { state ->
                 if (requestGeneration != detailRequestGeneration.get()) return@update state
@@ -778,16 +800,16 @@ class PureViewModel(
                     comments = JmCommentsUiState(comicId = id),
                 )
             }
-            // The album and forum endpoints are independent. Start the forum request
-            // immediately so the comments tab is ready by the time the detail card settles.
-            loadComments(id)
             runCatching { comicCache[id] ?: gateway.comic(id).also { comicCache[id] = it } }
                 .onSuccess { comic ->
                     if (requestGeneration != detailRequestGeneration.get()) return@onSuccess
                     val progress = settingsStore.loadProgress(comic.id)
+                    val resolvedDetail = withContext(Dispatchers.Default) {
+                        comic.toResolveState(progress)
+                    }
                     _state.update { state ->
                         if (requestGeneration != detailRequestGeneration.get()) return@update state
-                        state.copy(detail = comic.toResolveState(progress))
+                        state.copy(detail = resolvedDetail)
                     }
                     if (requestGeneration != detailRequestGeneration.get()) return@onSuccess
                     val historyItem = comic.toUiItem().let { actual ->
@@ -811,28 +833,47 @@ class PureViewModel(
         }
     }
 
-    private fun cachedCommentPage(comicId: String): JmCommentPage? {
-        val cached = commentCache[comicId] ?: return null
-        if (System.currentTimeMillis() - cached.cachedAt <= COMMENT_CACHE_TTL_MS) return cached.page
-        commentCache.remove(comicId, cached)
-        return null
-    }
-
-    private fun loadComments(comicId: String, page: Int = 1, force: Boolean = false) {
-        if (!comicId.matches(Regex("\\d{1,12}"))) return
+    private fun loadComments(
+        comicId: String,
+        chapterId: String,
+        page: Int = 1,
+        force: Boolean = false,
+    ) {
+        if (!comicId.matches(SAFE_JM_ID) || !chapterId.matches(SAFE_JM_ID)) return
         val safePage = page.coerceIn(1, MAX_PAGINATION_PAGE)
         val current = _state.value.comments
         if (
             !force &&
             safePage == 1 &&
             current.comicId == comicId &&
+            current.chapterId == chapterId &&
             (current.loading || current.loaded)
         ) return
         val requestGeneration = commentsRequestGeneration.incrementAndGet()
         commentsJob?.cancel()
+        val cached = if (safePage == 1 && !force) commentCache.get(comicId, chapterId) else null
+        if (cached != null) {
+            _state.update { state ->
+                if (requestGeneration != commentsRequestGeneration.get()) return@update state
+                state.copy(
+                    comments = JmCommentsUiState(
+                        comicId = comicId,
+                        chapterId = chapterId,
+                        items = cached.items,
+                        page = cached.page,
+                        total = cached.total,
+                        loaded = true,
+                        hasMore = cached.hasMore,
+                    ),
+                )
+            }
+            return
+        }
         _state.update { state ->
             if (requestGeneration != commentsRequestGeneration.get()) return@update state
-            val previous = state.comments.takeIf { it.comicId == comicId } ?: JmCommentsUiState(comicId = comicId)
+            val previous = state.comments.takeIf {
+                it.comicId == comicId && it.chapterId == chapterId
+            } ?: JmCommentsUiState(comicId = comicId, chapterId = chapterId)
             state.copy(
                 comments = previous.copy(
                     items = if (safePage == 1) emptyList() else previous.items,
@@ -848,19 +889,16 @@ class PureViewModel(
         }
         commentsJob = viewModelScope.launch {
             runCatching {
-                val cached = if (safePage == 1 && !force) cachedCommentPage(comicId) else null
-                cached ?: gateway.comments(comicId, safePage).also { result ->
-                    if (safePage == 1 && requestGeneration == commentsRequestGeneration.get()) {
-                        commentCache[comicId] = CachedCommentPage(result, System.currentTimeMillis())
-                    }
-                }
+                val result = gateway.comments(chapterId, safePage)
+                withContext(Dispatchers.Default) { result.toUiSnapshot() }
             }
                 .onSuccess { result ->
                     _state.update { state ->
                         val previous = state.comments
                         if (
                             requestGeneration != commentsRequestGeneration.get() ||
-                            previous.comicId != comicId
+                            previous.comicId != comicId ||
+                            previous.chapterId != chapterId
                         ) return@update state
                         if (!isForwardPageResponse(previous.page, safePage, result.page)) {
                             return@update state.copy(
@@ -872,20 +910,45 @@ class PureViewModel(
                                 ),
                             )
                         }
+                        val mergedItems = if (safePage == 1) {
+                            result.items
+                        } else {
+                            mergeCommentPage(previous.items, result.items)
+                        }
                         state.copy(
                             comments = previous.copy(
-                                items = if (safePage == 1) {
-                                    result.comments.map(JmComment::toUiItem).distinctBy(JmCommentUiItem::id)
-                                } else {
-                                    mergeCommentPage(previous.items, result.comments.map(JmComment::toUiItem))
-                                },
+                                items = mergedItems,
                                 page = result.page,
                                 total = result.total,
                                 loading = false,
                                 loadingMore = false,
                                 loaded = true,
-                                hasMore = result.hasMore,
+                                hasMore = if (safePage == 1) {
+                                    result.hasMore && result.items.isNotEmpty()
+                                } else {
+                                    result.hasMore && result.items.isNotEmpty() &&
+                                        mergedItems.size > previous.items.size
+                                },
                                 error = null,
+                            ),
+                        )
+                    }
+                    val published = _state.value.comments
+                    if (
+                        requestGeneration == commentsRequestGeneration.get() &&
+                        published.comicId == comicId &&
+                        published.chapterId == chapterId &&
+                        published.loaded &&
+                        published.page == result.page
+                    ) {
+                        commentCache.put(
+                            comicId = comicId,
+                            chapterId = chapterId,
+                            page = CommentPageSnapshot(
+                                page = published.page,
+                                total = published.total,
+                                items = published.items,
+                                hasMore = published.hasMore,
                             ),
                         )
                     }
@@ -896,7 +959,8 @@ class PureViewModel(
                         val previous = state.comments
                         if (
                             requestGeneration != commentsRequestGeneration.get() ||
-                            previous.comicId != comicId
+                            previous.comicId != comicId ||
+                            previous.chapterId != chapterId
                         ) return@update state
                         state.copy(
                             comments = previous.copy(
@@ -910,23 +974,72 @@ class PureViewModel(
         }
     }
 
+    /** Load comments for an explicitly selected chapter, including from the reader. */
+    fun openComments(comicId: String, chapterId: String) {
+        loadComments(comicId.trim(), chapterId.trim())
+    }
+
+    /** Switch the detail-page comments tab to a chapter/photo. */
+    fun selectCommentsChapter(chapter: SourceChapterDto) {
+        val detail = _state.value.detail as? ComicResolveUiState.Ready ?: return
+        if (detail.chapters.isNotEmpty() && detail.chapters.none { it.sourceChapterId == chapter.sourceChapterId }) return
+        loadComments(detail.jmId, chapter.sourceChapterId)
+    }
+
     fun retryComments() {
         val current = _state.value.comments
-        if (current.comicId.isBlank()) return
+        if (current.comicId.isBlank() || current.chapterId.isBlank()) return
         val page = if (current.items.isNotEmpty() && current.page > 0) current.page + 1 else 1
-        loadComments(current.comicId, page, force = true)
+        loadComments(current.comicId, current.chapterId, page, force = true)
     }
 
     fun loadMoreComments() {
         val current = _state.value.comments
         if (
             current.comicId.isBlank() ||
+            current.chapterId.isBlank() ||
             current.loading ||
             current.loadingMore ||
             !current.loaded ||
             !current.hasMore
         ) return
-        loadComments(current.comicId, current.page + 1)
+        loadComments(current.comicId, current.chapterId, current.page + 1)
+    }
+
+    private suspend fun mapRankingItems(
+        items: List<JmRanking>,
+        distinct: Boolean = false,
+    ): List<ComicUiItem> = withContext(Dispatchers.Default) {
+        items.map(JmRanking::toUiItem).let { mapped ->
+            if (distinct) mapped.distinctBy(ComicUiItem::key) else mapped
+        }
+    }
+
+    private suspend fun awaitInitialHomePriorityWindow() {
+        val initialHomeJob = homeJob ?: return
+        withTimeoutOrNull(INITIAL_HOME_PRIORITY_TIMEOUT_MS) { initialHomeJob.join() }
+    }
+
+    private suspend fun mapFavoriteItems(items: List<JmFavoriteItem>): List<ComicUiItem> =
+        withContext(Dispatchers.Default) {
+            items.map(JmFavoriteItem::toUiItem)
+                .distinctBy(ComicUiItem::key)
+                .take(MAX_FAVORITE_ENTRIES)
+        }
+
+    private suspend fun saveStoredSession(session: JmSession): Boolean {
+        val store = sessionStore ?: return true
+        return withContext(Dispatchers.IO) { store.save(session) }
+    }
+
+    private suspend fun saveLatestGatewaySession(fallback: JmSession? = null): Boolean {
+        val session = gateway.session() ?: fallback ?: return false
+        return saveStoredSession(session)
+    }
+
+    private suspend fun clearStoredSession() {
+        val store = sessionStore ?: return
+        withContext(Dispatchers.IO) { store.clear() }
     }
 
     private suspend fun restoreAccount(session: JmSession) {
@@ -940,8 +1053,10 @@ class PureViewModel(
             )
         }
         gateway.restoreSession(session)
+        awaitInitialHomePriorityWindow()
         try {
             val favorites = gateway.allFavorites()
+            val sessionPersisted = saveLatestGatewaySession(session)
             publishOfficialAccount(
                 JmAccount(
                     uid = session.uid,
@@ -950,11 +1065,16 @@ class PureViewModel(
                 ),
                 favorites,
             )
+            if (!sessionPersisted) {
+                _state.update { state ->
+                    state.copy(account = state.account.copy(error = SESSION_PERSISTENCE_ERROR))
+                }
+            }
         } catch (error: Throwable) {
             error.rethrowCancellation()
             if (error is JmAuthException) {
                 gateway.clearSession()
-                sessionStore?.clear()
+                clearStoredSession()
                 _state.update {
                     it.copy(
                         account = JmAccountUiState(status = JmAccountStatus.Error, error = error.readable()),
@@ -962,13 +1082,17 @@ class PureViewModel(
                     )
                 }
             } else {
+                val sessionPersisted = saveLatestGatewaySession(session)
                 _state.update {
                     it.copy(
                         account = JmAccountUiState(
                             status = JmAccountStatus.SignedIn,
                             uid = session.uid,
                             username = session.username,
-                            error = error.readable(),
+                            error = listOfNotNull(
+                                error.readable(),
+                                SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                            ).joinToString("；"),
                         ),
                     )
                 }
@@ -983,7 +1107,7 @@ class PureViewModel(
             try {
                 val account = gateway.login(username, password)
                 val session = gateway.session() ?: throw JmAuthException("JM 登录未返回有效会话")
-                sessionStore?.save(session)
+                saveStoredSession(session)
                 val syncError = try {
                     val favorites = gateway.allFavorites()
                     publishOfficialAccount(account, favorites)
@@ -1004,9 +1128,24 @@ class PureViewModel(
                     }
                     error.readable()
                 }
+                val sessionPersisted = saveLatestGatewaySession(session)
+                if (!sessionPersisted) {
+                    _state.update { state ->
+                        state.copy(
+                            account = state.account.copy(
+                                error = listOfNotNull(
+                                    state.account.error,
+                                    SESSION_PERSISTENCE_ERROR,
+                                ).distinct().joinToString("；"),
+                            ),
+                        )
+                    }
+                }
                 _state.update {
                     it.copy(
-                        message = if (syncError == null) {
+                        message = if (!sessionPersisted) {
+                            "JM 登录成功，但登录状态无法写入本机"
+                        } else if (syncError == null) {
                             "已登录 JM 官方账号 ${account.username}"
                         } else {
                             "已登录 JM 官方账号，收藏稍后重试"
@@ -1016,7 +1155,7 @@ class PureViewModel(
             } catch (error: Throwable) {
                 error.rethrowCancellation()
                 gateway.clearSession()
-                sessionStore?.clear()
+                clearStoredSession()
                 _state.update {
                     it.copy(
                         account = JmAccountUiState(status = JmAccountStatus.Error, error = error.readable()),
@@ -1028,11 +1167,13 @@ class PureViewModel(
     }
 
     fun logout() {
+        favoriteOperationGeneration.incrementAndGet()
+        _state.update { it.copy(favoritePendingKeys = emptySet()) }
         accountJob?.cancel()
         accountJob = viewModelScope.launch {
-            runCatching { gateway.logout() }
+            runCatching { favoriteOperationLimiter.withPermit { gateway.logout() } }
                 .onFailure { error -> error.rethrowCancellation() }
-            sessionStore?.clear()
+            clearStoredSession()
             val cachedFavorites = withContext(Dispatchers.IO) { libraryStore.loadFavorites() }
             _state.update {
                 it.copy(
@@ -1050,31 +1191,54 @@ class PureViewModel(
             if (!current.signedIn) _state.update { it.copy(message = "请先登录 JM 官方账号") }
             return
         }
+        val operationGeneration = favoriteOperationGeneration.get()
         accountJob?.cancel()
         accountJob = viewModelScope.launch {
             _state.update { state -> state.copy(account = state.account.copy(syncing = true, error = null)) }
             try {
-                val favorites = gateway.allFavorites()
-                publishOfficialAccount(
-                    JmAccount(uid = current.uid, username = current.username),
-                    favorites,
-                )
-                _state.update { it.copy(message = "JM 官方收藏已同步") }
+                favoriteOperationLimiter.withPermit {
+                    if (
+                        operationGeneration != favoriteOperationGeneration.get() ||
+                        !_state.value.account.signedIn
+                    ) return@withPermit
+                    val favorites = gateway.allFavorites()
+                    if (operationGeneration != favoriteOperationGeneration.get()) return@withPermit
+                    val sessionPersisted = saveLatestGatewaySession()
+                    publishOfficialAccount(
+                        JmAccount(uid = current.uid, username = current.username),
+                        favorites,
+                    )
+                    if (!sessionPersisted) {
+                        _state.update { state ->
+                            state.copy(account = state.account.copy(error = SESSION_PERSISTENCE_ERROR))
+                        }
+                    }
+                    _state.update { it.copy(message = "JM 官方收藏已同步") }
+                }
             } catch (error: Throwable) {
                 error.rethrowCancellation()
                 if (error is JmAuthException) {
+                    favoriteOperationGeneration.incrementAndGet()
                     gateway.clearSession()
-                    sessionStore?.clear()
+                    clearStoredSession()
                     _state.update {
                         it.copy(
                             account = JmAccountUiState(status = JmAccountStatus.Error, error = error.readable()),
+                            favoritePendingKeys = emptySet(),
                             message = "JM 登录已失效，请重新登录",
                         )
                     }
                 } else {
+                    val sessionPersisted = saveLatestGatewaySession()
                     _state.update { state ->
                         state.copy(
-                            account = state.account.copy(syncing = false, error = "收藏同步失败：${error.readable()}"),
+                            account = state.account.copy(
+                                syncing = false,
+                                error = listOfNotNull(
+                                    "收藏同步失败：${error.readable()}",
+                                    SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                ).joinToString("；"),
+                            ),
                             message = "JM 收藏同步失败",
                         )
                     }
@@ -1083,10 +1247,8 @@ class PureViewModel(
         }
     }
 
-    private fun publishOfficialAccount(account: JmAccount, favorites: List<JmFavoriteItem>) {
-        val items = favorites.map(JmFavoriteItem::toUiItem)
-            .distinctBy(ComicUiItem::key)
-            .take(MAX_FAVORITE_ENTRIES)
+    private suspend fun publishOfficialAccount(account: JmAccount, favorites: List<JmFavoriteItem>) {
+        val items = mapFavoriteItems(favorites)
         _state.update {
             it.copy(
                 account = JmAccountUiState(
@@ -1109,59 +1271,190 @@ class PureViewModel(
             return
         }
         val id = item.jmId.trim()
-        if (!id.matches(Regex("\\d{1,12}")) || !favoriteOperations.add(id)) return
-        val wasFavorite = _state.value.favorites.any { it.key == item.key }
+        if (!id.matches(SAFE_JM_ID) || !favoriteOperations.add(id)) return
+        val operationGeneration = favoriteOperationGeneration.get()
+        _state.update { state ->
+            state.copy(favoritePendingKeys = state.favoritePendingKeys + item.key)
+        }
         viewModelScope.launch {
+            var mutation: FavoriteMutationSnapshot? = null
             try {
-                gateway.toggleFavorite(id)
-                val official = try {
-                    gateway.allFavorites()
-                } catch (error: Throwable) {
-                    error.rethrowCancellation()
-                    if (error is JmAuthException) throw error
-                    null
-                }
-                _state.update { state ->
-                    val next = official?.map(JmFavoriteItem::toUiItem)
-                        ?.distinctBy(ComicUiItem::key)
-                        ?.take(MAX_FAVORITE_ENTRIES)
-                        ?: if (wasFavorite) {
-                            state.favorites.filterNot { it.key == item.key }
-                        } else {
-                            (listOf(item) + state.favorites.filterNot { it.key == item.key })
-                                .take(MAX_FAVORITE_ENTRIES)
+                favoriteOperationLimiter.withPermit {
+                    if (
+                        operationGeneration != favoriteOperationGeneration.get() ||
+                        !_state.value.account.signedIn
+                    ) return@withPermit
+                    val activeMutation = favoriteMutationSnapshot(_state.value.favorites, item)
+                    mutation = activeMutation
+                    applyOptimisticFavoriteMutation(item, activeMutation, operationGeneration)
+                    try {
+                        gateway.toggleFavorite(id)
+                        if (operationGeneration != favoriteOperationGeneration.get()) return@withPermit
+                        val sessionPersisted = saveLatestGatewaySession()
+                        _state.update { state ->
+                            if (operationGeneration != favoriteOperationGeneration.get()) return@update state
+                            state.copy(
+                                account = state.account.copy(
+                                    error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                ),
+                                message = if (activeMutation.wasFavorite) {
+                                    "已取消 JM 收藏"
+                                } else {
+                                    "已加入 JM 收藏"
+                                },
+                            )
                         }
-                    state.copy(
-                        favorites = next,
-                        account = state.account.copy(
-                            favoriteCount = official?.size?.toLong() ?: next.size.toLong(),
-                            error = null,
-                        ),
-                        message = if (official?.any { it.id == id } ?: !wasFavorite) {
-                            "已加入 JM 收藏"
+                        persistFavoritesSnapshot()
+                    } catch (error: Throwable) {
+                        error.rethrowCancellation()
+                        if (error is JmAuthException) throw error
+                        val official = try {
+                            gateway.allFavorites()
+                        } catch (reconcileError: Throwable) {
+                            reconcileError.rethrowCancellation()
+                            if (reconcileError is JmAuthException) throw reconcileError
+                            null
+                        }
+                        if (official != null && operationGeneration == favoriteOperationGeneration.get()) {
+                            val account = _state.value.account
+                            publishOfficialAccount(
+                                JmAccount(uid = account.uid, username = account.username),
+                                official,
+                            )
+                            val sessionPersisted = saveLatestGatewaySession()
+                            val isOfficiallyFavorite = official.any { it.id == id }
+                            _state.update { state ->
+                                if (operationGeneration != favoriteOperationGeneration.get()) return@update state
+                                state.copy(
+                                    account = state.account.copy(
+                                        error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                    ),
+                                    message = if (isOfficiallyFavorite) {
+                                        "网络响应较慢，已按官方收藏夹确认为已收藏"
+                                    } else {
+                                        "网络响应较慢，已按官方收藏夹确认为未收藏"
+                                    },
+                                )
+                            }
                         } else {
-                            "已取消 JM 收藏"
-                        },
-                    )
+                            rollbackFavoriteMutation(item, mutation, operationGeneration)
+                            val sessionPersisted = saveLatestGatewaySession()
+                            _state.update { state ->
+                                if (operationGeneration != favoriteOperationGeneration.get()) return@update state
+                                state.copy(
+                                    account = state.account.copy(
+                                        error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                    ),
+                                    message = "JM 收藏操作失败，已恢复原状态：${error.readable()}",
+                                )
+                            }
+                            persistFavoritesSnapshot()
+                        }
+                    }
                 }
-                persistFavoritesSnapshot()
             } catch (error: Throwable) {
-                error.rethrowCancellation()
+                if (error is CancellationException) {
+                    rollbackFavoriteMutation(item, mutation, operationGeneration)
+                    throw error
+                }
                 if (error is JmAuthException) {
+                    rollbackFavoriteMutation(item, mutation, operationGeneration)
+                    favoriteOperationGeneration.incrementAndGet()
                     gateway.clearSession()
-                    sessionStore?.clear()
+                    clearStoredSession()
                     _state.update {
                         it.copy(
                             account = JmAccountUiState(status = JmAccountStatus.Error, error = error.readable()),
+                            favoritePendingKeys = emptySet(),
                             message = "JM 登录已失效，请重新登录",
                         )
                     }
                 } else {
-                    _state.update { it.copy(message = "JM 收藏操作失败：${error.readable()}") }
+                    rollbackFavoriteMutation(item, mutation, operationGeneration)
+                    val sessionPersisted = saveLatestGatewaySession()
+                    _state.update { state ->
+                        if (operationGeneration != favoriteOperationGeneration.get()) return@update state
+                        state.copy(
+                            account = state.account.copy(
+                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                            ),
+                            message = "JM 收藏操作失败，已恢复原状态：${error.readable()}",
+                        )
+                    }
+                    persistFavoritesSnapshot()
                 }
             } finally {
                 favoriteOperations.remove(id)
+                _state.update { state ->
+                    state.copy(favoritePendingKeys = state.favoritePendingKeys - item.key)
+                }
             }
+        }
+    }
+
+    private fun applyOptimisticFavoriteMutation(
+        item: ComicUiItem,
+        mutation: FavoriteMutationSnapshot,
+        operationGeneration: Long,
+    ) {
+        _state.update { state ->
+            if (operationGeneration != favoriteOperationGeneration.get()) return@update state
+            val shouldBeFavorite = !mutation.wasFavorite
+            val currentlyFavorite = state.favorites.any { it.key == item.key }
+            val next = favoriteItemsWithMembership(
+                items = state.favorites,
+                item = item,
+                shouldBeFavorite = shouldBeFavorite,
+                maxEntries = MAX_FAVORITE_ENTRIES,
+            )
+            state.copy(
+                favorites = next,
+                account = state.account.copy(
+                    favoriteCount = if (currentlyFavorite == shouldBeFavorite) {
+                        state.account.favoriteCount
+                    } else {
+                        adjustedFavoriteCount(
+                            currentCount = state.account.favoriteCount,
+                            loadedCount = state.favorites.size,
+                            adding = shouldBeFavorite,
+                        )
+                    },
+                    error = null,
+                ),
+            )
+        }
+    }
+
+    private fun rollbackFavoriteMutation(
+        item: ComicUiItem,
+        mutation: FavoriteMutationSnapshot?,
+        operationGeneration: Long,
+    ) {
+        mutation ?: return
+        _state.update { state ->
+            if (operationGeneration != favoriteOperationGeneration.get()) return@update state
+            val currentlyFavorite = state.favorites.any { it.key == item.key }
+            val next = favoriteItemsWithMembership(
+                items = state.favorites,
+                item = item,
+                shouldBeFavorite = mutation.wasFavorite,
+                insertionIndex = mutation.originalIndex,
+                maxEntries = MAX_FAVORITE_ENTRIES,
+            )
+            state.copy(
+                favorites = next,
+                account = state.account.copy(
+                    favoriteCount = if (currentlyFavorite == mutation.wasFavorite) {
+                        state.account.favoriteCount
+                    } else {
+                        adjustedFavoriteCount(
+                            currentCount = state.account.favoriteCount,
+                            loadedCount = state.favorites.size,
+                            adding = mutation.wasFavorite,
+                        )
+                    },
+                ),
+            )
         }
     }
 
@@ -1234,7 +1527,9 @@ class PureViewModel(
     private fun persistHistorySnapshot() {
         val generation = historyPersistGeneration.incrementAndGet()
         val snapshot = _state.value.history
-        viewModelScope.launch {
+        historySaveJob?.cancel()
+        historySaveJob = viewModelScope.launch {
+            delay(HISTORY_SAVE_DEBOUNCE_MS)
             withContext(Dispatchers.IO) {
                 libraryWriteLock.withLock {
                     if (generation != historyPersistGeneration.get()) return@withLock
@@ -1252,6 +1547,8 @@ class PureViewModel(
         commentsJob?.cancel()
         readerJob?.cancel()
         readerWarmupJob?.cancel()
+        chapterPreloader.cancelAll()
+        readerWarmupChapterId = null
         _state.update {
             it.copy(
                 detail = ComicResolveUiState.Idle,
@@ -1269,6 +1566,7 @@ class PureViewModel(
         val chapter = comic.chapters.firstOrNull { it.id == resumeProgress?.chapterId }
             ?: comic.chapters.firstOrNull()
             ?: return
+        readerWarmupChapterId = chapter.id
         readerWarmupJob = viewModelScope.launch {
             if (detailGeneration != detailRequestGeneration.get()) return@launch
             if (!settings.dataSaver) {
@@ -1281,7 +1579,10 @@ class PureViewModel(
                     val pageIndex = resumeProgress?.pageIndex
                         ?.coerceIn(0, chapterPages.pages.lastIndex.coerceAtLeast(0))
                         ?: 0
-                    chapterPages.pages.getOrNull(pageIndex)?.let { page ->
+                    val warmupCount = if (settings.readerTurboMode) 3 else 2
+                    readerEntryWarmupIndices(pageIndex, chapterPages.pages.size, warmupCount).forEach { index ->
+                        if (detailGeneration != detailRequestGeneration.get()) return@forEach
+                        val page = chapterPages.pages.getOrNull(index) ?: return@forEach
                         runCatching {
                             gateway.prefetchPage(page, settings.readerImageQuality, settings.readerTurboMode)
                         }.onFailure { error -> error.rethrowCancellation() }
@@ -1311,6 +1612,15 @@ class PureViewModel(
         preserveCurrent: Boolean,
     ) {
         val requestGeneration = readerRequestGeneration.incrementAndGet()
+        chapterPreloader.cancelAll()
+        // Keep a same-chapter metadata request alive so the reader can reuse its
+        // result. Only unrelated speculative work is cancelled; same-page image
+        // work is already foreground-preemptible inside the gateway.
+        if (readerWarmupChapterId != chapter.sourceChapterId) {
+            readerWarmupJob?.cancel()
+            readerWarmupJob = null
+            readerWarmupChapterId = null
+        }
         val previousReader = _state.value.reader as? ReaderUiState.Ready
         val historyItem = comicCache[comicId]?.toUiItem()
             ?: (_state.value.detail as? ComicResolveUiState.Ready)?.takeIf { it.jmId == comicId }?.toUiItem()
@@ -1350,9 +1660,38 @@ class PureViewModel(
                 )
             }
             runCatching {
-                gateway.chapter(chapter.sourceChapterId)
+                val chapterPages = gateway.chapter(chapter.sourceChapterId)
+                val (readerPages, currentChapterIndex) = withContext(Dispatchers.Default) {
+                    chapterPages.pages.map(JmPage::toDirectReaderPage) to
+                        chapters.indexOfFirst { item -> item.sourceChapterId == chapter.sourceChapterId }.coerceAtLeast(0)
+                }
+                Triple(chapterPages, readerPages, currentChapterIndex)
             }
-                .onSuccess { chapterPages ->
+                .onSuccess { (chapterPages, readerPages, currentChapterIndex) ->
+                    chapterPreloader.schedule(
+                        chapterId = chapter.sourceChapterId,
+                        pages = chapterPages.pages,
+                        startPageIndex = initialPageIndex,
+                    )
+                    val warmupSettings = _state.value.settings
+                    val warmupPage = chapterPages.pages.getOrNull(
+                        initialPageIndex.coerceIn(0, chapterPages.pages.lastIndex.coerceAtLeast(0)),
+                    )
+                    if (!warmupSettings.dataSaver && warmupPage != null) {
+                        // Start the first image as soon as chapter metadata is ready. The reader
+                        // composable will join the same gateway request instead of waiting for its
+                        // first frame to create the network work.
+                        launch(Dispatchers.IO) {
+                            if (requestGeneration != readerRequestGeneration.get()) return@launch
+                            runCatching {
+                                gateway.prefetchPage(
+                                    warmupPage,
+                                    warmupSettings.readerImageQuality,
+                                    warmupSettings.readerTurboMode,
+                                )
+                            }.onFailure { error -> error.rethrowCancellation() }
+                        }
+                    }
                     _state.update { state ->
                         if (requestGeneration != readerRequestGeneration.get()) return@update state
                         state.copy(
@@ -1362,10 +1701,9 @@ class PureViewModel(
                                 title = comicTitle,
                                 chapterId = chapter.sourceChapterId,
                                 chapterTitle = chapter.title.ifBlank { chapterPages.title },
-                                pages = chapterPages.pages.map(JmPage::toDirectReaderPage),
+                                pages = readerPages,
                                 chapters = chapters,
-                                currentChapterIndex = chapters.indexOfFirst { item -> item.sourceChapterId == chapter.sourceChapterId }
-                                    .coerceAtLeast(0),
+                                currentChapterIndex = currentChapterIndex,
                                 initialPageIndex = initialPageIndex,
                                 changingChapterTitle = null,
                             ),
@@ -1421,23 +1759,28 @@ class PureViewModel(
 
     suspend fun loadReaderChapterSegment(chapter: SourceChapterDto): ReaderChapterSegment {
         val current = _state.value.reader as? ReaderUiState.Ready ?: throw JmSourceException()
-        if (!current.sourceId.matches(Regex("\\d{1,12}"))) throw JmSourceException()
+        if (!current.sourceId.matches(SAFE_JM_ID)) throw JmSourceException()
         if (!_state.value.settings.dataSaver) {
             gateway.warmImageConnections(current.sourceId, chapter.sourceChapterId)
         }
         val chapterPages = gateway.chapter(chapter.sourceChapterId)
+        chapterPreloader.schedule(chapter.sourceChapterId, chapterPages.pages)
+        val (pages, chapterIndex) = withContext(Dispatchers.Default) {
+            chapterPages.pages.map(JmPage::toDirectReaderPage) to
+                current.chapters.indexOfFirst { it.sourceChapterId == chapter.sourceChapterId }.coerceAtLeast(0)
+        }
         return ReaderChapterSegment(
             chapterId = chapter.sourceChapterId,
             chapterTitle = chapter.title.ifBlank { chapterPages.title },
-            chapterIndex = current.chapters.indexOfFirst { it.sourceChapterId == chapter.sourceChapterId }
-                .coerceAtLeast(0),
-            pages = chapterPages.pages.map(JmPage::toDirectReaderPage),
+            chapterIndex = chapterIndex,
+            pages = pages,
         )
     }
 
     fun closeReader() {
         readerRequestGeneration.incrementAndGet()
         readerJob?.cancel()
+        chapterPreloader.cancelAll()
         _state.update { it.copy(reader = ReaderUiState.Idle) }
     }
 
@@ -1514,6 +1857,14 @@ class PureViewModel(
     fun updateSettings(settings: AppSettings) {
         val previous = _state.value.settings
         val normalized = when {
+            settings.readerPrefetchMode == ReaderPrefetchMode.UltraAggressive &&
+                previous.readerPrefetchMode != ReaderPrefetchMode.UltraAggressive -> settings.copy(dataSaver = false)
+            settings.dataSaver && !previous.dataSaver &&
+                settings.readerPrefetchMode == ReaderPrefetchMode.UltraAggressive -> settings.copy(
+                    readerTurboMode = false,
+                    readerPrefetchMode = ReaderPrefetchMode.Conservative,
+                    readerPrefetchPages = 1,
+                )
             settings.readerTurboMode && !previous.readerTurboMode -> settings.copy(dataSaver = false)
             settings.dataSaver && !previous.dataSaver -> settings.copy(readerTurboMode = false)
             settings.readerTurboMode && settings.dataSaver -> settings.copy(dataSaver = false)
@@ -1546,6 +1897,20 @@ class PureViewModel(
                 force = normalized.autoUpdateSourceList && !previous.autoUpdateSourceList,
                 updateOfficialList = normalized.autoUpdateSourceList && !previous.autoUpdateSourceList,
             )
+        }
+        if (normalized.readerPrefetchMode != ReaderPrefetchMode.UltraAggressive || normalized.dataSaver) {
+            chapterPreloader.cancelAll()
+        } else if (
+            previous.readerPrefetchMode != ReaderPrefetchMode.UltraAggressive ||
+            previous.dataSaver
+        ) {
+            (_state.value.reader as? ReaderUiState.Ready)?.let { reader ->
+                chapterPreloader.schedule(
+                    chapterId = reader.chapterId,
+                    pages = reader.pages.map(DirectReaderPage::toJmPage),
+                    startPageIndex = reader.initialPageIndex,
+                )
+            }
         }
     }
 
@@ -1643,6 +2008,9 @@ class PureViewModel(
 
     fun openDownloaded(item: DownloadedChapter) {
         val requestGeneration = readerRequestGeneration.incrementAndGet()
+        readerWarmupJob?.cancel()
+        readerWarmupJob = null
+        readerWarmupChapterId = null
         readerJob?.cancel()
         readerJob = viewModelScope.launch {
             val files = downloadStore.localPages(item)
@@ -1656,17 +2024,20 @@ class PureViewModel(
             }
             val chapter = SourceChapterDto(item.chapterId, 1, item.chapterTitle)
             val resumePageIndex = settingsStore.loadChapterProgress(item.comicId, item.chapterId)?.pageIndex ?: 0
-            val pages = files.mapIndexed { index, file ->
-                DirectReaderPage(
-                    index = index + 1,
-                    photoId = item.chapterId,
-                    fileName = file.name,
-                    scrambleId = "0",
-                    url = file.toURI().toString(),
-                    referer = "",
-                    localPath = file.absolutePath,
-                )
+            val pages = withContext(Dispatchers.Default) {
+                files.mapIndexed { index, file ->
+                    DirectReaderPage(
+                        index = index + 1,
+                        photoId = item.chapterId,
+                        fileName = file.name,
+                        scrambleId = "0",
+                        url = file.toURI().toString(),
+                        referer = "",
+                        localPath = file.absolutePath,
+                    )
+                }
             }
+            if (requestGeneration != readerRequestGeneration.get()) return@launch
             _state.update { state ->
                 if (requestGeneration != readerRequestGeneration.get()) return@update state
                 state.copy(
@@ -1821,7 +2192,9 @@ class PureViewModel(
         accountJob?.cancel()
         readerJob?.cancel()
         readerWarmupJob?.cancel()
+        chapterPreloader.cancelAll()
         settingsSaveJob?.cancel()
+        historySaveJob?.cancel()
         weeklyCatalogJob?.cancel()
         weeklyJob?.cancel()
         typeRankingJob?.cancel()
@@ -1868,175 +2241,15 @@ class PureViewModel(
     }
 }
 
-private fun JmRanking.toUiItem() = ComicUiItem(
-    jmId = id,
-    title = title,
-    subtitle = listOf(category, badge).filter(String::isNotBlank).joinToString(" · "),
-    metric = when {
-        likes != null -> "JM 收藏 ${likes.compact()}"
-        views != null -> "JM 浏览 ${views.compact()}"
-        else -> "JM 官方源"
-    },
-    accentIndex = id.takeLast(4).toIntOrNull() ?: title.hashCode(),
-    coverUrl = coverUrl,
-)
-
-private fun JmFavoriteItem.toUiItem() = ComicUiItem(
-    jmId = id,
-    title = title,
-    subtitle = authors.take(2).joinToString(" · ").ifBlank { "JM 官方收藏" },
-    metric = "JM 官方收藏",
-    accentIndex = id.takeLast(4).toIntOrNull() ?: title.hashCode(),
-    coverUrl = coverUrl,
-)
-
-private fun JmComic.toUiItem() = ComicUiItem(
-    jmId = id,
-    title = title,
-    subtitle = authors.take(2).joinToString(" · ").ifBlank { "JM 官方源" },
-    metric = likes?.let { "JM 收藏 ${it.compact()}" }
-        ?: views?.let { "JM 浏览 ${it.compact()}" }
-        ?: "",
-    accentIndex = id.takeLast(4).toIntOrNull() ?: title.hashCode(),
-    coverUrl = coverUrl,
-)
-
-private fun ComicResolveUiState.Ready.toUiItem() = ComicUiItem(
-    jmId = jmId,
-    title = title,
-    subtitle = "JM 官方源",
-    metric = "",
-    accentIndex = jmId.takeLast(4).toIntOrNull() ?: title.hashCode(),
-    coverUrl = coverUrl,
-    source = source,
-)
-
-private fun JmComment.toUiItem(): JmCommentUiItem {
-    val normalizedUsername = username.trim()
-    val normalizedNickname = nickname.trim()
-    return JmCommentUiItem(
-        id = id,
-        userId = userId,
-        displayName = normalizedNickname
-            .ifBlank { normalizedUsername }
-            .ifBlank { userId?.let { "JM$it" }.orEmpty() }
-            .ifBlank { "JM 用户" },
-        username = normalizedUsername,
-        content = content.trim(),
-        avatarUrl = avatarUrl?.trim()?.takeIf { it.startsWith("https://") },
-        createdAt = createdAt.trim(),
-        likes = likes.coerceAtLeast(0L),
-        spoiler = spoiler,
-        replies = replies.map(JmComment::toUiItem),
-    )
-}
-
-internal fun mergeComicPage(
-    existing: List<ComicUiItem>,
-    incoming: List<ComicUiItem>,
-): List<ComicUiItem> = buildList(existing.size + incoming.size) {
-    val seen = HashSet<String>(existing.size + incoming.size)
-    (existing + incoming).forEach { item ->
-        if (seen.add(item.key)) add(item)
-    }
-}
-
-internal fun mergeCommentPage(
-    existing: List<JmCommentUiItem>,
-    incoming: List<JmCommentUiItem>,
-): List<JmCommentUiItem> = buildList(existing.size + incoming.size) {
-    val seen = HashSet<String>(existing.size + incoming.size)
-    (existing + incoming).forEach { item ->
-        if (seen.add(item.id)) add(item)
-    }
-}
-
-internal fun shouldPublishProgress(previous: Float, current: Float, elapsedNanos: Long, completed: Boolean): Boolean =
-    completed || current - previous >= 0.01f || elapsedNanos >= 150_000_000L
-
-internal fun isForwardPageResponse(previousPage: Int, requestedPage: Int, responsePage: Int): Boolean =
-    requestedPage > previousPage && responsePage == requestedPage
-
-private fun JmCategory.toDirectCategory() = DirectJmCategory(id, name, slug, type, totalAlbums)
-
-private fun JmComic.toResolveState(progress: LocalReadingProgress?) = ComicResolveUiState.Ready(
-    source = SourceIds.Jm,
-    jmId = id,
-    title = title,
-    description = description,
-    coverUrl = coverUrl,
-    cacheState = "direct",
-    refreshing = false,
-    chapters = chapters.map { SourceChapterDto(it.id, it.index, it.title) },
-    resumeChapterId = progress?.chapterId,
-    resumePageIndex = progress?.pageIndex ?: 0,
-)
-
-private fun JmPage.toDirectReaderPage() = DirectReaderPage(
-    index = index,
-    photoId = photoId,
-    fileName = fileName,
-    scrambleId = scrambleId,
-    url = url,
-    alternativeUrls = alternativeUrls,
-    referer = referer,
-    localPath = localPath,
-)
-
-private fun DirectReaderPage.toJmPage() = JmPage(
-    index = index,
-    photoId = photoId,
-    fileName = fileName,
-    scrambleId = scrambleId,
-    url = url,
-    alternativeUrls = alternativeUrls,
-    referer = referer,
-    localPath = localPath ?: if (url.startsWith("file:")) runCatching { java.io.File(java.net.URI(url)).absolutePath }.getOrNull() else null,
-)
-
-private fun JmSourceSnapshot.toUiState(
-    checking: Boolean = false,
-    error: String? = null,
-) = JmSourceUiState(
-    items = endpoints.map { endpoint -> JmSourceUiItem(endpoint.host, endpoint.latencyMs) },
-    selectedHost = selectedHost,
-    updatedAt = updatedAt,
-    imageItems = imageEndpoints.map { endpoint -> JmSourceUiItem(endpoint.host, endpoint.latencyMs) },
-    selectedImageHost = selectedImageHost,
-    imageUpdatedAt = imageUpdatedAt,
-    checking = checking,
-    error = error,
-)
-
-private fun Long.compact(): String = when {
-    this >= 1_000_000 -> "%.1fM".format(this / 1_000_000.0)
-    this >= 1_000 -> "%.1fK".format(this / 1_000.0)
-    else -> toString()
-}
-
-private fun Throwable.readable(): String = message?.take(120).orEmpty().ifBlank { "JM 官方源连接失败" }
-
-private fun Throwable.rethrowCancellation() {
-    if (this is CancellationException) throw this
-}
-
-private fun parseJmId(raw: String): String? {
-    val value = raw.trim()
-    return when {
-        value.matches(Regex("\\d{1,12}")) -> value
-        else -> Regex("(?i)^jm\\s*[:#-]?\\s*(\\d{1,12})$").matchEntire(value)?.groupValues?.getOrNull(1)
-    }
-}
-
     private const val COMIC_CACHE_LIMIT = 48
-    private const val COMMENT_CACHE_LIMIT = 24
-    private const val COMMENT_CACHE_TTL_MS = 5L * 60L * 1_000L
     private const val MAX_FAVORITE_ENTRIES = 200
 private const val MAX_HISTORY_ENTRIES = 100
+private const val HISTORY_SAVE_DEBOUNCE_MS = 750L
+private const val INITIAL_HOME_PRIORITY_TIMEOUT_MS = 2_500L
 private const val MAX_PAGINATION_PAGE = 200
 private const val MAX_SEARCH_QUERY_LENGTH = 160
 private const val MAX_BROWSE_OPTION_LENGTH = 128
 private const val MAX_READER_PAGE_COUNT = 20_000
 private const val INVALID_PAGINATION_MESSAGE = "上游分页响应异常，请稍后重试"
-private val SAFE_JM_ID = Regex("^\\d{1,12}$")
+private const val SESSION_PERSISTENCE_ERROR = "当前会话有效，但无法保存登录状态；重启后可能需要重新登录"
 private const val SOURCE_REFRESH_INTERVAL_MS = 6L * 60L * 60L * 1_000L

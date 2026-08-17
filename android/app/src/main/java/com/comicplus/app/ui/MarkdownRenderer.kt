@@ -27,6 +27,7 @@ private val BR_TAG_PATTERN = Regex("(?i)<\\s*br\\s*/?\\s*>")
 private val PARAGRAPH_TAG_PATTERN = Regex("(?i)</?\\s*(?:p|div|li|blockquote)\\s*>")
 private val HTML_TAG_PATTERN = Regex("(?s)<[^>]{0,240}>")
 private val ENTITY_PATTERN = Regex("(?i)&(?:amp|lt|gt|quot|apos|nbsp|#39|#x27);")
+private val HORIZONTAL_RULE_PATTERN = Regex("^(?:[-*_]\\s*){3,}$")
 private val LINK_PATTERN = Regex(
     "\\[((?:\\\\.|[^\\]]){1,240})\\]\\((https://[^\\s<>\\\"]{1,$MAX_LINK_LENGTH})\\)",
     RegexOption.IGNORE_CASE,
@@ -136,7 +137,7 @@ private fun appendMarkdownLine(builder: AnnotatedString.Builder, line: String) {
         builder.pop()
         return
     }
-    if (line.trim().matches(Regex("^(?:[-*_]\\s*){3,}$"))) {
+    if (line.trim().matches(HORIZONTAL_RULE_PATTERN)) {
         builder.append("---")
         return
     }

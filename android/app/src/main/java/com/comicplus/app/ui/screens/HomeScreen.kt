@@ -39,8 +39,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -78,9 +80,6 @@ import com.comicplus.app.ui.theme.Muted
 import com.comicplus.app.ui.theme.SurfaceSoft
 import com.comicplus.app.ui.theme.White
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filter
-import androidx.compose.runtime.snapshotFlow
 
 @Composable
 fun HomeScreen(
@@ -108,13 +107,17 @@ fun HomeScreen(
     val searchFocusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
     val listState = rememberLazyListState()
-    LaunchedEffect(listState, discoveryLoading, discoveryExhausted) {
+    val currentCanLoadMoreDiscovery = rememberUpdatedState(!discoveryLoading && !discoveryExhausted)
+    val currentOnLoadMoreDiscovery = rememberUpdatedState(onLoadMoreDiscovery)
+    // The scrolling edge is the trigger. Loading/result changes only update
+    // the gate and must not restart the collector while the edge stays visible.
+    LaunchedEffect(listState) {
         snapshotFlow {
             val info = listState.layoutInfo
-            val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+            val last = info.visibleItemsInfo.lastOrNull()?.index ?: -1
             last >= info.totalItemsCount - 4 && info.totalItemsCount > 0
-        }.distinctUntilChanged().filter { it }.collect {
-            if (!discoveryLoading && !discoveryExhausted) onLoadMoreDiscovery()
+        }.collect { nearEnd ->
+            if (nearEnd && currentCanLoadMoreDiscovery.value) currentOnLoadMoreDiscovery.value()
         }
     }
 
@@ -264,11 +267,6 @@ fun HomeScreen(
                         androidx.compose.material3.CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
                     }
                 }
-            } else if (!discoveryExhausted) {
-                item(key = "home-discovery-sentinel", contentType = "sentinel") {
-                    LaunchedEffect(discoveryItems.size) { onLoadMoreDiscovery() }
-                    Spacer(Modifier.height(12.dp))
-                }
             }
 
             item(key = "home-footer", contentType = "home-footer") {
@@ -395,6 +393,7 @@ private fun FeaturedCarousel(
                             isFavorite = current.key in favoriteKeys,
                             onClick = { onToggleFavorite(current) },
                             modifier = Modifier.align(Alignment.TopEnd).padding(12.dp),
+                            favoriteKey = current.key,
                         )
                     }
             }

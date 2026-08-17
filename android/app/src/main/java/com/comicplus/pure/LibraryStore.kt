@@ -18,6 +18,8 @@ class LibraryStore(context: Context? = null) {
     private val lock = Any()
     private var memoryFavorites: List<ComicUiItem> = emptyList()
     private var memoryHistory: List<ReadingHistoryItem> = emptyList()
+    private var favoritesLoaded = false
+    private var historyLoaded = false
 
     fun loadFavorites(): List<ComicUiItem> = synchronized(lock) { readFavoritesLocked() }
 
@@ -87,39 +89,63 @@ class LibraryStore(context: Context? = null) {
 
     fun clearHistory() = synchronized(lock) {
         memoryHistory = emptyList()
+        historyLoaded = true
         preferences?.edit(commit = true) { remove(HISTORY_KEY) }
     }
 
     private fun readFavoritesLocked(): List<ComicUiItem> {
+        if (favoritesLoaded) return memoryFavorites
         val raw = preferences?.getString(FAVORITES_KEY, null)
-        if (raw == null) return memoryFavorites
-        val entryLimit = boundedLibraryEntryCount(raw, MAX_FAVORITES) ?: return emptyList()
-        return runCatching {
-            val array = JSONArray(raw)
+        if (raw == null) {
+            favoritesLoaded = true
+            return memoryFavorites
+        }
+        val array = parseLibraryArray(raw)
+        if (array == null) {
+            favoritesLoaded = true
+            memoryFavorites = emptyList()
+            return memoryFavorites
+        }
+        val entryLimit = array.length().coerceAtMost(MAX_FAVORITES)
+        memoryFavorites = runCatching {
             buildList(entryLimit) {
                 for (index in 0 until entryLimit) {
                     array.optJSONObject(index)?.toComicItem()?.let(::add)
                 }
             }.distinctBy(ComicUiItem::key)
         }.getOrElse { emptyList() }
+        favoritesLoaded = true
+        return memoryFavorites
     }
 
     private fun readHistoryLocked(): List<ReadingHistoryItem> {
+        if (historyLoaded) return memoryHistory
         val raw = preferences?.getString(HISTORY_KEY, null)
-        if (raw == null) return memoryHistory
-        val entryLimit = boundedLibraryEntryCount(raw, MAX_HISTORY) ?: return emptyList()
-        return runCatching {
-            val array = JSONArray(raw)
+        if (raw == null) {
+            historyLoaded = true
+            return memoryHistory
+        }
+        val array = parseLibraryArray(raw)
+        if (array == null) {
+            historyLoaded = true
+            memoryHistory = emptyList()
+            return memoryHistory
+        }
+        val entryLimit = array.length().coerceAtMost(MAX_HISTORY)
+        memoryHistory = runCatching {
             buildList(entryLimit) {
                 for (index in 0 until entryLimit) {
                     array.optJSONObject(index)?.toHistoryItem()?.let(::add)
                 }
             }.distinctBy { it.comic.key }
         }.getOrElse { emptyList() }
+        historyLoaded = true
+        return memoryHistory
     }
 
     private fun writeFavoritesLocked(items: List<ComicUiItem>) {
         memoryFavorites = items
+        favoritesLoaded = true
         if (preferences == null) return
         val value = JSONArray().apply { items.forEach { put(it.toJson()) } }.toString()
         preferences.edit(commit = true) { putString(FAVORITES_KEY, value) }
@@ -127,6 +153,7 @@ class LibraryStore(context: Context? = null) {
 
     private fun writeHistoryLocked(items: List<ReadingHistoryItem>) {
         memoryHistory = items
+        historyLoaded = true
         if (preferences == null) return
         val value = JSONArray().apply { items.forEach { put(it.toJson()) } }.toString()
         preferences.edit(commit = true) { putString(HISTORY_KEY, value) }
@@ -241,6 +268,11 @@ private fun sanitizeTimestamp(value: Long): Long {
 }
 
 internal fun boundedLibraryEntryCount(raw: String, maxItems: Int): Int? {
-    if (maxItems < 0 || raw.length !in 1..LibraryStore.MAX_LIBRARY_JSON_CHARS) return null
-    return runCatching { JSONArray(raw).length().coerceAtMost(maxItems) }.getOrNull()
+    if (maxItems < 0) return null
+    return parseLibraryArray(raw)?.length()?.coerceAtMost(maxItems)
+}
+
+private fun parseLibraryArray(raw: String): JSONArray? {
+    if (raw.length !in 1..LibraryStore.MAX_LIBRARY_JSON_CHARS) return null
+    return runCatching { JSONArray(raw) }.getOrNull()
 }
