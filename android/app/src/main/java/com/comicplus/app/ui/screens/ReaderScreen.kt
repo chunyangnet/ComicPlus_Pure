@@ -123,6 +123,8 @@ import com.comicplus.app.ui.theme.White
 import com.comicplus.app.ui.components.ShimmerBlock
 import com.comicplus.app.ui.components.pressFeedback
 import com.comicplus.app.ui.components.rememberShimmerBrush
+import com.comicplus.pure.rethrowCancellation
+import com.comicplus.pure.runCatchingNonFatal
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -160,11 +162,9 @@ fun ReaderScreen(
     when (state) {
         ReaderUiState.Idle -> Unit
         is ReaderUiState.Loading -> {
-            BackHandler(onBack = onClose)
             ReaderLoading(state.title, state.chapterTitle, settings.reduceMotion, onClose, modifier)
         }
         is ReaderUiState.Error -> {
-            BackHandler(onBack = onClose)
             ReaderError(state.title, state.message, onRetryChapter, onClose, modifier)
         }
         is ReaderUiState.Ready -> key(state.chapterId) {
@@ -283,13 +283,15 @@ private fun ReaderContent(
     var readerCommentsVisible by rememberSaveable { mutableStateOf(false) }
     var readerCommentChapterId by rememberSaveable(state.chapterId) { mutableStateOf(state.chapterId) }
     val readerCommentChapter = chaptersById[readerCommentChapterId] ?: activeChapter
-    val visibleComments = comments.takeIf {
-        it.comicId == state.sourceId && it.chapterId == readerCommentChapter.sourceChapterId
-    } ?: JmCommentsUiState(
-        comicId = state.sourceId,
-        chapterId = readerCommentChapter.sourceChapterId,
-        loading = true,
-    )
+    val visibleComments = remember(comments, state.sourceId, readerCommentChapter.sourceChapterId) {
+        comments.takeIf {
+            it.comicId == state.sourceId && it.chapterId == readerCommentChapter.sourceChapterId
+        } ?: JmCommentsUiState(
+            comicId = state.sourceId,
+            chapterId = readerCommentChapter.sourceChapterId,
+            loading = true,
+        )
+    }
     fun openReaderComments(chapter: SourceChapterDto) {
         readerCommentChapterId = chapter.sourceChapterId
         onOpenComments(state.sourceId, chapter.sourceChapterId)
@@ -310,9 +312,12 @@ private fun ReaderContent(
     var readerPositionInitialized by remember(state.chapterId) { mutableStateOf(false) }
     var savedVerticalIndex by remember(state.chapterId) { mutableIntStateOf(initialPageIndex) }
     var savedVerticalOffset by remember(state.chapterId) { mutableIntStateOf(0) }
+    val context = LocalContext.current
     val view = LocalView.current
-    val readerWindow = LocalContext.current.findActivity()?.window
-    val activityManager = LocalContext.current.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+    val readerWindow = remember(context) { context.findActivity()?.window }
+    val memoryClassMb = remember(context) {
+        (context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager)?.memoryClass ?: 256
+    }
     val skeletonBrush = rememberShimmerBrush(
         animated = !settings.reduceMotion,
         colors = listOf(Color(0xFF101010), Color(0xFF202020), Color(0xFF101010)),
@@ -411,12 +416,11 @@ private fun ReaderContent(
             }
     }
 
-    BackHandler {
+    BackHandler(enabled = chapterMenuVisible || readerSettingsVisible || readerCommentsVisible) {
         when {
             chapterMenuVisible -> chapterMenuVisible = false
             readerSettingsVisible -> readerSettingsVisible = false
             readerCommentsVisible -> readerCommentsVisible = false
-            else -> leaveReader()
         }
     }
 
@@ -525,24 +529,27 @@ private fun ReaderContent(
                     val effectivePrefetchPages = effectiveReaderPrefetchPages(
                         configuredPages = settings.readerPrefetchPages,
                         dataSaver = settings.dataSaver,
-                        memoryClassMb = activityManager?.memoryClass ?: 256,
+                        memoryClassMb = memoryClassMb,
                         turboMode = settings.readerTurboMode,
                         mode = settings.readerPrefetchMode,
+                        imageQuality = settings.readerImageQuality,
                         pageVelocityPagesPerSecond = smoothedVelocity,
                         networkLatencyMs = selectedImageLatencyMs,
                     )
                     if (effectivePrefetchPages <= 0) return@launch
-                    delay(
-                        if (settings.readerTurboMode) READER_TURBO_PREFETCH_SETTLE_MILLIS
-                        else READER_PREFETCH_SETTLE_MILLIS,
-                    )
+                    if (settings.readerPrefetchMode != ReaderPrefetchMode.UltraAggressive) {
+                        delay(
+                            if (settings.readerTurboMode) READER_TURBO_PREFETCH_SETTLE_MILLIS
+                            else READER_PREFETCH_SETTLE_MILLIS,
+                        )
+                    }
                     prefetchReaderPages(
                         position = position,
                         previousPosition = previous,
                         loadedSegments = loadedSegments,
                         initialSegment = initialSegment,
                         settings = settings,
-                        memoryClassMb = activityManager?.memoryClass ?: 256,
+                        memoryClassMb = memoryClassMb,
                         prefetchDistance = effectivePrefetchPages,
                         prefetchPage = prefetchPage,
                         cachedPage = cachedPage,
@@ -615,7 +622,9 @@ private fun ReaderContent(
                 loadPage = loadPage,
                 cachedPage = cachedPage,
                 requestProfileKey = readerRequestProfileKey,
-                beyondViewportPageCount = 1,
+                beyondViewportPageCount = if (
+                    settings.readerPrefetchMode == ReaderPrefetchMode.UltraAggressive
+                ) 2 else 1,
                 retryAllKey = retryAllKey,
                 skeletonBrush = skeletonBrush,
                 onToggleChrome = { if (settings.tapToToggleReaderMenu) chromeVisible = !chromeVisible },
@@ -974,7 +983,7 @@ private fun VerticalReaderPages(
         ) return
         appendStates[chapter.sourceChapterId] = ChapterAppendState.Loading
         scope.launch {
-            runCatching { loadChapterSegment(chapter) }
+            runCatchingNonFatal { loadChapterSegment(chapter) }
                 .onSuccess { segment ->
                     // Append the chapter as soon as its page list is ready.
                     // Image warming is speculative and must never hold the
@@ -982,7 +991,14 @@ private fun VerticalReaderPages(
                     onSegmentLoaded(segment)
                     appendStates.remove(chapter.sourceChapterId)
                     warmingChapters[chapter.sourceChapterId] = true
-                    val warmPages = segment.pages.take(if (settings.readerTurboMode) 2 else 1)
+                    val warmPages = segment.pages.take(
+                        when {
+                            settings.readerPrefetchMode == ReaderPrefetchMode.UltraAggressive ->
+                                ULTRA_NEXT_CHAPTER_WARM_PAGES
+                            settings.readerTurboMode -> 2
+                            else -> 1
+                        },
+                    )
                     suspend fun warm(page: DirectReaderPage) {
                         try {
                             prefetchPage(page)
@@ -992,15 +1008,20 @@ private fun VerticalReaderPages(
                             // The visible page owns retry UI if speculative warming fails.
                         }
                     }
-                    if (settings.readerTurboMode) {
-                        coroutineScope { warmPages.map { page -> async { warm(page) } }.awaitAll() }
+                    if (
+                        settings.readerTurboMode ||
+                        settings.readerPrefetchMode == ReaderPrefetchMode.UltraAggressive
+                    ) {
+                        warmPages.chunked(2).forEach { batch ->
+                            coroutineScope { batch.map { page -> async { warm(page) } }.awaitAll() }
+                        }
                     } else {
                         warmPages.forEach { page -> warm(page) }
                     }
                     warmingChapters.remove(chapter.sourceChapterId)
                 }
                 .onFailure { error ->
-                    if (error is CancellationException) throw error
+                    error.rethrowCancellation()
                     warmingChapters.remove(chapter.sourceChapterId)
                     if (segments.any { it.chapterId == chapter.sourceChapterId }) return@onFailure
                     appendStates[chapter.sourceChapterId] = ChapterAppendState.Failed(
@@ -1023,15 +1044,18 @@ private fun VerticalReaderPages(
                 .maxWithOrNull(compareBy<ReaderProgressPosition>({ it.chapterIndex }, { it.pageIndex }))
         }.distinctUntilChanged().collect { position ->
             if (position == null) return@collect
-            val preloadDistance = if (settings.readerTurboMode) {
-                NEXT_CHAPTER_TURBO_PRELOAD_PAGES
-            } else {
-                when {
-                    settings.dataSaver || settings.readerPrefetchMode == ReaderPrefetchMode.Conservative -> NEXT_CHAPTER_MIN_PRELOAD_PAGES
-                    settings.readerPrefetchMode == ReaderPrefetchMode.Aggressive ||
-                        settings.readerPrefetchMode == ReaderPrefetchMode.UltraAggressive -> NEXT_CHAPTER_MAX_PRELOAD_PAGES
-                    else -> settings.readerPrefetchPages.coerceIn(NEXT_CHAPTER_MIN_PRELOAD_PAGES, NEXT_CHAPTER_MAX_PRELOAD_PAGES)
-                }
+            val preloadDistance = when {
+                settings.dataSaver || settings.readerPrefetchMode == ReaderPrefetchMode.Conservative ->
+                    NEXT_CHAPTER_MIN_PRELOAD_PAGES
+                settings.readerPrefetchMode == ReaderPrefetchMode.UltraAggressive ->
+                    NEXT_CHAPTER_ULTRA_PRELOAD_PAGES
+                settings.readerTurboMode -> NEXT_CHAPTER_TURBO_PRELOAD_PAGES
+                settings.readerPrefetchMode == ReaderPrefetchMode.Aggressive ->
+                    NEXT_CHAPTER_MAX_PRELOAD_PAGES
+                else -> settings.readerPrefetchPages.coerceIn(
+                    NEXT_CHAPTER_MIN_PRELOAD_PAGES,
+                    NEXT_CHAPTER_MAX_PRELOAD_PAGES,
+                )
             }
             if (shouldPreloadNextChapter(position.pageIndex, position.pageCount, preloadDistance)) {
                 chapters.getOrNull(position.chapterIndex + 1)?.let(::requestNextChapter)
@@ -1765,6 +1789,8 @@ private const val READER_PAGE_KEY_PREFIX = "reader-page:"
 private const val NEXT_CHAPTER_MIN_PRELOAD_PAGES = 4
 private const val NEXT_CHAPTER_MAX_PRELOAD_PAGES = 6
 private const val NEXT_CHAPTER_TURBO_PRELOAD_PAGES = 8
+private const val NEXT_CHAPTER_ULTRA_PRELOAD_PAGES = 16
+private const val ULTRA_NEXT_CHAPTER_WARM_PAGES = 6
 private const val READER_EDGE_TAP_FRACTION = .28f
 private const val DEFAULT_READER_PAGE_ASPECT_RATIO = .70f
 private const val MAX_READER_ZOOM = 4f

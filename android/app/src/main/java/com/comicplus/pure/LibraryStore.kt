@@ -107,7 +107,7 @@ class LibraryStore(context: Context? = null) {
             return memoryFavorites
         }
         val entryLimit = array.length().coerceAtMost(MAX_FAVORITES)
-        memoryFavorites = runCatching {
+        memoryFavorites = runCatchingNonFatal {
             buildList(entryLimit) {
                 for (index in 0 until entryLimit) {
                     array.optJSONObject(index)?.toComicItem()?.let(::add)
@@ -132,7 +132,7 @@ class LibraryStore(context: Context? = null) {
             return memoryHistory
         }
         val entryLimit = array.length().coerceAtMost(MAX_HISTORY)
-        memoryHistory = runCatching {
+        memoryHistory = runCatchingNonFatal {
             buildList(entryLimit) {
                 for (index in 0 until entryLimit) {
                     array.optJSONObject(index)?.toHistoryItem()?.let(::add)
@@ -274,5 +274,5 @@ internal fun boundedLibraryEntryCount(raw: String, maxItems: Int): Int? {
 
 private fun parseLibraryArray(raw: String): JSONArray? {
     if (raw.length !in 1..LibraryStore.MAX_LIBRARY_JSON_CHARS) return null
-    return runCatching { JSONArray(raw) }.getOrNull()
+    return runCatchingNonFatal { JSONArray(raw) }.getOrNull()
 }

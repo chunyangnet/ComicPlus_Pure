@@ -71,6 +71,12 @@ internal class JmChapterPreloader(
         jobs.clear()
     }
 
+    fun cancelExcept(chapterId: String) {
+        jobs.entries.forEach { (id, job) ->
+            if (id != chapterId && jobs.remove(id, job)) job.cancel()
+        }
+    }
+
     private companion object {
         private const val ULTRA_PRELOAD_WORKERS = 2
     }

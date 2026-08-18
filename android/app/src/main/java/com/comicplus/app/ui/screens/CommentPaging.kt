@@ -5,6 +5,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
+import com.comicplus.app.ui.JmCommentUiItem
 
 /**
  * Keeps the scroll observer isolated from the detail/readers' large UI trees.
@@ -52,3 +53,6 @@ internal fun formatCommentCount(value: Long): String = when {
     value >= 10_000L -> "${value / 10_000L}万+"
     else -> value.coerceAtLeast(0L).toString()
 }
+
+internal fun containsSpoilerComment(items: List<JmCommentUiItem>): Boolean =
+    items.any { comment -> comment.spoiler || containsSpoilerComment(comment.replies) }

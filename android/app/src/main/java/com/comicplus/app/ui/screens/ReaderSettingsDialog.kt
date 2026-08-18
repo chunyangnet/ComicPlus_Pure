@@ -403,7 +403,7 @@ private fun readerPrefetchModeForLabel(label: String): ReaderPrefetchMode = when
 private fun readerPrefetchDescription(mode: ReaderPrefetchMode, pages: Int): String = when (mode) {
     ReaderPrefetchMode.Conservative -> "只保温相邻 1 页，优先降低内存和流量占用"
     ReaderPrefetchMode.Aggressive -> "前后页并行保温，并提前准备下一话"
-    ReaderPrefetchMode.UltraAggressive -> "立即缓存整章源图，快速滑动时只需解码；流量与存储占用最高"
+    ReaderPrefetchMode.UltraAggressive -> "首屏就绪后进入，沿滑动方向保持解码缓冲并提前准备下一话；流量、内存与存储占用最高"
     ReaderPrefetchMode.Custom -> "按 $pages 页保温，并自动避让正在阅读的页面"
     ReaderPrefetchMode.Smart -> "根据翻页速度、方向和设备内存动态调整"
 }

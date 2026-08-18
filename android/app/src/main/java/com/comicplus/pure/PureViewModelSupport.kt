@@ -152,7 +152,7 @@ internal fun DirectReaderPage.toJmPage() = JmPage(
     alternativeUrls = alternativeUrls,
     referer = referer,
     localPath = localPath ?: if (url.startsWith("file:")) {
-        runCatching { File(URI(url)).absolutePath }.getOrNull()
+        runCatchingNonFatal { File(URI(url)).absolutePath }.getOrNull()
     } else {
         null
     },
@@ -181,7 +181,20 @@ internal fun Long.compact(): String = when {
 internal fun Throwable.readable(): String = message?.take(120).orEmpty().ifBlank { "JM 官方源连接失败" }
 
 internal fun Throwable.rethrowCancellation() {
-    if (this is CancellationException) throw this
+    if (
+        this is CancellationException ||
+        this is VirtualMachineError ||
+        this is ThreadDeath ||
+        this is LinkageError
+    ) throw this
+}
+
+/** Like Kotlin's runCatching, but never turns cancellation or process-fatal errors into data. */
+internal inline fun <R> runCatchingNonFatal(block: () -> R): Result<R> = try {
+    Result.success(block())
+} catch (error: Throwable) {
+    error.rethrowCancellation()
+    Result.failure(error)
 }
 
 internal fun parseJmId(raw: String): String? {

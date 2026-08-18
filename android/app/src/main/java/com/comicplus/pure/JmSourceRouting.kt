@@ -16,6 +16,25 @@ data class JmSourceSnapshot(
     val imageUpdatedAt: Long = 0L,
 )
 
+/**
+ * Source probing is relatively expensive and competes with the first reader
+ * request for sockets. A persisted snapshot is sufficient until either side
+ * is stale or has never produced a usable latency measurement.
+ */
+internal fun sourceSnapshotNeedsRefresh(
+    snapshot: JmSourceSnapshot,
+    nowMillis: Long,
+    maxAgeMillis: Long,
+): Boolean {
+    if (maxAgeMillis <= 0L) return true
+    fun stale(timestamp: Long): Boolean =
+        timestamp <= 0L || timestamp > nowMillis || nowMillis - timestamp >= maxAgeMillis
+    return stale(snapshot.updatedAt) ||
+        stale(snapshot.imageUpdatedAt) ||
+        snapshot.endpoints.none { it.latencyMs != null } ||
+        snapshot.imageEndpoints.none { it.latencyMs != null }
+}
+
 internal fun orderSourceEndpoints(
     endpoints: List<JmSourceEndpoint>,
     autoSelect: Boolean,

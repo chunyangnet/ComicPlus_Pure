@@ -4,6 +4,7 @@ import com.comicplus.app.data.source.DirectReaderPage
 import com.comicplus.app.ui.screens.pagerPageToReadingIndex
 import com.comicplus.app.ui.screens.readerPagedPrefetchIndices
 import com.comicplus.app.ui.screens.readerPrefetchPlan
+import com.comicplus.app.ui.screens.readerPrefetchPlanForMode
 import com.comicplus.app.ui.screens.readerPrefetchIndices
 import com.comicplus.app.ui.screens.readingIndexToPagerPage
 import com.comicplus.app.ui.screens.shouldPreloadNextChapter
@@ -78,7 +79,26 @@ class ReaderPrefetchTest {
     }
 
     @Test
-    fun ultraAggressiveKeepsTheLargestNearPageWindowUnlessDataSaverIsEnabled() {
+    fun ultraAggressiveUsesAQualityAndMemoryBoundedForwardRunway() {
+        assertEquals(
+            8,
+            effectiveReaderPrefetchPages(
+                configuredPages = 1,
+                dataSaver = false,
+                memoryClassMb = 768,
+                mode = ReaderPrefetchMode.UltraAggressive,
+            ),
+        )
+        assertEquals(
+            12,
+            effectiveReaderPrefetchPages(
+                configuredPages = 1,
+                dataSaver = false,
+                memoryClassMb = 768,
+                turboMode = true,
+                mode = ReaderPrefetchMode.UltraAggressive,
+            ),
+        )
         assertEquals(
             6,
             effectiveReaderPrefetchPages(
@@ -86,6 +106,17 @@ class ReaderPrefetchTest {
                 dataSaver = false,
                 memoryClassMb = 768,
                 mode = ReaderPrefetchMode.UltraAggressive,
+                imageQuality = ReaderImageQuality.High,
+            ),
+        )
+        assertEquals(
+            4,
+            effectiveReaderPrefetchPages(
+                configuredPages = 1,
+                dataSaver = false,
+                memoryClassMb = 384,
+                mode = ReaderPrefetchMode.UltraAggressive,
+                imageQuality = ReaderImageQuality.Low,
             ),
         )
         assertEquals(
@@ -118,6 +149,32 @@ class ReaderPrefetchTest {
         assertEquals(
             listOf(1, 2, 3, 4),
             readerPrefetchPlan(0, 10, 4, direction = 1, includeOpposite = true),
+        )
+    }
+
+    @Test
+    fun ultraAggressivePagedModeSpendsItsWholeWindowAhead() {
+        assertEquals(
+            listOf(6, 7, 8, 9),
+            readerPrefetchPlanForMode(
+                currentPageIndex = 5,
+                pageCount = 12,
+                distance = 4,
+                direction = 1,
+                readerMode = ReaderMode.Paged,
+                prefetchMode = ReaderPrefetchMode.UltraAggressive,
+            ),
+        )
+        assertEquals(
+            listOf(6, 7, 4, 3),
+            readerPrefetchPlanForMode(
+                currentPageIndex = 5,
+                pageCount = 12,
+                distance = 4,
+                direction = 1,
+                readerMode = ReaderMode.Paged,
+                prefetchMode = ReaderPrefetchMode.Smart,
+            ),
         )
     }
 

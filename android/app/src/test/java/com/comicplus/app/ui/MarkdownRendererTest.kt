@@ -2,6 +2,7 @@ package com.comicplus.app.ui
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -52,5 +53,11 @@ class MarkdownRendererTest {
     @Test
     fun leavesUnclosedMarkersReadable() {
         assertEquals("**unfinished", markdownToAnnotatedString("**unfinished").text)
+    }
+
+    @Test
+    fun reusesCachedLayoutForRepeatedShortComments() {
+        val source = "cache-test-**same comment**"
+        assertSame(markdownToAnnotatedString(source), markdownToAnnotatedString(source))
     }
 }

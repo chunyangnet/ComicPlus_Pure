@@ -2,6 +2,7 @@ package com.comicplus.app.ui
 
 import com.comicplus.app.data.source.SourceChapterDto
 import com.comicplus.app.ui.screens.buildDetailChapterCatalog
+import com.comicplus.app.ui.screens.defaultDetailChapterSelection
 import com.comicplus.app.ui.screens.resolveReadingEntry
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -48,8 +49,6 @@ class ComicDetailEntryTest {
 
         assertEquals(5, catalog.ranges.size)
         assertEquals("101-150", catalog.rangeKeyByChapterId["chapter-125"])
-        assertEquals(124, catalog.chapterIndicesById["chapter-125"])
-        assertEquals("第 125 话", catalog.chapterLabels[124])
     }
 
     @Test
@@ -63,5 +62,41 @@ class ComicDetailEntryTest {
         assertEquals("31-45", catalog.ranges.first().key)
         assertEquals(45, catalog.ranges.first().chapters.first().index)
         assertEquals("31-45", catalog.rangeKeyByChapterId["chapter-40"])
+    }
+
+    @Test
+    fun defaultRangeFollowsTheConfiguredChapterOrder() {
+        val manyChapters = List(80) { index ->
+            SourceChapterDto("chapter-${index + 1}", index + 1, "第 ${index + 1} 话")
+        }
+
+        val ascending = defaultDetailChapterSelection(
+            buildDetailChapterCatalog(manyChapters, descending = false),
+            preferredChapterId = null,
+        )!!
+        val descending = defaultDetailChapterSelection(
+            buildDetailChapterCatalog(manyChapters, descending = true),
+            preferredChapterId = null,
+        )!!
+
+        assertEquals("1-30", ascending.rangeKey)
+        assertEquals("chapter-1", ascending.chapterId)
+        assertEquals("61-80", descending.rangeKey)
+        assertEquals("chapter-80", descending.chapterId)
+    }
+
+    @Test
+    fun savedProgressKeepsItsRangeRegardlessOfChapterOrder() {
+        val manyChapters = List(80) { index ->
+            SourceChapterDto("chapter-${index + 1}", index + 1, "第 ${index + 1} 话")
+        }
+
+        val selection = defaultDetailChapterSelection(
+            buildDetailChapterCatalog(manyChapters, descending = true),
+            preferredChapterId = "chapter-40",
+        )!!
+
+        assertEquals("31-60", selection.rangeKey)
+        assertEquals("chapter-40", selection.chapterId)
     }
 }

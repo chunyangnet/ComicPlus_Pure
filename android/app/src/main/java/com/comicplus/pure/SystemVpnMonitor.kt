@@ -53,7 +53,7 @@ internal object SystemVpnMonitor {
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) =
                 refresh(manager)
         }
-        runCatching { manager.registerDefaultNetworkCallback(callback) }
+        runCatchingNonFatal { manager.registerDefaultNetworkCallback(callback) }
             .onFailure { started.set(false) }
     }
 
@@ -70,7 +70,7 @@ internal object SystemVpnMonitor {
             isVpnActive = current.vpnActive
             routeChanged
         }
-        if (changed) listeners.forEach { listener -> runCatching(listener) }
+        if (changed) listeners.forEach { listener -> runCatchingNonFatal(listener) }
     }
 }
 

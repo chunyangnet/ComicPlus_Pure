@@ -1,6 +1,5 @@
 package com.comicplus.app.ui.screens
 
-import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -102,7 +101,6 @@ fun OfficialBrowseScreen(
     var sectionName by rememberSaveable { mutableStateOf(OfficialBrowseSection.Weekly.name) }
     val section = OfficialBrowseSection.entries.firstOrNull { it.name == sectionName }
         ?: OfficialBrowseSection.Weekly
-    BackHandler(onBack = onBack)
     LaunchedEffect(Unit) { onEnsure() }
 
     Column(modifier.fillMaxSize().background(Canvas).navigationBarsPadding()) {

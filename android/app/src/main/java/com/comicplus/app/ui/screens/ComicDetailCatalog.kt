@@ -37,10 +37,25 @@ internal data class DetailChapterCatalog(
     val ranges: List<ChapterRange>,
     val rangesByKey: Map<String, ChapterRange>,
     val rangeKeyByChapterId: Map<String, String>,
-    val chapterLabels: List<String>,
-    val chaptersById: Map<String, SourceChapterDto>,
-    val chapterIndicesById: Map<String, Int>,
 )
+
+internal data class DetailChapterSelection(
+    val chapterId: String,
+    val rangeKey: String,
+)
+
+internal fun defaultDetailChapterSelection(
+    catalog: DetailChapterCatalog,
+    preferredChapterId: String?,
+): DetailChapterSelection? {
+    val preferredRangeKey = preferredChapterId?.let(catalog.rangeKeyByChapterId::get)
+    if (preferredRangeKey != null) {
+        return DetailChapterSelection(preferredChapterId, preferredRangeKey)
+    }
+    val firstRange = catalog.ranges.firstOrNull() ?: return null
+    val firstChapter = firstRange.chapters.firstOrNull() ?: return null
+    return DetailChapterSelection(firstChapter.sourceChapterId, firstRange.key)
+}
 
 internal fun buildDetailChapterCatalog(
     chapters: List<SourceChapterDto>,
@@ -74,10 +89,5 @@ internal fun buildDetailChapterCatalog(
         ranges = ranges,
         rangesByKey = ranges.associateBy(ChapterRange::key),
         rangeKeyByChapterId = rangeKeyByChapterId,
-        chapterLabels = chapters.map(SourceChapterDto::title),
-        chaptersById = chapters.associateBy(SourceChapterDto::sourceChapterId),
-        chapterIndicesById = buildMap(chapters.size) {
-            chapters.forEachIndexed { index, chapter -> put(chapter.sourceChapterId, index) }
-        },
     )
 }

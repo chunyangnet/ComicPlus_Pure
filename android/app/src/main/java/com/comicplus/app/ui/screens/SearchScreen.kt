@@ -1,6 +1,5 @@
 package com.comicplus.app.ui.screens
 
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -95,7 +94,6 @@ fun SearchScreen(
     var scopeId by rememberSaveable(initialQuery, initialScope) { mutableIntStateOf(initialScope.coerceIn(0, 4)) }
     var orderId by rememberSaveable(initialQuery) { mutableStateOf(state.order) }
     val parsed = remember(query) { JmIdParser.parse(query) }
-    BackHandler(onBack = onBack)
     LaunchedEffect(state.redirectAid) {
         state.redirectAid?.let { id ->
             onRedirectConsumed()

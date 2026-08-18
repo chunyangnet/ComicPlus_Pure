@@ -9,10 +9,12 @@ internal const val MAX_ACCOUNT_FIELD_LENGTH = 128
 internal const val MAX_FAVORITE_SYNC_ITEMS = 200
 internal const val MAX_FAVORITE_SYNC_PAGES = 10
 private const val MAX_FAVORITE_AUTHORS = 12
+private const val MAX_FAVORITE_FOLDERS = 100
 private const val OFFICIAL_FAVORITE_PAGE_SIZE = 20
 private const val MAX_FAVORITE_TITLE_LENGTH = 500
 private const val MAX_FAVORITE_DESCRIPTION_LENGTH = 50_000
 private const val MAX_FAVORITE_FIELD_LENGTH = 512
+internal const val MAX_FAVORITE_FOLDER_NAME_LENGTH = 80
 internal val safeNumericId = Regex("^\\d{1,12}$")
 private val favoriteImageFilePattern = Regex(
     "^[A-Za-z0-9_-]{1,128}\\.(?:jpg|jpeg|png|webp)$",
@@ -45,10 +47,12 @@ internal fun Any?.primitiveContent(): String? = this?.toString()?.takeUnless { i
 internal fun parseFavoritePage(
     payload: JSONObject,
     page: Int = 1,
+    folderId: String = "0",
     coverResolver: (String) -> String = { id -> "https://cover.invalid/$id.jpg" },
 ): JmFavoritePage {
     val root = payload.optJSONObject("data") ?: payload
     val safePage = page.coerceIn(1, MAX_OFFICIAL_PAGE)
+    val safeFolderId = folderId.takeIf(safeNumericId::matches) ?: "0"
     val items = firstJsonArray(root, "list", "content", "data", "albums", "favorites", "photos")
         ?.objectsOrValues(MAX_FAVORITE_SYNC_ITEMS)
         ?.mapNotNull { value ->
@@ -73,12 +77,34 @@ internal fun parseFavoritePage(
         .orEmpty()
     val reportedTotal = firstJsonLong(root, "total", "count")
     return JmFavoritePage(
+        folderId = safeFolderId,
         page = safePage,
         total = JmGateway.normalizedPagedTotal(safePage, OFFICIAL_FAVORITE_PAGE_SIZE, items.size, reportedTotal),
         items = items,
+        folders = favoriteFolders(root),
         hasMore = JmGateway.hasMorePagedResults(safePage, OFFICIAL_FAVORITE_PAGE_SIZE, items.size, reportedTotal),
+        totalKnown = reportedTotal != null,
     )
 }
+
+private fun favoriteFolders(root: JSONObject): List<JmFavoriteFolder> = buildList {
+    add(JmFavoriteFolder(id = "0", name = "全部"))
+    firstJsonArray(root, "folder_list", "folders")
+        ?.objectsOrValues(MAX_FAVORITE_FOLDERS)
+        ?.forEach { value ->
+            val item = value as? JSONObject ?: return@forEach
+            val id = firstJsonString(item, "FID", "fid", "id", "folder_id")
+                .take(MAX_ACCOUNT_FIELD_LENGTH)
+                .takeIf(safeNumericId::matches)
+                ?.takeUnless { it == "0" }
+                ?: return@forEach
+            val name = firstJsonString(item, "name", "folder_name", "title")
+                .trim()
+                .take(MAX_FAVORITE_FOLDER_NAME_LENGTH)
+                .ifBlank { "收藏夹 $id" }
+            add(JmFavoriteFolder(id = id, name = name))
+        }
+}.distinctBy(JmFavoriteFolder::id)
 
 private fun favoriteAuthors(item: JSONObject): List<String> {
     val values = item.opt("author").takeUnless { it == null || it == JSONObject.NULL } ?: item.opt("authors")
@@ -212,7 +238,7 @@ internal fun firstJsonArray(value: JSONObject, vararg keys: String): JSONArray? 
         value.optJSONArray(key)?.let { return it }
         val encoded = value.optString(key).trim()
         if (encoded.startsWith("[") && encoded.length <= MAX_EMBEDDED_JSON_ARRAY_CHARS) {
-            runCatching { JSONArray(encoded) }.getOrNull()?.let { return it }
+            runCatchingNonFatal { JSONArray(encoded) }.getOrNull()?.let { return it }
         }
     }
     return null

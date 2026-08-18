@@ -254,11 +254,95 @@ class JmGatewayProtocolTest {
 
         assertEquals(21L, page.total)
         assertEquals(true, page.hasMore)
+        assertEquals(true, page.totalKnown)
         assertEquals(1, page.items.size)
         assertEquals("123", page.items.single().id)
         assertEquals("Saved", page.items.single().title)
         assertEquals(listOf("a", "b"), page.items.single().authors)
         assertEquals("https://cover.invalid/media/albums/cover.jpg", page.items.single().coverUrl)
+    }
+
+    @Test
+    fun favoritePageMarksAComputedTotalAsUnknown() {
+        val page = parseFavoritePage(
+            JSONObject("""{"list":[{"id":"123","name":"Saved"}]}"""),
+        )
+
+        assertEquals(1L, page.total)
+        assertEquals(false, page.totalKnown)
+    }
+
+    @Test
+    fun officialFavoritePayloadParsesChildFoldersAndSelectedFolder() {
+        val page = parseFavoritePage(
+            JSONObject(
+                """
+                {
+                  "total": "1",
+                  "list": [{"id":"123", "name":"Saved"}],
+                  "folder_list": [
+                    {"FID":"7", "name":"追更"},
+                    {"fid":"8", "folder_name":"已读"},
+                    {"FID":"7", "name":"duplicate"},
+                    {"FID":"bad", "name":"ignored"}
+                  ]
+                }
+                """.trimIndent(),
+            ),
+            page = 1,
+            folderId = "7",
+        )
+
+        assertEquals("7", page.folderId)
+        assertEquals(listOf("0", "7", "8"), page.folders.map(JmFavoriteFolder::id))
+        assertEquals(listOf("全部", "追更", "已读"), page.folders.map(JmFavoriteFolder::name))
+    }
+
+    @Test
+    fun officialFavoriteFolderMutationsUseTheVerifiedMobileFields() {
+        assertEquals(
+            mapOf("type" to "add", "folder_id" to "0", "folder_name" to "追更"),
+            JmGateway.favoriteFolderMutationForm(
+                type = "add",
+                folderId = "0",
+                folderName = "追更",
+            ),
+        )
+        assertEquals(
+            mapOf("type" to "move", "folder_id" to "7", "aid" to "123"),
+            JmGateway.favoriteFolderMutationForm(
+                type = "move",
+                folderId = "7",
+                albumId = "123",
+            ),
+        )
+    }
+
+    @Test
+    fun sourceSnapshotRefreshesOnlyWhenMeasurementsAreMissingOrStale() {
+        val snapshot = JmSourceSnapshot(
+            endpoints = listOf(JmSourceEndpoint("api.example", 42L)),
+            selectedHost = "api.example",
+            updatedAt = 900L,
+            imageEndpoints = listOf(JmSourceEndpoint("cdn.example", 55L)),
+            selectedImageHost = "cdn.example",
+            imageUpdatedAt = 900L,
+        )
+
+        assertEquals(false, sourceSnapshotNeedsRefresh(snapshot, nowMillis = 1_000L, maxAgeMillis = 500L))
+        assertEquals(true, sourceSnapshotNeedsRefresh(snapshot, nowMillis = 1_401L, maxAgeMillis = 500L))
+        assertEquals(
+            true,
+            sourceSnapshotNeedsRefresh(
+                snapshot.copy(imageEndpoints = listOf(JmSourceEndpoint("cdn.example", null))),
+                nowMillis = 1_000L,
+                maxAgeMillis = 500L,
+            ),
+        )
+        assertEquals(
+            true,
+            sourceSnapshotNeedsRefresh(snapshot, nowMillis = 800L, maxAgeMillis = 500L),
+        )
     }
 
     @Test
@@ -448,6 +532,50 @@ class JmGatewayProtocolTest {
         assertEquals(true, JmGateway.shouldInvalidateRestoredSession(authFailures = 2, otherFailures = 0))
         assertEquals(false, JmGateway.shouldInvalidateRestoredSession(authFailures = 1, otherFailures = 1))
         assertEquals(false, JmGateway.shouldInvalidateRestoredSession(authFailures = 0, otherFailures = 3))
+    }
+
+    @Test
+    fun authenticatedHostCooldownSkipsRecentFailuresButAlwaysKeepsOneFallback() {
+        assertEquals(
+            listOf("expired.example", "healthy.example"),
+            JmGateway.prioritizeHostsByFailureCooldown(
+                candidates = listOf("expired.example", "cooling.example", "healthy.example"),
+                failedAt = mapOf("expired.example" to 700L, "cooling.example" to 950L),
+                now = 1_000L,
+                cooldownMillis = 200L,
+            ),
+        )
+        assertEquals(
+            listOf("oldest.example"),
+            JmGateway.prioritizeHostsByFailureCooldown(
+                candidates = listOf("oldest.example", "newest.example"),
+                failedAt = mapOf("oldest.example" to 800L, "newest.example" to 950L),
+                now = 1_000L,
+                cooldownMillis = 500L,
+            ),
+        )
+    }
+
+    @Test
+    fun favoriteSyncUsesKnownTotalToBoundParallelPagePlan() {
+        assertEquals(1, JmGateway.favoritePageCount(total = 0L, maxPages = 10))
+        assertEquals(2, JmGateway.favoritePageCount(total = 21L, maxPages = 10))
+        assertEquals(10, JmGateway.favoritePageCount(total = 500L, maxPages = 10))
+    }
+
+    @Test
+    fun coverMirrorsPreserveTheCanonicalPathAndQuery() {
+        val mirrors = JmGateway.coverMirrorUrls(
+            "https://origin.example/media/albums/123_3x4.jpg?token=public",
+        )
+
+        assertEquals(4, mirrors.size)
+        assertEquals(true, mirrors.all { it.contains("/media/albums/123_3x4.jpg?token=public") })
+        assertEquals(mirrors.size, mirrors.distinct().size)
+        assertEquals(
+            listOf("https://origin.example/custom/cover.jpg"),
+            JmGateway.coverMirrorUrls("https://origin.example/custom/cover.jpg"),
+        )
     }
 
     @Test

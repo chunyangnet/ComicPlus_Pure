@@ -21,7 +21,7 @@ class LocalSettingsStore(context: Context) {
         )
         val storedPrefetchPages = preferences.getInt("prefetch", 3).coerceIn(0, 6)
         val storedPrefetchMode = preferences.getString("prefetch_mode", null)
-            ?.let { runCatching { ReaderPrefetchMode.valueOf(it) }.getOrNull() }
+            ?.let { runCatchingNonFatal { ReaderPrefetchMode.valueOf(it) }.getOrNull() }
             ?: when (storedPrefetchPages) {
                 0 -> ReaderPrefetchMode.Conservative
                 5, 6 -> ReaderPrefetchMode.Aggressive
@@ -54,11 +54,11 @@ class LocalSettingsStore(context: Context) {
             readerPrefetchMode = normalizedPrefetchMode,
             readerPageSpacingDp = preferences.getInt("page_spacing", 0).coerceIn(0, 16),
             readerMode = preferences.getString("reader_mode", ReaderMode.Vertical.name)
-                ?.let { runCatching { ReaderMode.valueOf(it) }.getOrNull() } ?: ReaderMode.Vertical,
+                ?.let { runCatchingNonFatal { ReaderMode.valueOf(it) }.getOrNull() } ?: ReaderMode.Vertical,
             readerDirection = preferences.getString("reader_direction", ReaderDirection.LeftToRight.name)
-                ?.let { runCatching { ReaderDirection.valueOf(it) }.getOrNull() } ?: ReaderDirection.LeftToRight,
+                ?.let { runCatchingNonFatal { ReaderDirection.valueOf(it) }.getOrNull() } ?: ReaderDirection.LeftToRight,
             readerImageQuality = preferences.getString("reader_image_quality", ReaderImageQuality.Medium.name)
-                ?.let { runCatching { ReaderImageQuality.valueOf(it) }.getOrNull() } ?: ReaderImageQuality.Medium,
+                ?.let { runCatchingNonFatal { ReaderImageQuality.valueOf(it) }.getOrNull() } ?: ReaderImageQuality.Medium,
             readerTurboMode = normalizedTurboMode,
             readerBrightnessPercent = preferences.getInt("brightness", 0).coerceIn(0, 100),
             keepScreenOn = preferences.getBoolean("keep_screen_on", true),

@@ -1,7 +1,10 @@
 package com.comicplus.pure
 
 import android.annotation.SuppressLint
+import android.app.ActivityManager
+import android.content.ComponentCallbacks2
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
@@ -73,7 +76,7 @@ private class FeatureRequestTracker(
     private val rejectedHosts = LinkedHashSet<String>()
     private var fallbackPayload: JSONObject? = null
 
-    fun accepts(payload: JSONObject): Boolean = runCatching { validator(payload) }.getOrDefault(false)
+    fun accepts(payload: JSONObject): Boolean = runCatchingNonFatal { validator(payload) }.getOrDefault(false)
 
     fun reject(host: String, payload: JSONObject) = synchronized(lock) {
         rejectedHosts += host
@@ -131,13 +134,20 @@ class JmGateway(context: Context) {
         .retryOnConnectionFailure(false)
         .build()
     private val removeRouteChangeListener = SystemVpnMonitor.registerRouteChangeListener {
-        client.dispatcher.cancelAll()
-        sourceProbeClient.dispatcher.cancelAll()
-        client.connectionPool.evictAll()
-        sourceProbeClient.connectionPool.evictAll()
+        evictConnectionsAsync(client, sourceProbeClient)
+        failedAuthenticatedHosts.clear()
         warmedImageHosts.clear()
     }
-    private val cacheDir = File(appContext.cacheDir, "jm-pure-pages").apply { mkdirs() }
+    private val cacheDir by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        File(appContext.cacheDir, "jm-pure-pages").apply {
+            mkdirs()
+            val staleCutoff = System.currentTimeMillis() - PAGE_STREAM_TEMP_STALE_MILLIS
+            listFiles { file ->
+                file.isFile && file.name.startsWith(PAGE_STREAM_TEMP_PREFIX) &&
+                    file.lastModified() in 1 until staleCutoff
+            }.orEmpty().forEach(File::delete)
+        }
+    }
     private val mainHandler = Handler(Looper.getMainLooper())
     private val maxConcurrentImageWork = imageWorkPermits(context)
     private val maxDecodedPagePixels = decodedPagePixelLimit(context)
@@ -168,6 +178,25 @@ class JmGateway(context: Context) {
         override fun sizeOf(key: String, value: Bitmap): Int =
             (value.allocationByteCount / 1024).coerceAtLeast(1)
     }
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+    private val memoryCallbacks = object : ComponentCallbacks2 {
+        override fun onTrimMemory(level: Int) {
+            when {
+                level >= ComponentCallbacks2.TRIM_MEMORY_COMPLETE -> bitmapCache.evictAll()
+                level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND ||
+                    level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ->
+                    bitmapCache.trimToSize(bitmapCache.maxSize() / 4)
+                level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ->
+                    bitmapCache.trimToSize(bitmapCache.maxSize() / 2)
+            }
+        }
+
+        override fun onLowMemory() = bitmapCache.evictAll()
+        override fun onConfigurationChanged(newConfig: Configuration) = Unit
+    }
+    init {
+        appContext.registerComponentCallbacks(memoryCallbacks)
+    }
     private val chapterCache = Collections.synchronizedMap(
         object : LinkedHashMap<String, JmChapterPages>(CHAPTER_CACHE_LIMIT, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, JmChapterPages>?): Boolean =
@@ -188,6 +217,7 @@ class JmGateway(context: Context) {
     private val scrambleMutex = Mutex()
     private val sourceStateLock = Any()
     private val initializedCookieHosts = ConcurrentHashMap.newKeySet<String>()
+    private val failedAuthenticatedHosts = ConcurrentHashMap<String, Long>()
     private val failedImageHosts = ConcurrentHashMap<String, Long>()
     private val warmedImageHosts = ConcurrentHashMap<String, Long>()
     private val unavailableFeatureHosts = ConcurrentHashMap<String, Long>()
@@ -266,22 +296,19 @@ class JmGateway(context: Context) {
     fun close() {
         if (!closed.compareAndSet(0, 1)) return
         removeRouteChangeListener()
+        appContext.unregisterComponentCallbacks(memoryCallbacks)
         cacheScope.cancel()
         mainHandler.removeCallbacksAndMessages(null)
         pageLoadsInFlight.values.forEach { it.cancel() }
         sourceLoadsInFlight.values.forEach { it.cancel() }
         pageLoadsInFlight.clear()
         sourceLoadsInFlight.clear()
+        failedAuthenticatedHosts.clear()
         unavailableFeatureHosts.clear()
         pageProgressCallbacks.clear()
         pageAspectRatioCallbacks.clear()
         bitmapCache.evictAll()
-        client.dispatcher.cancelAll()
-        sourceProbeClient.dispatcher.cancelAll()
-        client.connectionPool.evictAll()
-        sourceProbeClient.connectionPool.evictAll()
-        client.dispatcher.executorService.shutdown()
-        sourceProbeClient.dispatcher.executorService.shutdown()
+        closeOkHttpClientsAsync(client, sourceProbeClient)
     }
 
     fun warmImageConnections(comicId: String, chapterId: String) {
@@ -382,17 +409,40 @@ class JmGateway(context: Context) {
         }
     }
 
-    suspend fun home(): List<JmRanking> = supervisorScope {
+    suspend fun home(
+        onPartial: suspend (List<JmRanking>) -> Unit = {},
+    ): List<JmRanking> = supervisorScope {
         suspend fun load(order: String): Result<List<JmRanking>> = try {
             Result.success(category("0", order))
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
+            error.rethrowCancellation()
             Result.failure(error)
         }
         val today = async { load("mv_t") }
         val latest = async { load("mr") }
-        val (todayResult, latestResult) = awaitAll(today, latest)
+        val (todayCompletedFirst, firstResult) = select<Pair<Boolean, Result<List<JmRanking>>>> {
+            today.onAwait { true to it }
+            latest.onAwait { false to it }
+        }
+        firstResult.getOrNull()?.takeIf(List<JmRanking>::isNotEmpty)?.let { items ->
+            onPartial(
+                if (todayCompletedFirst) mergeHomeRankings(items, emptyList())
+                else mergeHomeRankings(emptyList(), items),
+            )
+        }
+        val otherResult = if (todayCompletedFirst) latest.await() else today.await()
+        if (firstResult.isFailure) {
+            otherResult.getOrNull()?.takeIf(List<JmRanking>::isNotEmpty)?.let { items ->
+                onPartial(
+                    if (todayCompletedFirst) mergeHomeRankings(emptyList(), items)
+                    else mergeHomeRankings(items, emptyList()),
+                )
+            }
+        }
+        val todayResult = if (todayCompletedFirst) firstResult else otherResult
+        val latestResult = if (todayCompletedFirst) otherResult else firstResult
         if (todayResult.isFailure && latestResult.isFailure) {
             throw todayResult.exceptionOrNull() ?: latestResult.exceptionOrNull() ?: JmSourceException()
         }
@@ -624,12 +674,12 @@ class JmGateway(context: Context) {
         }
     }
 
-    /** Read the official, anonymous forum for one chapter/photo. Posting is out of scope. */
-    suspend fun comments(chapterId: String, page: Int = 1): JmCommentPage {
-        require(chapterId.matches(safeNumericId)) { "JM 编号无效" }
+    /** Read the official, anonymous forum for a comic or chapter/photo. Posting is out of scope. */
+    suspend fun comments(targetId: String, page: Int = 1): JmCommentPage {
+        require(targetId.matches(safeNumericId)) { "JM 编号无效" }
         val safePage = page.coerceIn(1, MAX_OFFICIAL_PAGE)
         val payload = requestJson(
-            "/forum?page=$safePage&aid=${encode(chapterId)}&mode=manhua",
+            "/forum?page=$safePage&aid=${encode(targetId)}&mode=manhua",
         )
         val avatarHost = domains.firstOrNull()
         return withContext(Dispatchers.Default) {
@@ -692,40 +742,130 @@ class JmGateway(context: Context) {
     fun session(): JmSession? = authenticatedSession
 
     suspend fun logout() {
-        runCatching {
+        runCatchingNonFatal {
             if (authenticatedSession != null) {
                 requestPostJson("/logout", emptyMap(), allowUnauthenticated = false)
             }
-        }.onFailure { if (it is CancellationException) throw it }
+        }.onFailure { it.rethrowCancellation() }
         clearSession()
     }
 
-    /** Fetches one page of the signed-in user's official collection. */
-    suspend fun favoritePage(page: Int = 1): JmFavoritePage {
+    /** Fetches one page of the signed-in user's official collection or one child folder. */
+    suspend fun favoritePage(page: Int = 1, folderId: String = "0"): JmFavoritePage {
         requireAuthenticated()
+        require(folderId.matches(safeNumericId)) { "收藏夹编号无效" }
         val safePage = page.coerceIn(1, MAX_OFFICIAL_PAGE)
-        val payload = requestAuthenticatedJson("/favorite?page=$safePage&folder_id=0&o=mr")
+        val payload = requestAuthenticatedJson(
+            "/favorite?page=$safePage&folder_id=${encode(folderId)}&o=mr",
+        )
         return withContext(Dispatchers.Default) {
             requireAuthenticatedPayload(payload)
             parseFavoritePage(
                 payload,
                 safePage,
+                folderId,
                 ::coverUrl,
             )
         }
     }
 
-    suspend fun allFavorites(maxPages: Int = MAX_FAVORITE_SYNC_PAGES): List<JmFavoriteItem> = withContext(Dispatchers.Default) {
+    suspend fun favoriteCollection(
+        folderId: String = "0",
+        maxPages: Int = MAX_FAVORITE_SYNC_PAGES,
+        onFirstPage: suspend (JmFavoriteCollection) -> Unit = {},
+    ): JmFavoriteCollection = withContext(Dispatchers.Default) {
         requireAuthenticated()
+        require(folderId.matches(safeNumericId)) { "收藏夹编号无效" }
+        val safeMaxPages = maxPages.coerceIn(1, MAX_FAVORITE_SYNC_PAGES)
         val result = ArrayList<JmFavoriteItem>()
-        var page = 1
-        while (page <= maxPages) {
-            val current = favoritePage(page)
+        var folders = listOf(JmFavoriteFolder(id = "0", name = "全部"))
+        var total = 0L
+
+        fun collection(): JmFavoriteCollection = JmFavoriteCollection(
+            folderId = folderId,
+            total = total,
+            items = result.distinctBy(JmFavoriteItem::id).take(MAX_FAVORITE_SYNC_ITEMS),
+            folders = folders,
+        )
+
+        fun append(current: JmFavoritePage) {
             result += current.items
-            if (!current.hasMore || current.items.isEmpty()) break
-            page++
+            if (current.folders.size > 1 || folders.size <= 1) folders = current.folders
+            total = maxOf(total, current.total)
         }
-        result.distinctBy(JmFavoriteItem::id).take(MAX_FAVORITE_SYNC_ITEMS)
+
+        val first = favoritePage(page = 1, folderId = folderId)
+        append(first)
+        onFirstPage(collection())
+        if (!first.hasMore || first.items.isEmpty() || safeMaxPages == 1) return@withContext collection()
+
+        if (first.totalKnown) {
+            val lastPage = favoritePageCount(first.total, safeMaxPages)
+            var nextPage = 2
+            var exhausted = false
+            while (nextPage <= lastPage && !exhausted) {
+                val batchPages = nextPage..minOf(nextPage + FAVORITE_SYNC_CONCURRENCY - 1, lastPage)
+                val loaded = coroutineScope {
+                    batchPages.map { page -> async { favoritePage(page, folderId) } }.awaitAll()
+                }.sortedBy(JmFavoritePage::page)
+                for (current in loaded) {
+                    append(current)
+                    if (!current.hasMore || current.items.isEmpty()) {
+                        exhausted = true
+                        break
+                    }
+                }
+                nextPage = batchPages.last + 1
+            }
+        } else {
+            var nextPage = 2
+            var hasMore = first.hasMore
+            while (nextPage <= safeMaxPages && hasMore) {
+                val current = favoritePage(nextPage, folderId)
+                append(current)
+                hasMore = current.hasMore && current.items.isNotEmpty()
+                nextPage++
+            }
+        }
+        collection()
+    }
+
+    suspend fun allFavorites(maxPages: Int = MAX_FAVORITE_SYNC_PAGES): List<JmFavoriteItem> =
+        favoriteCollection(maxPages = maxPages).items
+
+    suspend fun createFavoriteFolder(name: String) {
+        requireAuthenticated()
+        val safeName = name.trim()
+        require(safeName.isNotEmpty()) { "收藏夹名称不能为空" }
+        require(safeName.length <= MAX_FAVORITE_FOLDER_NAME_LENGTH) { "收藏夹名称不能超过 $MAX_FAVORITE_FOLDER_NAME_LENGTH 个字符" }
+        requireMutationSucceeded(
+            requestPostJson(
+                path = "/favorite_folder",
+                form = favoriteFolderMutationForm(
+                    type = "add",
+                    folderId = "0",
+                    folderName = safeName,
+                ),
+                retryAcrossDomains = false,
+            ),
+        )
+    }
+
+    suspend fun moveFavoriteToFolder(albumId: String, folderId: String) {
+        requireAuthenticated()
+        require(albumId.matches(safeNumericId)) { "JM 编号无效" }
+        require(folderId.matches(safeNumericId) && folderId != "0") { "目标收藏夹编号无效" }
+        requireMutationSucceeded(
+            requestPostJson(
+                path = "/favorite_folder",
+                form = favoriteFolderMutationForm(
+                    type = "move",
+                    folderId = folderId,
+                    albumId = albumId,
+                ),
+                retryAcrossDomains = false,
+            ),
+        )
     }
 
     /** The official endpoint toggles based on the current server state. */
@@ -1098,7 +1238,7 @@ class JmGateway(context: Context) {
                 onProgress = { done, total ->
                     pageProgressCallbacks.forEach(key) { callback ->
                         if (closed.get() == 0 && pageProgressCallbacks.referenceCount(key, callback) > 0) {
-                            runCatching { callback(done, total) }
+                            runCatchingNonFatal { callback(done, total) }
                         }
                     }
                 },
@@ -1310,6 +1450,9 @@ class JmGateway(context: Context) {
         cacheScope.launch {
             try {
                 writeRawPageCache(key, file, bytes, generation)
+            } catch (error: Throwable) {
+                error.rethrowCancellation()
+                // Raw cache writes are best effort; the caller already has the bytes.
             } finally {
                 rawCacheWriteLimiter.release()
                 pageCacheWritesInFlight.remove(writeId)
@@ -1360,7 +1503,8 @@ class JmGateway(context: Context) {
                         temporary.delete()
                     }
                 }
-            } catch (_: Exception) {
+            } catch (error: Throwable) {
+                error.rethrowCancellation()
                 // Raw bytes remain a valid fallback when decoded-cache compression fails.
             } finally {
                 pageCacheWritesInFlight.remove(writeId)
@@ -1612,7 +1756,7 @@ class JmGateway(context: Context) {
         firstResult.getOrNull()?.let { opened ->
             other.cancel()
             other.invokeOnCompletion {
-                if (!other.isCancelled) runCatching { other.getCompleted().getOrNull()?.response?.close() }
+                if (!other.isCancelled) runCatchingNonFatal { other.getCompleted().getOrNull()?.response?.close() }
             }
             return@supervisorScope readOpenedImage(opened, key, onProgress)
         }
@@ -1733,20 +1877,32 @@ class JmGateway(context: Context) {
                     return@withContext bytes
                 }
 
-                val sink = java.io.ByteArrayOutputStream(16 * 1024)
-                var done = 0L
-                while (true) {
-                    while (shouldPauseBackgroundNetwork(key)) {
-                        delay(BACKGROUND_PRIORITY_POLL_MILLIS)
+                // Chunked responses have no trustworthy final size. Spool them to disk so a
+                // ByteArrayOutputStream growth buffer and its final copy cannot coexist near the
+                // page-size limit and push the process over its bitmap memory budget.
+                val temporary = File.createTempFile(PAGE_STREAM_TEMP_PREFIX, ".tmp", cacheDir)
+                try {
+                    var done = 0L
+                    temporary.outputStream().buffered(PAGE_NETWORK_READ_CHUNK_BYTES).use { output ->
+                        while (true) {
+                            while (shouldPauseBackgroundNetwork(key)) {
+                                delay(BACKGROUND_PRIORITY_POLL_MILLIS)
+                            }
+                            val read = runInterruptible(Dispatchers.IO) { readPageInputChunk(input, buffer) }
+                            if (read < 0) break
+                            done += read
+                            if (done > MAX_PAGE_BYTES) throw JmSourceException()
+                            output.write(buffer, 0, read)
+                            onProgress(done, total)
+                        }
                     }
-                    val read = runInterruptible(Dispatchers.IO) { readPageInputChunk(input, buffer) }
-                    if (read < 0) break
-                    done += read
-                    if (done > MAX_PAGE_BYTES) throw JmSourceException()
-                    sink.write(buffer, 0, read)
-                    onProgress(done, total)
+                    if (done <= 0L || temporary.length() != done) throw JmSourceException()
+                    runInterruptible(Dispatchers.IO) { temporary.readBytes() }
+                        .takeIf { it.size.toLong() == done }
+                        ?: throw JmSourceException()
+                } finally {
+                    temporary.delete()
                 }
-                sink.toByteArray()
             }
         }
     }
@@ -1785,7 +1941,7 @@ class JmGateway(context: Context) {
         if (closed.get() != 0 || pageAspectRatioCallbacks.referenceCount(key, callback) <= 0) return
         mainHandler.post {
             if (closed.get() == 0 && pageAspectRatioCallbacks.referenceCount(key, callback) > 0) {
-                runCatching { callback(ratio) }
+                runCatchingNonFatal { callback(ratio) }
             }
         }
     }
@@ -2061,24 +2217,24 @@ class JmGateway(context: Context) {
         val path = "/chapter_view_template?id=$photoId&mode=vertical&page=0&app_img_shunt=1&express=off&v=${epochSeconds()}"
         val attempted = domains.take(MAX_API_CANDIDATES)
         for (domain in attempted) {
-            runCatching {
+            runCatchingNonFatal {
                 ensureCookies(domain)
                 val timestamp = epochSeconds()
                 execute(domain, path, timestamp, APP_CONTENT_PROTOCOL_KEY).use { response ->
                     if (response.isSuccessful) scrambleRegex.find(response.body.readStringLimited(MAX_API_RESPONSE_BYTES))?.groupValues?.getOrNull(1)?.let { return@withContext it }
                 }
-            }.onFailure { if (it is CancellationException) throw it }
+            }.onFailure { it.rethrowCancellation() }
         }
         val refreshed = discoverDomains()
         val attemptedSet = attempted.toHashSet()
         for (domain in refreshed.filterNot(attemptedSet::contains).take(MAX_API_CANDIDATES)) {
-            runCatching {
+            runCatchingNonFatal {
                 ensureCookies(domain)
                 val timestamp = epochSeconds()
                 execute(domain, path, timestamp, APP_CONTENT_PROTOCOL_KEY).use { response ->
                     if (response.isSuccessful) scrambleRegex.find(response.body.readStringLimited(MAX_API_RESPONSE_BYTES))?.groupValues?.getOrNull(1)?.let { return@withContext it }
                 }
-            }.onFailure { if (it is CancellationException) throw it }
+            }.onFailure { it.rethrowCancellation() }
         }
         DEFAULT_SCRAMBLE_ID
     }
@@ -2113,34 +2269,94 @@ class JmGateway(context: Context) {
         var authFailures = 0
         var otherFailures = 0
 
-        suspend fun tryDomains(candidates: List<String>): JSONObject? {
-            for (domain in candidates.take(MAX_API_CANDIDATES)) {
-                val result = requestDomainJson(path, domain)
-                result.getOrNull()?.let { return it }
-                result.exceptionOrNull()?.let { error ->
-                    if (error is JmAuthException) {
-                        authFailures++
-                        if (authError == null) authError = error
-                    } else {
-                        otherFailures++
-                    }
+        fun accept(domain: String, result: Result<JSONObject>): JSONObject? {
+            result.getOrNull()?.let { payload ->
+                failedAuthenticatedHosts.remove(domain)
+                return payload
+            }
+            result.exceptionOrNull()?.let { error ->
+                if (error is JmAuthException) {
+                    failedAuthenticatedHosts.remove(domain)
+                    authFailures++
+                    if (authError == null) authError = error
+                } else {
+                    failedAuthenticatedHosts[domain] = SystemClock.elapsedRealtime()
+                    otherFailures++
                 }
             }
             return null
         }
 
-        val attempted = domains.take(MAX_API_CANDIDATES)
+        suspend fun tryDomains(candidates: List<String>): JSONObject? {
+            val ordered = candidates.distinct().take(MAX_API_CANDIDATES)
+            if (ordered.isEmpty()) return null
+            if (ordered.size == 1) {
+                return accept(ordered[0], requestDomainJson(path, ordered[0]))
+            }
+
+            supervisorScope {
+                val primaryDomain = ordered[0]
+                val secondaryDomain = ordered[1]
+                val primary = async { requestDomainJson(path, primaryDomain) }
+                val earlyPrimary = withTimeoutOrNull(API_HEDGE_DELAY_MILLIS) { primary.await() }
+                if (earlyPrimary != null) {
+                    accept(primaryDomain, earlyPrimary)?.let { return@supervisorScope it }
+                    accept(secondaryDomain, requestDomainJson(path, secondaryDomain))
+                        ?.let { return@supervisorScope it }
+                } else {
+                    val secondary = async { requestDomainJson(path, secondaryDomain) }
+                    val first = select<Triple<String, Result<JSONObject>, Deferred<Result<JSONObject>>>> {
+                        primary.onAwait { Triple(primaryDomain, it, secondary) }
+                        secondary.onAwait { Triple(secondaryDomain, it, primary) }
+                    }
+                    accept(first.first, first.second)?.let { payload ->
+                        first.third.cancel()
+                        return@supervisorScope payload
+                    }
+                    val otherDomain = if (first.first == primaryDomain) secondaryDomain else primaryDomain
+                    accept(otherDomain, first.third.await())?.let { return@supervisorScope it }
+                }
+
+                for (domain in ordered.drop(2)) {
+                    accept(domain, requestDomainJson(path, domain))?.let { return@supervisorScope it }
+                }
+                null
+            }?.let { return it }
+            return null
+        }
+
+        val attempted = prioritizedAuthenticatedDomains(domains).take(MAX_API_CANDIDATES)
         tryDomains(attempted)?.let { return@withContext it }
-        val refreshed = runCatching { discoverDomains() }
-            .onFailure { error -> if (error is CancellationException) throw error }
+        val refreshed = runCatchingNonFatal { discoverDomains() }
+            .onFailure { error -> error.rethrowCancellation() }
             .getOrDefault(emptyList())
         val attemptedSet = attempted.toHashSet()
-        tryDomains(refreshed.filterNot(attemptedSet::contains))?.let { return@withContext it }
+        val refreshedCandidates = prioritizedAuthenticatedDomains(
+            refreshed.filterNot(attemptedSet::contains),
+        )
+        tryDomains(refreshedCandidates)?.let { return@withContext it }
         throw if (shouldInvalidateRestoredSession(authFailures, otherFailures)) {
             authError ?: JmAuthException("JM 登录已失效，请重新登录")
         } else {
             JmSourceException()
         }
+    }
+
+    private fun prioritizedAuthenticatedDomains(candidates: List<String>): List<String> {
+        val now = SystemClock.elapsedRealtime()
+        val ordered = prioritizeHostsByFailureCooldown(
+            candidates = candidates,
+            failedAt = failedAuthenticatedHosts,
+            now = now,
+            cooldownMillis = AUTHENTICATED_HOST_COOLDOWN_MILLIS,
+        )
+        candidates.forEach { host ->
+            val markedAt = failedAuthenticatedHosts[host] ?: return@forEach
+            if (now < markedAt || now - markedAt >= AUTHENTICATED_HOST_COOLDOWN_MILLIS) {
+                failedAuthenticatedHosts.remove(host, markedAt)
+            }
+        }
+        return ordered
     }
 
     private suspend fun requestPostJson(
@@ -2168,15 +2384,18 @@ class JmGateway(context: Context) {
         val initialCandidates = orderedMutationDomains()
 
         if (!retryAcrossDomains) {
-            // /favorite and /like are server-side toggles rather than
-            // idempotent "set" operations. Probe a healthy source first, then
-            // submit exactly once; replaying an ambiguous POST could undo the
-            // successful toggle on the next domain.
+            // Account mutations may be toggles or create/move operations. Probe
+            // a healthy source first, then submit exactly once so an ambiguous
+            // POST is never replayed against another domain.
             suspend fun submitOnce(candidates: List<String>): JSONObject? {
                 for (domain in candidates.take(MAX_API_CANDIDATES)) {
-                    val probe = requestDomainJson("/setting", domain)
-                    probe.exceptionOrNull()?.let { error -> lastError = error }
-                    if (probe.isFailure) continue
+                    val healthy = withTimeoutOrNull(MUTATION_PREFLIGHT_TIMEOUT_MILLIS) {
+                        ensureCookies(domain)
+                    } ?: false
+                    if (!healthy) {
+                        lastError = JmSourceException()
+                        continue
+                    }
                     val result = requestDomainJson(path, domain, form)
                     result.getOrNull()?.let { return it }
                     result.exceptionOrNull()?.let { error -> throw error }
@@ -2185,8 +2404,8 @@ class JmGateway(context: Context) {
             }
 
             submitOnce(initialCandidates)?.let { return@withContext it }
-            runCatching { discoverDomains(force = true) }
-                .onFailure { error -> if (error is CancellationException) throw error }
+            runCatchingNonFatal { discoverDomains(force = true) }
+                .onFailure { error -> error.rethrowCancellation() }
                 .getOrNull()
                 ?.let { refreshed ->
                     val attempted = initialCandidates.toHashSet()
@@ -2199,8 +2418,8 @@ class JmGateway(context: Context) {
         // A stale source list should not prevent a valid account operation.
         // Refresh once after the initial candidates fail, while preserving the
         // first meaningful error if discovery itself is unavailable.
-        runCatching { discoverDomains(force = true) }
-            .onFailure { error -> if (error is CancellationException) throw error }
+        runCatchingNonFatal { discoverDomains(force = true) }
+            .onFailure { error -> error.rethrowCancellation() }
             .getOrNull()
             ?.let { refreshed ->
                 val attempted = initialCandidates.toHashSet()
@@ -2238,7 +2457,20 @@ class JmGateway(context: Context) {
                 preferredAvailable?.takeIf { it in domains }?.let(::add)
                 addAll(domains.filterNot { it == preferredAvailable })
             }.distinct().take(MAX_API_CANDIDATES)
-            manuallyOrdered.forEach { domain ->
+            if (manuallyOrdered.size >= 2) {
+                raceDomainJson(
+                    path = path,
+                    primaryDomain = manuallyOrdered[0],
+                    secondaryDomain = manuallyOrdered[1],
+                    tracker = tracker,
+                    hedgeDelayMillis = MANUAL_API_FALLBACK_DELAY_MILLIS,
+                )?.let { return it }
+            } else {
+                return manuallyOrdered.firstOrNull()?.let { domain ->
+                    acceptedFeaturePayload(domain, requestDomainJson(path, domain), tracker)
+                }
+            }
+            manuallyOrdered.drop(2).forEach { domain ->
                 acceptedFeaturePayload(domain, requestDomainJson(path, domain), tracker)?.let { return it }
             }
             return null
@@ -2261,10 +2493,11 @@ class JmGateway(context: Context) {
         primaryDomain: String,
         secondaryDomain: String,
         tracker: FeatureRequestTracker? = null,
+        hedgeDelayMillis: Long = API_HEDGE_DELAY_MILLIS,
     ): JSONObject? =
         supervisorScope {
             val primary = async { requestDomainJson(path, primaryDomain) }
-            val earlyPrimary = withTimeoutOrNull(API_HEDGE_DELAY_MILLIS) { primary.await() }
+            val earlyPrimary = withTimeoutOrNull(hedgeDelayMillis) { primary.await() }
             if (earlyPrimary != null) {
                 acceptedFeaturePayload(primaryDomain, earlyPrimary, tracker)?.let { return@supervisorScope it }
                 return@supervisorScope acceptedFeaturePayload(
@@ -2360,29 +2593,30 @@ class JmGateway(context: Context) {
         Result.failure(error)
     }
 
-    private suspend fun ensureCookies(domain: String) {
+    private suspend fun ensureCookies(domain: String): Boolean {
         installSessionCookie(domain)
-        if (domain in initializedCookieHosts) return
-        cookieInitLocks[lockStripeIndex(domain, cookieInitLocks.size)].withLock {
+        if (domain in initializedCookieHosts) return true
+        return cookieInitLocks[lockStripeIndex(domain, cookieInitLocks.size)].withLock {
             installSessionCookie(domain)
-            if (domain in initializedCookieHosts) return@withLock
-            val initialized = runCatching {
+            if (domain in initializedCookieHosts) return@withLock true
+            val initialized = runCatchingNonFatal {
                 val timestamp = epochSeconds()
                 execute(domain, "/setting", timestamp, APP_TOKEN_PROTOCOL_KEY).use { response ->
                     if (!response.isSuccessful) return@use false
                     response.body.readStringLimited(MAX_API_RESPONSE_BYTES)
                     true
                 }
-            }.onFailure { if (it is CancellationException) throw it }.getOrDefault(false)
+            }.onFailure { it.rethrowCancellation() }.getOrDefault(false)
             installSessionCookie(domain)
             if (initialized) initializedCookieHosts += domain
+            initialized
         }
     }
 
     private fun installSessionCookie(domain: String) {
         val avs = authenticatedSession?.avs?.takeIf { it.isNotBlank() } ?: return
         val url = "https://$domain/".toHttpUrlOrNull() ?: return
-        runCatching {
+        runCatchingNonFatal {
             cookies.install(
                 url,
                 listOf(
@@ -2666,6 +2900,9 @@ class JmGateway(context: Context) {
         private const val SOURCE_PROBE_READ_TIMEOUT_SECONDS = 4L
         private const val SOURCE_PROBE_CALL_TIMEOUT_SECONDS = 6L
         private const val API_HEDGE_DELAY_MILLIS = 450L
+        private const val MANUAL_API_FALLBACK_DELAY_MILLIS = 1_500L
+        private const val MUTATION_PREFLIGHT_TIMEOUT_MILLIS = 6_500L
+        private const val AUTHENTICATED_HOST_COOLDOWN_MILLIS = 2L * 60L * 1_000L
         private const val FEATURE_UNAVAILABLE_TTL_MILLIS = 15L * 60L * 1_000L
         private const val FEATURE_WEEK_CATALOG = "week-catalog"
         private const val FEATURE_WEEK_RANKING = "week-ranking"
@@ -2722,6 +2959,8 @@ class JmGateway(context: Context) {
         private const val TURBO_IMAGE_HEDGE_DELAY_MILLIS = 45L
         private const val BACKGROUND_PRIORITY_POLL_MILLIS = 24L
         private const val PAGE_NETWORK_READ_CHUNK_BYTES = 32 * 1024
+        private const val PAGE_STREAM_TEMP_PREFIX = "jm-page-stream-"
+        private const val PAGE_STREAM_TEMP_STALE_MILLIS = 6L * 60L * 60L * 1_000L
         private const val RAW_CACHE_WRITE_POLL_MILLIS = 16L
         private const val DECODED_CACHE_WRITE_DELAY_MILLIS = 4_000L
         private const val UNOBSERVED_PAGE_LOAD_GRACE_MILLIS = 1_500L
@@ -2729,6 +2968,8 @@ class JmGateway(context: Context) {
         private const val SCRAMBLE_CACHE_MILLIS = 6L * 60L * 60L * 1_000L
         private const val OFFICIAL_SEARCH_PAGE_SIZE = 20
         private const val OFFICIAL_LIST_PAGE_SIZE = 20
+        private const val OFFICIAL_FAVORITE_PAGE_SIZE = 20
+        private const val FAVORITE_SYNC_CONCURRENCY = 2
         private const val SCRAMBLE_268850 = 268850L
         private const val SCRAMBLE_421926 = 421926L
         private val builtInDomains = listOf("www.cdnhjk.net", "www.cdngwc.cc", "www.cdngwc.net", "www.cdngwc.club", "www.cdnhjk.cc", "www.cdnutc.me")
@@ -2738,6 +2979,10 @@ class JmGateway(context: Context) {
         private val timeLimitedRankingOrders = setOf("mv_m", "mv_w", "mv_t")
         private val officialSearchOrders = setOf("mr", "mv", "mp", "tf")
         private val safeImageFile = Regex("^[A-Za-z0-9_-]{1,128}\\.(?:jpg|jpeg|png|webp|gif)$", RegexOption.IGNORE_CASE)
+        private val coverMirrorPath = Regex(
+            "^/media/albums/[A-Za-z0-9_-]{1,128}\\.(?:jpg|jpeg|png|webp)$",
+            RegexOption.IGNORE_CASE,
+        )
         private val safeHost = Regex("^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
         private val ipLiteral = Regex("^(?:\\d{1,3}\\.){3}\\d{1,3}$|:")
         private val scrambleRegex = Regex("var\\s+scramble_id\\s*=\\s*(\\d+);")
@@ -2746,6 +2991,22 @@ class JmGateway(context: Context) {
             lastWarmedAt != null && now >= lastWarmedAt && now - lastWarmedAt < IMAGE_WARMUP_REUSE_MILLIS
         internal fun shouldInvalidateRestoredSession(authFailures: Int, otherFailures: Int): Boolean =
             authFailures > 0 && otherFailures == 0
+        internal fun prioritizeHostsByFailureCooldown(
+            candidates: List<String>,
+            failedAt: Map<String, Long>,
+            now: Long,
+            cooldownMillis: Long,
+        ): List<String> {
+            val distinct = candidates.distinct()
+            val available = distinct.filter { host ->
+                val timestamp = failedAt[host] ?: return@filter true
+                now < timestamp || now - timestamp >= cooldownMillis
+            }
+            if (available.isNotEmpty()) return available
+            return distinct.minByOrNull { host -> failedAt[host] ?: Long.MIN_VALUE }
+                ?.let(::listOf)
+                .orEmpty()
+        }
         private fun md5(value: String) = encodeLowerHex(
             MessageDigest.getInstance("MD5").digest(value.toByteArray()),
         )
@@ -2846,11 +3107,11 @@ class JmGateway(context: Context) {
             }
         }
         private fun bitmapCacheSizeKb(context: Context): Int {
-            val memoryMb = (context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).memoryClass
+            val memoryMb = context.getSystemService(ActivityManager::class.java)?.memoryClass ?: 256
             return (memoryMb * 1024 / 8).coerceIn(MIN_BITMAP_CACHE_KB, MAX_BITMAP_CACHE_KB)
         }
         private fun decodedPagePixelLimit(context: Context): Long {
-            val memoryMb = (context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).memoryClass
+            val memoryMb = context.getSystemService(ActivityManager::class.java)?.memoryClass ?: 256
             return when {
                 memoryMb < 384 -> 8_000_000L
                 memoryMb < 512 -> 10_000_000L
@@ -2858,8 +3119,11 @@ class JmGateway(context: Context) {
             }
         }
         private fun imageWorkPermits(context: Context): Int {
-            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-            return imageWorkPermits(activityManager.memoryClass, activityManager.isLowRamDevice)
+            val activityManager = context.getSystemService(ActivityManager::class.java)
+            return imageWorkPermits(
+                activityManager?.memoryClass ?: 256,
+                activityManager?.isLowRamDevice ?: true,
+            )
         }
         internal fun imageWorkPermits(memoryMb: Int, isLowRamDevice: Boolean): Int =
             if (isLowRamDevice || memoryMb < 512) 1 else 2
@@ -2878,6 +3142,13 @@ class JmGateway(context: Context) {
         }
         internal fun hasMoreSearchResults(page: Int, pageSize: Int, loaded: Int, total: Long?, redirectAid: String?): Boolean =
             redirectAid == null && hasMorePagedResults(page, pageSize, loaded, total)
+        internal fun favoritePageCount(total: Long, maxPages: Int): Int {
+            val safeMaxPages = maxPages.coerceIn(1, MAX_FAVORITE_SYNC_PAGES)
+            if (total <= 0L) return 1
+            return (((total - 1L) / OFFICIAL_FAVORITE_PAGE_SIZE) + 1L)
+                .coerceAtMost(safeMaxPages.toLong())
+                .toInt()
+        }
         internal fun hasMorePagedResults(page: Int, pageSize: Int, loaded: Int, total: Long?): Boolean {
             if (page !in 1 until MAX_OFFICIAL_PAGE || loaded <= 0) return false
             val safePageSize = pageSize.coerceAtLeast(1)
@@ -2895,6 +3166,17 @@ class JmGateway(context: Context) {
             val safeLoaded = loaded.coerceAtLeast(0)
             val accumulated = (safePage - 1L) * safePageSize + safeLoaded
             return (reportedTotal ?: accumulated).coerceAtLeast(accumulated)
+        }
+        internal fun favoriteFolderMutationForm(
+            type: String,
+            folderId: String,
+            folderName: String = "",
+            albumId: String = "",
+        ): Map<String, String> = buildMap {
+            put("type", type)
+            put("folder_id", folderId)
+            folderName.takeIf(String::isNotBlank)?.let { put("folder_name", it) }
+            albumId.takeIf(String::isNotBlank)?.let { put("aid", it) }
         }
         internal fun normalizeChapterImageFiles(values: List<String>): List<String> = values
             .asSequence()
@@ -2949,12 +3231,23 @@ class JmGateway(context: Context) {
             if (normalizeRemoteDomain(url.host) == null) return null
             return url.toString().takeIf { it.length <= MAX_FIELD_LENGTH }
         }
+        internal fun coverMirrorUrls(raw: String): List<String> {
+            val normalized = normalizeRemoteHttpsUrl(raw) ?: return listOf(raw)
+            val url = normalized.toHttpUrlOrNull() ?: return listOf(normalized)
+            if (!coverMirrorPath.matches(url.encodedPath)) return listOf(normalized)
+            return (listOf(url.host) + imageDomains)
+                .distinct()
+                .take(MAX_COVER_MIRROR_CANDIDATES)
+                .map { host -> url.newBuilder().host(host).build().toString() }
+        }
         private fun isAllowedImageUrl(raw: String): Boolean {
             val url = raw.trim().toHttpUrlOrNull() ?: return false
             return url.scheme == "https" && url.port == 443 &&
                 url.username.isEmpty() && url.password.isEmpty() &&
                 url.host in imageDomains && raw.length <= MAX_FIELD_LENGTH * 4
         }
+
+        private const val MAX_COVER_MIRROR_CANDIDATES = 4
         private fun imageSequence(fileName: String) =
             imageSequencePattern.find(fileName)?.value?.toLongOrNull() ?: Long.MAX_VALUE
         private fun formatChapterTitle(raw: String, sort: Int): String {

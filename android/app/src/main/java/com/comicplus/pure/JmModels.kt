@@ -147,11 +147,29 @@ data class JmFavoriteItem(
 )
 
 @Immutable
+data class JmFavoriteFolder(
+    val id: String,
+    val name: String,
+)
+
+@Immutable
 data class JmFavoritePage(
+    val folderId: String,
     val page: Int,
     val total: Long,
     val items: List<JmFavoriteItem>,
+    val folders: List<JmFavoriteFolder>,
     val hasMore: Boolean,
+    /** Whether the upstream response explicitly supplied a total/count field. */
+    val totalKnown: Boolean = true,
+)
+
+@Immutable
+data class JmFavoriteCollection(
+    val folderId: String,
+    val total: Long,
+    val items: List<JmFavoriteItem>,
+    val folders: List<JmFavoriteFolder>,
 )
 
 class JmAuthException(message: String) : IOException(message)

@@ -1,6 +1,9 @@
 package com.comicplus.app.ui
 
+import com.comicplus.app.ui.screens.containsSpoilerComment
+import com.comicplus.app.ui.screens.nextVisibleReplyCount
 import com.comicplus.app.ui.screens.shouldLoadMoreComments
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -32,5 +35,27 @@ class CommentPagingTest {
                 prefetchDistance = -1,
             ),
         )
+    }
+
+    @Test
+    fun spoilerDetectionIncludesNestedReplies() {
+        assertFalse(containsSpoilerComment(listOf(JmCommentUiItem(id = "plain"))))
+        assertTrue(
+            containsSpoilerComment(
+                listOf(
+                    JmCommentUiItem(
+                        id = "root",
+                        replies = listOf(JmCommentUiItem(id = "reply", spoiler = true)),
+                    ),
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun replyExpansionAddsOneBoundedBatchAtATime() {
+        assertEquals(13, nextVisibleReplyCount(current = 3, total = 40))
+        assertEquals(23, nextVisibleReplyCount(current = 13, total = 40))
+        assertEquals(25, nextVisibleReplyCount(current = 23, total = 25))
     }
 }

@@ -12,6 +12,7 @@ import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import kotlinx.coroutines.Dispatchers
 import okio.Path.Companion.toOkioPath
 import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 
 class ComicPlusApplication : Application(), SingletonImageLoader.Factory {
     override fun onCreate() {
@@ -21,10 +22,13 @@ class ComicPlusApplication : Application(), SingletonImageLoader.Factory {
 
     override fun newImageLoader(context: Context): ImageLoader {
         val coverClient = OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .callTimeout(12, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
             .build()
         SystemVpnMonitor.registerRouteChangeListener {
-            coverClient.dispatcher.cancelAll()
-            coverClient.connectionPool.evictAll()
+            evictConnectionsAsync(coverClient)
         }
         return ImageLoader.Builder(context)
             .components { add(OkHttpNetworkFetcherFactory(coverClient)) }

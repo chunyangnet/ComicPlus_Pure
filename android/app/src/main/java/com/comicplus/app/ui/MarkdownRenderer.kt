@@ -9,6 +9,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.sp
 import java.net.URI
+import java.util.LinkedHashMap
 
 /** Annotation tag used for links emitted by [markdownToAnnotatedString]. */
 const val MARKDOWN_URL_TAG: String = "markdown-url"
@@ -17,6 +18,13 @@ private const val MAX_MARKDOWN_LENGTH = 40_000
 private const val MAX_MARKDOWN_LINES = 800
 private const val MAX_INLINE_DEPTH = 8
 private const val MAX_LINK_LENGTH = 1_024
+private const val MAX_CACHED_MARKDOWN_LENGTH = 12_000
+private const val MARKDOWN_CACHE_ENTRIES = 96
+
+private val markdownCache = object : LinkedHashMap<String, AnnotatedString>(MARKDOWN_CACHE_ENTRIES, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, AnnotatedString>?): Boolean =
+        size > MARKDOWN_CACHE_ENTRIES
+}
 
 private val HEADING_PATTERN = Regex("^\\s{0,3}(#{1,6})\\s+(.+?)\\s*#*\\s*$")
 private val UNORDERED_PATTERN = Regex("^(\\s*)[-+*]\\s+(.+)$")
@@ -70,8 +78,12 @@ private sealed interface ParsedLine {
  * cannot inject a view or executable resource into the UI.
  */
 fun markdownToAnnotatedString(source: String): AnnotatedString {
+    val cacheable = source.length <= MAX_CACHED_MARKDOWN_LENGTH
+    if (cacheable) synchronized(markdownCache) { markdownCache[source] }?.let { return it }
     val normalized = sanitizeMarkup(source.take(MAX_MARKDOWN_LENGTH)).trim()
-    if (normalized.isBlank()) return AnnotatedString("")
+    if (normalized.isBlank()) return AnnotatedString("").also { rendered ->
+        if (cacheable) synchronized(markdownCache) { markdownCache[source] = rendered }
+    }
 
     val parsed = ArrayList<ParsedLine>()
     var inFence = false
@@ -99,7 +111,9 @@ fun markdownToAnnotatedString(source: String): AnnotatedString {
             is ParsedLine.Text -> appendMarkdownLine(builder, line.value)
         }
     }
-    return builder.toAnnotatedString()
+    return builder.toAnnotatedString().also { rendered ->
+        if (cacheable) synchronized(markdownCache) { markdownCache[source] = rendered }
+    }
 }
 
 private fun appendCodeLine(builder: AnnotatedString.Builder, line: String) {
@@ -244,7 +258,7 @@ private fun unescape(value: String): String = value.replace("\\\\", "\\").replac
 
 private fun isSafeHttpsUrl(value: String): Boolean {
     if (value.length > MAX_LINK_LENGTH || value.any(Char::isWhitespace)) return false
-    return runCatching {
+    return com.comicplus.pure.runCatchingNonFatal {
         val uri = URI(value)
         uri.scheme.equals("https", ignoreCase = true) &&
             uri.host != null &&

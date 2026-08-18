@@ -26,6 +26,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -50,6 +55,8 @@ internal fun ReaderCommentsDialog(
     onDismiss: () -> Unit,
 ) {
     val listState = rememberLazyListState()
+    var revealSpoilersRequest by rememberSaveable(chapter.sourceChapterId) { mutableIntStateOf(0) }
+    val hasSpoilers = remember(state.items) { containsSpoilerComment(state.items) }
     LaunchedEffect(chapter.sourceChapterId) {
         listState.scrollToItem(0)
     }
@@ -110,17 +117,25 @@ internal fun ReaderCommentsDialog(
                             contentPadding = PaddingValues(top = 4.dp, bottom = 20.dp),
                         ) {
                             item(key = "reader-comments-summary", contentType = "reader-comments-summary") {
-                                Text(
-                                    when {
-                                        state.loading -> "正在读取评论"
-                                        state.total > 0L -> "共 ${formatCommentCount(state.total)} 条"
-                                        state.loaded -> "暂时没有评论"
-                                        else -> "JM 官方评论"
-                                    },
-                                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
-                                    color = White.copy(alpha = .52f),
-                                    style = MaterialTheme.typography.labelMedium,
-                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        when {
+                                            state.loading -> "正在读取评论"
+                                            state.total > 0L -> "共 ${formatCommentCount(state.total)} 条"
+                                            state.loaded -> "暂时没有评论"
+                                            else -> "JM 官方评论"
+                                        },
+                                        modifier = Modifier.weight(1f).padding(vertical = 6.dp),
+                                        color = White.copy(alpha = .52f),
+                                        style = MaterialTheme.typography.labelMedium,
+                                    )
+                                    if (hasSpoilers) {
+                                        RevealSpoilersButton(onClick = { revealSpoilersRequest += 1 })
+                                    }
+                                }
                             }
                             when {
                                 state.loading && state.items.isEmpty() -> item(
@@ -158,7 +173,10 @@ internal fun ReaderCommentsDialog(
                                         key = { it.id },
                                         contentType = { "reader-comment" },
                                     ) { comment ->
-                                        OfficialCommentItem(comment)
+                                        OfficialCommentItem(
+                                            comment = comment,
+                                            revealSpoilersRequest = revealSpoilersRequest,
+                                        )
                                     }
                                     item(key = "reader-comment-footer", contentType = "reader-comment-footer") {
                                         CommentListFooter(

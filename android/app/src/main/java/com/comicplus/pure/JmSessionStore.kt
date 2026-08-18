@@ -27,7 +27,7 @@ class JmSessionStore(context: Context) {
         val username = preferences.getString(KEY_USERNAME, null)?.trim().orEmpty()
         val encrypted = preferences.getString(KEY_AVS, null).orEmpty()
         if (uid.length > MAX_FIELD_LENGTH || username.length > MAX_FIELD_LENGTH || encrypted.isBlank()) return null
-        val avs = runCatching { decrypt(encrypted) }.getOrNull()?.trim().orEmpty()
+        val avs = runCatchingNonFatal { decrypt(encrypted) }.getOrNull()?.trim().orEmpty()
         if (uid.isBlank() || username.isBlank() || avs.isBlank() || avs.length > MAX_AVS_LENGTH) return null
         return JmSession(uid = uid, username = username, avs = avs)
     }
@@ -39,7 +39,7 @@ class JmSessionStore(context: Context) {
             session.uid.length > MAX_FIELD_LENGTH || session.username.length > MAX_FIELD_LENGTH ||
             session.avs.isBlank() || session.avs.length > MAX_AVS_LENGTH
         ) return false
-        return runCatching {
+        return runCatchingNonFatal {
             preferences.edit()
                 .putString(KEY_UID, session.uid)
                 .putString(KEY_USERNAME, session.username)

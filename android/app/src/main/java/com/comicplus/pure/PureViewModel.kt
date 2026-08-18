@@ -19,6 +19,8 @@ import com.comicplus.app.ui.JmBrowseOptionUi
 import com.comicplus.app.ui.JmCommentsUiState
 import com.comicplus.app.ui.JmAccountStatus
 import com.comicplus.app.ui.JmAccountUiState
+import com.comicplus.app.ui.JmFavoriteFolderUiItem
+import com.comicplus.app.ui.JmFavoriteFoldersUiState
 import com.comicplus.app.ui.JmTagGroupUi
 import com.comicplus.app.ui.JmSourceUiState
 import com.comicplus.app.ui.PureUiState
@@ -28,9 +30,16 @@ import com.comicplus.app.ui.ReaderChapterSegment
 import com.comicplus.app.ui.ReaderPrefetchMode
 import com.comicplus.app.ui.ReadingHistoryItem
 import com.comicplus.app.ui.key
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -43,9 +52,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 class PureViewModel(
     private val gateway: JmGateway,
@@ -64,8 +72,6 @@ class PureViewModel(
     )
 
     private val initialSettings = settingsStore.load()
-    private val initialFavorites = libraryStore.loadFavorites()
-    private val initialHistory = libraryStore.loadHistory()
     private val cachedSourceSnapshot = gateway.apply {
         setSourcePreferences(
             autoSelect = initialSettings.autoSelectSource,
@@ -77,8 +83,6 @@ class PureViewModel(
         PureUiState(
             downloads = downloadStore.items.value,
             settings = initialSettings,
-            favorites = initialFavorites,
-            history = initialHistory,
             sourceStatus = cachedSourceSnapshot.toUiState(),
             appUpdate = AppUpdateUiState(currentVersion = currentVersion),
         ),
@@ -97,27 +101,32 @@ class PureViewModel(
     private var detailJob: Job? = null
     private var commentsJob: Job? = null
     private var accountJob: Job? = null
+    private var favoriteFolderJob: Job? = null
     private var readerJob: Job? = null
     private var readerWarmupJob: Job? = null
+    private var readerBufferRefillJob: Job? = null
     private var readerWarmupChapterId: String? = null
     private var lastProgressSignature: String? = null
-    private val progressWriteLock = ReentrantLock()
+    private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+    private val localLibraryLoaded = CompletableDeferred<Unit>()
     private val progressPersistGeneration = AtomicLong()
     @Volatile private var latestProgressSnapshot: ReaderProgressSnapshot? = null
-    // onCleared() is synchronous, so a blocking lock is required to serialize
-    // its final snapshot with already-running IO writes. The JSON snapshots are
-    // bounded and normally small, keeping the critical section short.
-    private val libraryWriteLock = ReentrantLock()
+    @Volatile private var persistedProgressGeneration = 0L
     private val favoritesPersistGeneration = AtomicLong()
     private val historyPersistGeneration = AtomicLong()
+    private val settingsPersistGeneration = AtomicLong()
+    @Volatile private var persistedFavoritesGeneration = 0L
+    @Volatile private var persistedHistoryGeneration = 0L
+    @Volatile private var persistedSettingsGeneration = 0L
     private var settingsSaveJob: Job? = null
-    private var historySaveJob: Job? = null
+    private var readerStateSaveJob: Job? = null
     private var sourceRefreshJob: Job? = null
     private var sourceScheduleJob: Job? = null
     private var updateCheckJob: Job? = null
     private val searchRequestGeneration = AtomicLong()
     private val detailRequestGeneration = AtomicLong()
     private val commentsRequestGeneration = AtomicLong()
+    private val favoriteFolderRequestGeneration = AtomicLong()
     private val readerRequestGeneration = AtomicLong()
     private val homeRequestGeneration = AtomicLong()
     private val categoryCatalogRequestGeneration = AtomicLong()
@@ -128,28 +137,80 @@ class PureViewModel(
     private val typeRankingRequestGeneration = AtomicLong()
     private val sourceRefreshRequestGeneration = AtomicLong()
     private val updateCheckRequestGeneration = AtomicLong()
+    private val appInForeground = AtomicBoolean(true)
     private val comicCache = SynchronizedLruCache<String, JmComic>(maxEntries = COMIC_CACHE_LIMIT)
     private val commentCache = CommentPageCache()
     private val downloadLimiter = Semaphore(permits = 2)
-    // The server-side favorite toggle is stateful. Serialize it with manual favorite sync so an
-    // older full snapshot cannot overwrite a newer optimistic toggle.
+    // Official favorite writes are stateful and must stay ordered. Reads remain concurrent and
+    // use favoriteMutationRevision to reject snapshots captured across a write.
     private val favoriteOperationLimiter = Semaphore(permits = 1)
     private val favoriteOperations = ConcurrentHashMap.newKeySet<String>()
     private val favoriteOperationGeneration = AtomicLong()
+    private val favoriteMutationRevision = AtomicLong()
 
     init {
+        viewModelScope.launch {
+            val favoritesGeneration = favoritesPersistGeneration.get()
+            val historyGeneration = historyPersistGeneration.get()
+            try {
+                val (favorites, history) = withContext(Dispatchers.IO) {
+                    libraryStore.loadFavorites() to libraryStore.loadHistory()
+                }
+                _state.update { state ->
+                    val loadedFavorites = if (favoritesGeneration == favoritesPersistGeneration.get()) {
+                        favorites
+                    } else {
+                        (state.favorites + favorites)
+                            .distinctBy(ComicUiItem::key)
+                            .take(MAX_FAVORITE_ENTRIES)
+                    }
+                    val loadedHistory = if (historyGeneration == historyPersistGeneration.get()) {
+                        history
+                    } else {
+                        (state.history + history)
+                            .distinctBy { it.comic.key }
+                            .sortedByDescending(ReadingHistoryItem::updatedAt)
+                            .take(MAX_HISTORY_ENTRIES)
+                    }
+                    state.copy(
+                        favorites = loadedFavorites,
+                        history = loadedHistory,
+                        favoriteFolders = if (!state.account.signedIn) {
+                            state.favoriteFolders.copy(
+                                items = loadedFavorites,
+                                total = loadedFavorites.size.toLong(),
+                            )
+                        } else {
+                            state.favoriteFolders
+                        },
+                    )
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                // Keep the in-memory defaults when a corrupt or unavailable local snapshot fails.
+            } finally {
+                localLibraryLoaded.complete(Unit)
+            }
+        }
         viewModelScope.launch {
             downloadStore.items.collect { downloads -> _state.update { it.copy(downloads = downloads) } }
         }
         sessionStore?.let { store ->
             accountJob = viewModelScope.launch {
+                localLibraryLoaded.await()
                 withContext(Dispatchers.IO) { store.load() }?.let { session -> restoreAccount(session) }
             }
         }
         refreshHome()
         viewModelScope.launch {
             awaitInitialHomePriorityWindow()
-            downloadStore.refresh()
+            try {
+                downloadStore.refresh()
+            } catch (error: Throwable) {
+                error.rethrowCancellation()
+                // Downloads can be refreshed again from the library screen.
+            }
         }
         viewModelScope.launch {
             awaitInitialHomePriorityWindow()
@@ -157,24 +218,45 @@ class PureViewModel(
         }
         sourceScheduleJob = viewModelScope.launch {
             awaitInitialHomePriorityWindow()
-            val settings = _state.value.settings
-            if (settings.autoSelectSource || settings.autoUpdateSourceList) {
-                refreshSources(force = false, updateOfficialList = settings.autoUpdateSourceList)
-            }
+            // Source probing opens several connections per host. Give the
+            // first screen and an immediately opened reader a quiet window,
+            // then refresh only when the persisted measurements are stale.
+            delay(SOURCE_REFRESH_START_DELAY_MS)
             while (isActive) {
-                delay(SOURCE_REFRESH_INTERVAL_MS)
                 val currentSettings = _state.value.settings
-                if (currentSettings.autoSelectSource || currentSettings.autoUpdateSourceList) {
+                val currentState = _state.value
+                val appIsIdle = currentState.detail is ComicResolveUiState.Idle &&
+                    currentState.reader is ReaderUiState.Idle &&
+                    !currentState.account.syncing &&
+                    currentState.downloadProgress.isEmpty() &&
+                    !currentState.favoriteFolders.loading &&
+                    !currentState.favoriteFolders.creating &&
+                    currentState.favoriteFolders.movingKey == null &&
+                    currentState.account.status != JmAccountStatus.Restoring &&
+                    currentState.account.status != JmAccountStatus.SigningIn
+                if (
+                    appInForeground.get() &&
+                    appIsIdle &&
+                    !currentState.sourceStatus.checking &&
+                    (currentSettings.autoSelectSource || currentSettings.autoUpdateSourceList) &&
+                    sourceSnapshotNeedsRefresh(
+                        gateway.cachedSourceSnapshot(),
+                        System.currentTimeMillis(),
+                        SOURCE_REFRESH_INTERVAL_MS,
+                    )
+                ) {
                     refreshSources(
                         force = currentSettings.autoUpdateSourceList,
                         updateOfficialList = currentSettings.autoUpdateSourceList,
                     )
                 }
+                delay(SOURCE_REFRESH_CHECK_INTERVAL_MS)
             }
         }
     }
 
     fun refreshHome() {
+        cancelSourceRefreshForForeground()
         val requestGeneration = homeRequestGeneration.incrementAndGet()
         homeJob?.cancel()
         homeJob = viewModelScope.launch {
@@ -182,7 +264,22 @@ class PureViewModel(
                 if (requestGeneration != homeRequestGeneration.get()) return@update state
                 state.copy(loading = true, message = null)
             }
-            runCatching { gateway.home() }
+            runCatching {
+                gateway.home { partial ->
+                    if (requestGeneration != homeRequestGeneration.get()) return@home
+                    val uiItems = mapRankingItems(partial)
+                    if (requestGeneration != homeRequestGeneration.get()) return@home
+                    _state.update { state ->
+                        if (requestGeneration != homeRequestGeneration.get()) return@update state
+                        state.copy(
+                            home = uiItems,
+                            discoveryItems = uiItems.drop(8),
+                            loading = false,
+                            discoveryExhausted = false,
+                        )
+                    }
+                }
+            }
                 .onSuccess { items ->
                     if (requestGeneration != homeRequestGeneration.get()) return@onSuccess
                     val uiItems = mapRankingItems(items)
@@ -214,6 +311,7 @@ class PureViewModel(
     fun loadRankings(order: String = _state.value.rankings.jmOrder) {
         val current = _state.value.rankings
         if (current.jmOrder == order && (current.jmLoading || current.jmLoaded && current.jmItems.isNotEmpty())) return
+        cancelSourceRefreshForForeground()
         val requestGeneration = rankingRequestGeneration.incrementAndGet()
         rankingJob?.cancel()
         rankingJob = viewModelScope.launch {
@@ -270,6 +368,7 @@ class PureViewModel(
     fun loadWeeklyCatalog(force: Boolean = false) {
         val current = _state.value.officialBrowse.weekly
         if (!force && (current.catalogLoading || current.categories.isNotEmpty() && current.types.isNotEmpty())) return
+        cancelSourceRefreshForForeground()
         val requestGeneration = weeklyCatalogRequestGeneration.incrementAndGet()
         weeklyCatalogJob?.cancel()
         weeklyCatalogJob = viewModelScope.launch {
@@ -374,6 +473,7 @@ class PureViewModel(
         val current = _state.value.officialBrowse.weekly
         val sameFilter = current.selectedCategoryId == categoryId && current.selectedTypeId == typeId
         if (!force && sameFilter && (current.loading || current.loaded)) return
+        cancelSourceRefreshForForeground()
         val requestGeneration = weeklyRequestGeneration.incrementAndGet()
         weeklyJob?.cancel()
         weeklyJob = viewModelScope.launch {
@@ -439,6 +539,7 @@ class PureViewModel(
         val current = _state.value.officialBrowse.typeRanking
         val sameFilter = current.selectedSlug == safeSlug && current.order == order
         if (!force && sameFilter && (current.loading || current.loaded)) return
+        cancelSourceRefreshForForeground()
         val requestGeneration = typeRankingRequestGeneration.incrementAndGet()
         typeRankingJob?.cancel()
         typeRankingJob = viewModelScope.launch {
@@ -497,6 +598,7 @@ class PureViewModel(
 
     fun loadCategories() {
         if (_state.value.officialBrowse.catalogLoaded || categoryCatalogJob?.isActive == true) return
+        cancelSourceRefreshForForeground()
         val requestGeneration = categoryCatalogRequestGeneration.incrementAndGet()
         categoryCatalogJob = viewModelScope.launch {
             _state.update {
@@ -547,6 +649,7 @@ class PureViewModel(
             current.page > 0 &&
             current.items.isNotEmpty()
         ) return
+        cancelSourceRefreshForForeground()
         val requestGeneration = categoryRequestGeneration.incrementAndGet()
         categoryJob?.cancel()
         categoryJob = viewModelScope.launch {
@@ -611,6 +714,7 @@ class PureViewModel(
         if (current.loading || current.loadingMore || !current.hasMore ||
             current.page <= 0 || current.page >= MAX_PAGINATION_PAGE
         ) return
+        cancelSourceRefreshForForeground()
         val slug = current.selectedSlug
         val order = current.order
         val nextPage = current.page + 1
@@ -672,6 +776,7 @@ class PureViewModel(
     }
 
     fun search(query: String, mainTag: Int = 0, order: String = "mr", page: Int = 1) {
+        cancelSourceRefreshForForeground()
         val normalizedQuery = query.trim().take(MAX_SEARCH_QUERY_LENGTH)
         val safeMainTag = mainTag.coerceIn(0, 4)
         val safePage = page.coerceIn(1, MAX_PAGINATION_PAGE)
@@ -787,6 +892,7 @@ class PureViewModel(
     fun openComic(id: String) = openComic(id, null)
 
     private fun openComic(id: String, sourceItem: ComicUiItem?) {
+        cancelSourceRefreshForForeground()
         val requestGeneration = detailRequestGeneration.incrementAndGet()
         detailJob?.cancel()
         commentsJob?.cancel()
@@ -803,7 +909,9 @@ class PureViewModel(
             runCatching { comicCache[id] ?: gateway.comic(id).also { comicCache[id] = it } }
                 .onSuccess { comic ->
                     if (requestGeneration != detailRequestGeneration.get()) return@onSuccess
-                    val progress = settingsStore.loadProgress(comic.id)
+                    val progress = withContext(Dispatchers.IO) {
+                        settingsStore.loadProgress(comic.id)
+                    }
                     val resolvedDetail = withContext(Dispatchers.Default) {
                         comic.toResolveState(progress)
                     }
@@ -974,16 +1082,15 @@ class PureViewModel(
         }
     }
 
-    /** Load comments for an explicitly selected chapter, including from the reader. */
+    /** Load comments for an explicitly selected chapter from the reader. */
     fun openComments(comicId: String, chapterId: String) {
         loadComments(comicId.trim(), chapterId.trim())
     }
 
-    /** Switch the detail-page comments tab to a chapter/photo. */
-    fun selectCommentsChapter(chapter: SourceChapterDto) {
-        val detail = _state.value.detail as? ComicResolveUiState.Ready ?: return
-        if (detail.chapters.isNotEmpty() && detail.chapters.none { it.sourceChapterId == chapter.sourceChapterId }) return
-        loadComments(detail.jmId, chapter.sourceChapterId)
+    /** Load the official comic-level forum used by the detail page. */
+    fun openComicComments(comicId: String) {
+        val normalizedId = comicId.trim()
+        loadComments(normalizedId, normalizedId)
     }
 
     fun retryComments() {
@@ -1027,6 +1134,16 @@ class PureViewModel(
                 .take(MAX_FAVORITE_ENTRIES)
         }
 
+    private fun List<JmFavoriteFolder>.toFavoriteFolderUiItems(): List<JmFavoriteFolderUiItem> =
+        (listOf(JmFavoriteFolder(id = "0", name = "全部")) + this)
+            .map { folder ->
+                JmFavoriteFolderUiItem(
+                    id = folder.id,
+                    name = folder.name.trim().ifBlank { if (folder.id == "0") "全部" else "收藏夹 ${folder.id}" },
+                )
+            }
+            .distinctBy(JmFavoriteFolderUiItem::id)
+
     private suspend fun saveStoredSession(session: JmSession): Boolean {
         val store = sessionStore ?: return true
         return withContext(Dispatchers.IO) { store.save(session) }
@@ -1050,45 +1167,81 @@ class PureViewModel(
                     uid = session.uid,
                     username = session.username,
                 ),
+                favoriteFolders = JmFavoriteFoldersUiState(
+                    items = it.favorites,
+                    total = it.favorites.size.toLong(),
+                ),
             )
         }
         gateway.restoreSession(session)
-        awaitInitialHomePriorityWindow()
-        try {
-            val favorites = gateway.allFavorites()
-            val sessionPersisted = saveLatestGatewaySession(session)
-            publishOfficialAccount(
-                JmAccount(
+        // The encrypted session is already trusted enough to expose the local
+        // cache immediately. The network reconciliation runs in the background
+        // so a cold start never blocks the library behind a full-page sync.
+        _state.update { state ->
+            state.copy(
+                account = JmAccountUiState(
+                    status = JmAccountStatus.SignedIn,
                     uid = session.uid,
                     username = session.username,
-                    favoriteCount = favorites.size.toLong(),
+                    syncing = true,
                 ),
-                favorites,
+                favoriteFolders = state.favoriteFolders.copy(
+                    items = state.favorites,
+                    total = state.favorites.size.toLong(),
+                ),
             )
-            if (!sessionPersisted) {
+        }
+        awaitInitialHomePriorityWindow()
+        delay(ACCOUNT_SYNC_START_DELAY_MS)
+        val mutationRevision = favoriteMutationRevision.get()
+        try {
+            val account = JmAccount(uid = session.uid, username = session.username)
+            val favorites = gateway.favoriteCollection { partial ->
+                publishOfficialAccount(
+                    account = account.copy(favoriteCount = partial.total),
+                    favorites = partial,
+                    expectedMutationRevision = mutationRevision,
+                    mergeWithCached = true,
+                    syncing = true,
+                )
+            }
+            val sessionPersisted = saveLatestGatewaySession(session)
+            val published = publishOfficialAccount(
+                account = account.copy(favoriteCount = favorites.total),
+                favorites = favorites,
+                expectedMutationRevision = mutationRevision,
+            )
+            if (!published || !sessionPersisted) {
                 _state.update { state ->
-                    state.copy(account = state.account.copy(error = SESSION_PERSISTENCE_ERROR))
+                    state.copy(
+                        account = state.account.copy(
+                            syncing = false,
+                            error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                        ),
+                    )
                 }
             }
         } catch (error: Throwable) {
             error.rethrowCancellation()
             if (error is JmAuthException) {
-                gateway.clearSession()
-                clearStoredSession()
-                _state.update {
-                    it.copy(
-                        account = JmAccountUiState(status = JmAccountStatus.Error, error = error.readable()),
-                        message = "JM 登录已失效，请重新登录",
-                    )
-                }
+                invalidateFavoriteFolderSession(error)
             } else {
                 val sessionPersisted = saveLatestGatewaySession(session)
-                _state.update {
-                    it.copy(
+                _state.update { state ->
+                    if (mutationRevision != favoriteMutationRevision.get()) {
+                        return@update state.copy(
+                            account = state.account.copy(
+                                syncing = false,
+                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                            ),
+                        )
+                    }
+                    state.copy(
                         account = JmAccountUiState(
                             status = JmAccountStatus.SignedIn,
                             uid = session.uid,
                             username = session.username,
+                            syncing = false,
                             error = listOfNotNull(
                                 error.readable(),
                                 SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
@@ -1101,30 +1254,55 @@ class PureViewModel(
     }
 
     fun login(username: String, password: String) {
+        cancelSourceRefreshForForeground()
+        favoriteFolderRequestGeneration.incrementAndGet()
+        favoriteFolderJob?.cancel()
         accountJob?.cancel()
         accountJob = viewModelScope.launch {
-            _state.update { it.copy(account = JmAccountUiState(status = JmAccountStatus.SigningIn)) }
+            _state.update {
+                it.copy(
+                    account = JmAccountUiState(status = JmAccountStatus.SigningIn),
+                    favoriteFolders = JmFavoriteFoldersUiState(
+                        items = it.favorites,
+                        total = it.favorites.size.toLong(),
+                    ),
+                )
+            }
             try {
                 val account = gateway.login(username, password)
                 val session = gateway.session() ?: throw JmAuthException("JM 登录未返回有效会话")
                 saveStoredSession(session)
+                val mutationRevision = favoriteMutationRevision.get()
                 val syncError = try {
-                    val favorites = gateway.allFavorites()
-                    publishOfficialAccount(account, favorites)
+                    val favorites = gateway.favoriteCollection { partial ->
+                        publishOfficialAccount(
+                            account = account,
+                            favorites = partial,
+                            expectedMutationRevision = mutationRevision,
+                            mergeWithCached = true,
+                        )
+                    }
+                    publishOfficialAccount(
+                        account = account,
+                        favorites = favorites,
+                        expectedMutationRevision = mutationRevision,
+                    )
                     null
                 } catch (error: Throwable) {
                     error.rethrowCancellation()
                     if (error is JmAuthException) throw error
-                    _state.update { state ->
-                        state.copy(
-                            account = JmAccountUiState(
-                                status = JmAccountStatus.SignedIn,
-                                uid = account.uid,
-                                username = account.username,
-                                favoriteCount = account.favoriteCount,
-                                error = "收藏同步失败：${error.readable()}",
-                            ),
-                        )
+                    if (mutationRevision == favoriteMutationRevision.get()) {
+                        _state.update { state ->
+                            state.copy(
+                                account = JmAccountUiState(
+                                    status = JmAccountStatus.SignedIn,
+                                    uid = account.uid,
+                                    username = account.username,
+                                    favoriteCount = account.favoriteCount,
+                                    error = "收藏同步失败：${error.readable()}",
+                                ),
+                            )
+                        }
                     }
                     error.readable()
                 }
@@ -1141,9 +1319,11 @@ class PureViewModel(
                         )
                     }
                 }
-                _state.update {
-                    it.copy(
-                        message = if (!sessionPersisted) {
+                _state.update { state ->
+                    state.copy(
+                        message = if (mutationRevision != favoriteMutationRevision.get()) {
+                            state.message
+                        } else if (!sessionPersisted) {
                             "JM 登录成功，但登录状态无法写入本机"
                         } else if (syncError == null) {
                             "已登录 JM 官方账号 ${account.username}"
@@ -1168,6 +1348,8 @@ class PureViewModel(
 
     fun logout() {
         favoriteOperationGeneration.incrementAndGet()
+        favoriteFolderRequestGeneration.incrementAndGet()
+        favoriteFolderJob?.cancel()
         _state.update { it.copy(favoritePendingKeys = emptySet()) }
         accountJob?.cancel()
         accountJob = viewModelScope.launch {
@@ -1179,6 +1361,10 @@ class PureViewModel(
                 it.copy(
                     account = JmAccountUiState(),
                     favorites = cachedFavorites,
+                    favoriteFolders = JmFavoriteFoldersUiState(
+                        items = cachedFavorites,
+                        total = cachedFavorites.size.toLong(),
+                    ),
                     message = "已退出 JM 官方账号",
                 )
             }
@@ -1191,43 +1377,52 @@ class PureViewModel(
             if (!current.signedIn) _state.update { it.copy(message = "请先登录 JM 官方账号") }
             return
         }
+        cancelSourceRefreshForForeground()
         val operationGeneration = favoriteOperationGeneration.get()
         accountJob?.cancel()
         accountJob = viewModelScope.launch {
             _state.update { state -> state.copy(account = state.account.copy(syncing = true, error = null)) }
+            val mutationRevision = favoriteMutationRevision.get()
             try {
-                favoriteOperationLimiter.withPermit {
-                    if (
-                        operationGeneration != favoriteOperationGeneration.get() ||
-                        !_state.value.account.signedIn
-                    ) return@withPermit
-                    val favorites = gateway.allFavorites()
-                    if (operationGeneration != favoriteOperationGeneration.get()) return@withPermit
-                    val sessionPersisted = saveLatestGatewaySession()
+                if (
+                    operationGeneration != favoriteOperationGeneration.get() ||
+                    !_state.value.account.signedIn
+                ) return@launch
+                val account = JmAccount(uid = current.uid, username = current.username)
+                val favorites = gateway.favoriteCollection { partial ->
+                    if (operationGeneration != favoriteOperationGeneration.get()) return@favoriteCollection
                     publishOfficialAccount(
-                        JmAccount(uid = current.uid, username = current.username),
-                        favorites,
+                        account = account,
+                        favorites = partial,
+                        expectedMutationRevision = mutationRevision,
+                        mergeWithCached = true,
+                        syncing = true,
                     )
-                    if (!sessionPersisted) {
-                        _state.update { state ->
-                            state.copy(account = state.account.copy(error = SESSION_PERSISTENCE_ERROR))
-                        }
+                }
+                if (operationGeneration != favoriteOperationGeneration.get()) return@launch
+                val sessionPersisted = saveLatestGatewaySession()
+                val published = publishOfficialAccount(
+                    account = account,
+                    favorites = favorites,
+                    expectedMutationRevision = mutationRevision,
+                )
+                if (published && !sessionPersisted) {
+                    _state.update { state ->
+                        state.copy(account = state.account.copy(error = SESSION_PERSISTENCE_ERROR))
                     }
-                    _state.update { it.copy(message = "JM 官方收藏已同步") }
+                }
+                _state.update { state ->
+                    state.copy(
+                        account = state.account.copy(syncing = false),
+                        message = if (published) "JM 官方收藏已同步" else state.message,
+                    )
                 }
             } catch (error: Throwable) {
                 error.rethrowCancellation()
                 if (error is JmAuthException) {
-                    favoriteOperationGeneration.incrementAndGet()
-                    gateway.clearSession()
-                    clearStoredSession()
-                    _state.update {
-                        it.copy(
-                            account = JmAccountUiState(status = JmAccountStatus.Error, error = error.readable()),
-                            favoritePendingKeys = emptySet(),
-                            message = "JM 登录已失效，请重新登录",
-                        )
-                    }
+                    invalidateFavoriteFolderSession(error)
+                } else if (mutationRevision != favoriteMutationRevision.get()) {
+                    _state.update { state -> state.copy(account = state.account.copy(syncing = false)) }
                 } else {
                     val sessionPersisted = saveLatestGatewaySession()
                     _state.update { state ->
@@ -1247,21 +1442,361 @@ class PureViewModel(
         }
     }
 
-    private suspend fun publishOfficialAccount(account: JmAccount, favorites: List<JmFavoriteItem>) {
-        val items = mapFavoriteItems(favorites)
-        _state.update {
-            it.copy(
+    fun selectFavoriteFolder(folderId: String, force: Boolean = false) {
+        val safeFolderId = folderId.trim()
+        val current = _state.value
+        if (!current.account.signedIn) {
+            _state.update { it.copy(message = "请先登录 JM 官方账号") }
+            return
+        }
+        if (!safeFolderId.matches(SAFE_JM_ID) || current.favoriteFolders.folders.none { it.id == safeFolderId }) return
+        if (safeFolderId == "0") {
+            favoriteFolderRequestGeneration.incrementAndGet()
+            favoriteFolderJob?.cancel()
+            _state.update { state ->
+                state.copy(
+                    favoriteFolders = state.favoriteFolders.copy(
+                        selectedFolderId = "0",
+                        items = state.favorites,
+                        total = state.account.favoriteCount ?: state.favorites.size.toLong(),
+                        loading = false,
+                        error = null,
+                    ),
+                )
+            }
+            return
+        }
+        cancelSourceRefreshForForeground()
+        if (
+            !force && current.favoriteFolders.selectedFolderId == safeFolderId &&
+            !current.favoriteFolders.loading && current.favoriteFolders.error == null
+        ) return
+
+        val requestGeneration = favoriteFolderRequestGeneration.incrementAndGet()
+        favoriteFolderJob?.cancel()
+        _state.update { state ->
+            state.copy(
+                favoriteFolders = state.favoriteFolders.copy(
+                    selectedFolderId = safeFolderId,
+                    items = if (state.favoriteFolders.selectedFolderId == safeFolderId) state.favoriteFolders.items else emptyList(),
+                    total = if (state.favoriteFolders.selectedFolderId == safeFolderId) state.favoriteFolders.total else 0L,
+                    loading = true,
+                    error = null,
+                ),
+            )
+        }
+        favoriteFolderJob = viewModelScope.launch {
+            val mutationRevision = favoriteMutationRevision.get()
+            try {
+                suspend fun publishFolder(collection: JmFavoriteCollection): Boolean {
+                    val items = mapFavoriteItems(collection.items)
+                    val fetchedFolders = collection.folders.toFavoriteFolderUiItems()
+                    var published = false
+                    if (requestGeneration != favoriteFolderRequestGeneration.get()) return false
+                    _state.update { state ->
+                        if (
+                            requestGeneration != favoriteFolderRequestGeneration.get() ||
+                            mutationRevision != favoriteMutationRevision.get() ||
+                            state.favoriteFolders.selectedFolderId != safeFolderId
+                        ) return@update state
+                        published = true
+                        state.copy(
+                            favoriteFolders = state.favoriteFolders.copy(
+                                folders = fetchedFolders.takeIf { folders -> folders.any { it.id == safeFolderId } }
+                                    ?: state.favoriteFolders.folders,
+                                items = items,
+                                total = collection.total,
+                                loading = false,
+                                error = null,
+                            ),
+                        )
+                    }
+                    return published
+                }
+
+                val collection = gateway.favoriteCollection(folderId = safeFolderId) { partial ->
+                    publishFolder(partial)
+                }
+                val sessionPersisted = saveLatestGatewaySession()
+                if (requestGeneration != favoriteFolderRequestGeneration.get()) return@launch
+                val published = publishFolder(collection)
+                _state.update { state ->
+                    if (state.favoriteFolders.selectedFolderId != safeFolderId) return@update state
+                    state.copy(
+                        account = state.account.copy(
+                            error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted || !published },
+                        ),
+                        favoriteFolders = state.favoriteFolders.copy(loading = false),
+                    )
+                }
+            } catch (error: Throwable) {
+                error.rethrowCancellation()
+                if (error is JmAuthException) {
+                    invalidateFavoriteFolderSession(error)
+                } else if (mutationRevision != favoriteMutationRevision.get()) {
+                    _state.update { state ->
+                        if (state.favoriteFolders.selectedFolderId != safeFolderId) return@update state
+                        state.copy(favoriteFolders = state.favoriteFolders.copy(loading = false))
+                    }
+                } else if (requestGeneration == favoriteFolderRequestGeneration.get()) {
+                    val sessionPersisted = saveLatestGatewaySession()
+                    _state.update { state ->
+                        if (state.favoriteFolders.selectedFolderId != safeFolderId) return@update state
+                        state.copy(
+                            account = state.account.copy(
+                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                            ),
+                            favoriteFolders = state.favoriteFolders.copy(
+                                loading = false,
+                                error = "收藏夹读取失败：${error.readable()}",
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun retryFavoriteFolder() {
+        selectFavoriteFolder(_state.value.favoriteFolders.selectedFolderId, force = true)
+    }
+
+    fun createFavoriteFolder(name: String) {
+        val safeName = name.trim()
+        val current = _state.value
+        if (!current.account.signedIn) {
+            _state.update { it.copy(message = "请先登录 JM 官方账号") }
+            return
+        }
+        if (current.favoriteFolders.creating) return
+        if (safeName.isBlank()) {
+            _state.update { it.copy(message = "收藏夹名称不能为空") }
+            return
+        }
+        if (safeName.length > MAX_FAVORITE_FOLDER_NAME_LENGTH) {
+            _state.update { it.copy(message = "收藏夹名称不能超过 $MAX_FAVORITE_FOLDER_NAME_LENGTH 个字符") }
+            return
+        }
+
+        val operationGeneration = favoriteOperationGeneration.get()
+        favoriteMutationRevision.incrementAndGet()
+        val knownFolderIds = current.favoriteFolders.folders.mapTo(hashSetOf(), JmFavoriteFolderUiItem::id)
+        _state.update { state ->
+            state.copy(favoriteFolders = state.favoriteFolders.copy(creating = true, error = null))
+        }
+        viewModelScope.launch {
+            try {
+                favoriteOperationLimiter.withPermit {
+                    if (
+                        operationGeneration != favoriteOperationGeneration.get() ||
+                        !_state.value.account.signedIn
+                    ) return@withPermit
+                    gateway.createFavoriteFolder(safeName)
+                    val refreshed = gateway.favoritePage(page = 1, folderId = "0")
+                    if (operationGeneration != favoriteOperationGeneration.get()) return@withPermit
+                    val parsedFolders = refreshed.folders.toFavoriteFolderUiItems()
+                    val folders = parsedFolders.takeIf { it.size > 1 || _state.value.favoriteFolders.folders.size <= 1 }
+                        ?: _state.value.favoriteFolders.folders
+                    val createdFolder = folders.firstOrNull { it.id !in knownFolderIds }
+                    val sessionPersisted = saveLatestGatewaySession()
+                    _state.update { state ->
+                        state.copy(
+                            account = state.account.copy(
+                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                            ),
+                            favoriteFolders = state.favoriteFolders.copy(
+                                folders = folders,
+                                creating = false,
+                                error = null,
+                            ),
+                            message = createdFolder?.let { "已创建收藏夹「${it.name}」" }
+                                ?: "收藏夹已创建",
+                        )
+                    }
+                }
+            } catch (error: Throwable) {
+                error.rethrowCancellation()
+                if (error is JmAuthException) {
+                    invalidateFavoriteFolderSession(error)
+                } else {
+                    val sessionPersisted = saveLatestGatewaySession()
+                    _state.update { state ->
+                        state.copy(
+                            account = state.account.copy(
+                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                            ),
+                            favoriteFolders = state.favoriteFolders.copy(creating = false),
+                            message = "创建收藏夹失败：${error.readable()}",
+                        )
+                    }
+                }
+            } finally {
+                favoriteMutationRevision.incrementAndGet()
+                _state.update { state ->
+                    state.copy(favoriteFolders = state.favoriteFolders.copy(creating = false))
+                }
+            }
+        }
+    }
+
+    fun moveFavoriteToFolder(item: ComicUiItem, folderId: String) {
+        val targetFolderId = folderId.trim()
+        val current = _state.value
+        val targetFolder = current.favoriteFolders.folders.firstOrNull { it.id == targetFolderId }
+        if (!current.account.signedIn) {
+            _state.update { it.copy(message = "请先登录 JM 官方账号") }
+            return
+        }
+        if (
+            !item.jmId.matches(SAFE_JM_ID) || targetFolderId == "0" || targetFolder == null ||
+            targetFolderId == current.favoriteFolders.selectedFolderId || current.favoriteFolders.movingKey != null
+        ) return
+
+        val operationGeneration = favoriteOperationGeneration.get()
+        favoriteMutationRevision.incrementAndGet()
+        val sourceFolderId = current.favoriteFolders.selectedFolderId
+        _state.update { state ->
+            state.copy(favoriteFolders = state.favoriteFolders.copy(movingKey = item.key, error = null))
+        }
+        viewModelScope.launch {
+            try {
+                favoriteOperationLimiter.withPermit {
+                    if (
+                        operationGeneration != favoriteOperationGeneration.get() ||
+                        !_state.value.account.signedIn
+                    ) return@withPermit
+                    gateway.moveFavoriteToFolder(item.jmId, targetFolderId)
+                    if (operationGeneration != favoriteOperationGeneration.get()) return@withPermit
+                    val sessionPersisted = saveLatestGatewaySession()
+                    _state.update { state ->
+                        val stillShowingSource = state.favoriteFolders.selectedFolderId == sourceFolderId
+                        val sourceItems = if (stillShowingSource && sourceFolderId != "0") {
+                            state.favoriteFolders.items.filterNot { it.key == item.key }
+                        } else {
+                            state.favoriteFolders.items
+                        }
+                        val sourceTotal = if (
+                            stillShowingSource && sourceFolderId != "0" &&
+                            state.favoriteFolders.items.any { it.key == item.key }
+                        ) {
+                            (state.favoriteFolders.total - 1L).coerceAtLeast(0L)
+                        } else {
+                            state.favoriteFolders.total
+                        }
+                        state.copy(
+                            account = state.account.copy(
+                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                            ),
+                            favoriteFolders = state.favoriteFolders.copy(
+                                items = sourceItems,
+                                total = sourceTotal,
+                                movingKey = null,
+                                error = null,
+                            ),
+                            message = "已移动到「${targetFolder.name}」",
+                        )
+                    }
+                }
+            } catch (error: Throwable) {
+                error.rethrowCancellation()
+                if (error is JmAuthException) {
+                    invalidateFavoriteFolderSession(error)
+                } else {
+                    val sessionPersisted = saveLatestGatewaySession()
+                    _state.update { state ->
+                        state.copy(
+                            account = state.account.copy(
+                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                            ),
+                            favoriteFolders = state.favoriteFolders.copy(movingKey = null),
+                            message = "移动收藏失败：${error.readable()}",
+                        )
+                    }
+                }
+            } finally {
+                favoriteMutationRevision.incrementAndGet()
+                _state.update { state ->
+                    state.copy(favoriteFolders = state.favoriteFolders.copy(movingKey = null))
+                }
+            }
+        }
+    }
+
+    private suspend fun invalidateFavoriteFolderSession(error: JmAuthException) {
+        favoriteOperationGeneration.incrementAndGet()
+        favoriteFolderRequestGeneration.incrementAndGet()
+        gateway.clearSession()
+        clearStoredSession()
+        _state.update { state ->
+            state.copy(
+                account = JmAccountUiState(status = JmAccountStatus.Error, error = error.readable()),
+                favoriteFolders = JmFavoriteFoldersUiState(
+                    items = state.favorites,
+                    total = state.favorites.size.toLong(),
+                ),
+                favoritePendingKeys = emptySet(),
+                message = "JM 登录已失效，请重新登录",
+            )
+        }
+    }
+
+    private suspend fun publishOfficialAccount(
+        account: JmAccount,
+        favorites: JmFavoriteCollection,
+        expectedMutationRevision: Long? = null,
+        mergeWithCached: Boolean = false,
+        syncing: Boolean = false,
+    ): Boolean {
+        val fetchedItems = mapFavoriteItems(favorites.items)
+        val fetchedFolders = favorites.folders.toFavoriteFolderUiItems()
+        var published = false
+        _state.update { state ->
+            if (
+                expectedMutationRevision != null &&
+                expectedMutationRevision != favoriteMutationRevision.get()
+            ) return@update state
+            val items = if (mergeWithCached) {
+                (fetchedItems + state.favorites)
+                    .distinctBy(ComicUiItem::key)
+                    .take(MAX_FAVORITE_ENTRIES)
+            } else {
+                fetchedItems
+            }
+            val folders = fetchedFolders.takeIf { it.size > 1 || state.favoriteFolders.folders.size <= 1 }
+                ?: state.favoriteFolders.folders
+            val selectedFolderId = state.favoriteFolders.selectedFolderId
+                .takeIf { selected -> folders.any { it.id == selected } }
+                ?: "0"
+            val favoriteKeys = items.mapTo(hashSetOf(), ComicUiItem::key)
+            published = true
+            state.copy(
                 account = JmAccountUiState(
                     status = JmAccountStatus.SignedIn,
                     uid = account.uid,
                     username = account.username,
-                    favoriteCount = account.favoriteCount ?: items.size.toLong(),
+                    favoriteCount = account.favoriteCount ?: favorites.total,
                     error = null,
+                    syncing = syncing,
                 ),
                 favorites = items,
+                favoriteFolders = state.favoriteFolders.copy(
+                    folders = folders,
+                    selectedFolderId = selectedFolderId,
+                    items = if (selectedFolderId == "0") {
+                        items
+                    } else if (mergeWithCached) {
+                        state.favoriteFolders.items
+                    } else {
+                        state.favoriteFolders.items.filter { it.key in favoriteKeys }
+                    },
+                    total = if (selectedFolderId == "0") favorites.total else state.favoriteFolders.total,
+                    loading = false,
+                    error = null,
+                ),
             )
         }
-        persistFavoritesSnapshot()
+        if (published && !mergeWithCached) persistFavoritesSnapshot()
+        return published
     }
 
     /** Toggle a comic through JM's authenticated /favorite endpoint. */
@@ -1273,31 +1808,41 @@ class PureViewModel(
         val id = item.jmId.trim()
         if (!id.matches(SAFE_JM_ID) || !favoriteOperations.add(id)) return
         val operationGeneration = favoriteOperationGeneration.get()
+        val mutation = favoriteMutationSnapshot(_state.value.favorites, item)
+        favoriteMutationRevision.incrementAndGet()
         _state.update { state ->
             state.copy(favoritePendingKeys = state.favoritePendingKeys + item.key)
         }
+        applyOptimisticFavoriteMutation(item, mutation, operationGeneration)
         viewModelScope.launch {
-            var mutation: FavoriteMutationSnapshot? = null
             try {
                 favoriteOperationLimiter.withPermit {
                     if (
                         operationGeneration != favoriteOperationGeneration.get() ||
                         !_state.value.account.signedIn
                     ) return@withPermit
-                    val activeMutation = favoriteMutationSnapshot(_state.value.favorites, item)
-                    mutation = activeMutation
-                    applyOptimisticFavoriteMutation(item, activeMutation, operationGeneration)
                     try {
                         gateway.toggleFavorite(id)
                         if (operationGeneration != favoriteOperationGeneration.get()) return@withPermit
                         val sessionPersisted = saveLatestGatewaySession()
                         _state.update { state ->
                             if (operationGeneration != favoriteOperationGeneration.get()) return@update state
+                            val removeFromSelectedFolder = mutation.wasFavorite &&
+                                state.favoriteFolders.selectedFolderId != "0" &&
+                                state.favoriteFolders.items.any { it.key == item.key }
                             state.copy(
                                 account = state.account.copy(
                                     error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
                                 ),
-                                message = if (activeMutation.wasFavorite) {
+                                favoriteFolders = if (removeFromSelectedFolder) {
+                                    state.favoriteFolders.copy(
+                                        items = state.favoriteFolders.items.filterNot { it.key == item.key },
+                                        total = (state.favoriteFolders.total - 1L).coerceAtLeast(0L),
+                                    )
+                                } else {
+                                    state.favoriteFolders
+                                },
+                                message = if (mutation.wasFavorite) {
                                     "已取消 JM 收藏"
                                 } else {
                                     "已加入 JM 收藏"
@@ -1309,7 +1854,7 @@ class PureViewModel(
                         error.rethrowCancellation()
                         if (error is JmAuthException) throw error
                         val official = try {
-                            gateway.allFavorites()
+                            gateway.favoriteCollection()
                         } catch (reconcileError: Throwable) {
                             reconcileError.rethrowCancellation()
                             if (reconcileError is JmAuthException) throw reconcileError
@@ -1322,7 +1867,7 @@ class PureViewModel(
                                 official,
                             )
                             val sessionPersisted = saveLatestGatewaySession()
-                            val isOfficiallyFavorite = official.any { it.id == id }
+                            val isOfficiallyFavorite = official.items.any { it.id == id }
                             _state.update { state ->
                                 if (operationGeneration != favoriteOperationGeneration.get()) return@update state
                                 state.copy(
@@ -1357,18 +1902,10 @@ class PureViewModel(
                     rollbackFavoriteMutation(item, mutation, operationGeneration)
                     throw error
                 }
+                error.rethrowCancellation()
                 if (error is JmAuthException) {
                     rollbackFavoriteMutation(item, mutation, operationGeneration)
-                    favoriteOperationGeneration.incrementAndGet()
-                    gateway.clearSession()
-                    clearStoredSession()
-                    _state.update {
-                        it.copy(
-                            account = JmAccountUiState(status = JmAccountStatus.Error, error = error.readable()),
-                            favoritePendingKeys = emptySet(),
-                            message = "JM 登录已失效，请重新登录",
-                        )
-                    }
+                    invalidateFavoriteFolderSession(error)
                 } else {
                     rollbackFavoriteMutation(item, mutation, operationGeneration)
                     val sessionPersisted = saveLatestGatewaySession()
@@ -1384,6 +1921,7 @@ class PureViewModel(
                     persistFavoritesSnapshot()
                 }
             } finally {
+                favoriteMutationRevision.incrementAndGet()
                 favoriteOperations.remove(id)
                 _state.update { state ->
                     state.copy(favoritePendingKeys = state.favoritePendingKeys - item.key)
@@ -1407,20 +1945,29 @@ class PureViewModel(
                 shouldBeFavorite = shouldBeFavorite,
                 maxEntries = MAX_FAVORITE_ENTRIES,
             )
+            val nextFavoriteCount = if (currentlyFavorite == shouldBeFavorite) {
+                state.account.favoriteCount
+            } else {
+                adjustedFavoriteCount(
+                    currentCount = state.account.favoriteCount,
+                    loadedCount = state.favorites.size,
+                    adding = shouldBeFavorite,
+                )
+            }
             state.copy(
                 favorites = next,
                 account = state.account.copy(
-                    favoriteCount = if (currentlyFavorite == shouldBeFavorite) {
-                        state.account.favoriteCount
-                    } else {
-                        adjustedFavoriteCount(
-                            currentCount = state.account.favoriteCount,
-                            loadedCount = state.favorites.size,
-                            adding = shouldBeFavorite,
-                        )
-                    },
+                    favoriteCount = nextFavoriteCount,
                     error = null,
                 ),
+                favoriteFolders = if (state.favoriteFolders.selectedFolderId == "0") {
+                    state.favoriteFolders.copy(
+                        items = next,
+                        total = nextFavoriteCount ?: next.size.toLong(),
+                    )
+                } else {
+                    state.favoriteFolders
+                },
             )
         }
     }
@@ -1441,19 +1988,28 @@ class PureViewModel(
                 insertionIndex = mutation.originalIndex,
                 maxEntries = MAX_FAVORITE_ENTRIES,
             )
+            val nextFavoriteCount = if (currentlyFavorite == mutation.wasFavorite) {
+                state.account.favoriteCount
+            } else {
+                adjustedFavoriteCount(
+                    currentCount = state.account.favoriteCount,
+                    loadedCount = state.favorites.size,
+                    adding = mutation.wasFavorite,
+                )
+            }
             state.copy(
                 favorites = next,
                 account = state.account.copy(
-                    favoriteCount = if (currentlyFavorite == mutation.wasFavorite) {
-                        state.account.favoriteCount
-                    } else {
-                        adjustedFavoriteCount(
-                            currentCount = state.account.favoriteCount,
-                            loadedCount = state.favorites.size,
-                            adding = mutation.wasFavorite,
-                        )
-                    },
+                    favoriteCount = nextFavoriteCount,
                 ),
+                favoriteFolders = if (state.favoriteFolders.selectedFolderId == "0") {
+                    state.favoriteFolders.copy(
+                        items = next,
+                        total = nextFavoriteCount ?: next.size.toLong(),
+                    )
+                } else {
+                    state.favoriteFolders
+                },
             )
         }
     }
@@ -1465,12 +2021,11 @@ class PureViewModel(
     private fun persistFavoritesSnapshot() {
         val generation = favoritesPersistGeneration.incrementAndGet()
         val snapshot = _state.value.favorites
-        viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                libraryWriteLock.withLock {
-                    if (generation != favoritesPersistGeneration.get()) return@withLock
-                    libraryStore.replaceFavorites(snapshot)
-                }
+        persistenceScope.launch {
+            persistBestEffort {
+                if (generation != favoritesPersistGeneration.get()) return@persistBestEffort
+                libraryStore.replaceFavorites(snapshot)
+                persistedFavoritesGeneration = generation
             }
         }
     }
@@ -1525,15 +2080,30 @@ class PureViewModel(
     }
 
     private fun persistHistorySnapshot() {
-        val generation = historyPersistGeneration.incrementAndGet()
-        val snapshot = _state.value.history
-        historySaveJob?.cancel()
-        historySaveJob = viewModelScope.launch {
-            delay(HISTORY_SAVE_DEBOUNCE_MS)
-            withContext(Dispatchers.IO) {
-                libraryWriteLock.withLock {
-                    if (generation != historyPersistGeneration.get()) return@withLock
-                    libraryStore.replaceHistory(snapshot)
+        val historyGeneration = historyPersistGeneration.incrementAndGet()
+        val historySnapshot = _state.value.history
+        val progressGeneration = progressPersistGeneration.get()
+        val progressSnapshot = latestProgressSnapshot
+        readerStateSaveJob?.cancel()
+        readerStateSaveJob = persistenceScope.launch {
+            persistBestEffort {
+                delay(LOCAL_STATE_SAVE_DEBOUNCE_MS)
+                if (historyGeneration == historyPersistGeneration.get()) {
+                    libraryStore.replaceHistory(historySnapshot)
+                    persistedHistoryGeneration = historyGeneration
+                }
+                if (
+                    progressSnapshot != null &&
+                    progressGeneration > persistedProgressGeneration &&
+                    progressGeneration == progressPersistGeneration.get()
+                ) {
+                    settingsStore.saveProgress(
+                        comicId = progressSnapshot.comicId,
+                        chapterId = progressSnapshot.chapterId,
+                        pageIndex = progressSnapshot.pageIndex,
+                        pageCount = progressSnapshot.pageCount,
+                    )
+                    persistedProgressGeneration = progressGeneration
                 }
             }
         }
@@ -1542,11 +2112,13 @@ class PureViewModel(
     fun dismissDetail() {
         detailRequestGeneration.incrementAndGet()
         commentsRequestGeneration.incrementAndGet()
+        favoriteFolderRequestGeneration.incrementAndGet()
         readerRequestGeneration.incrementAndGet()
         detailJob?.cancel()
         commentsJob?.cancel()
         readerJob?.cancel()
         readerWarmupJob?.cancel()
+        readerBufferRefillJob?.cancel()
         chapterPreloader.cancelAll()
         readerWarmupChapterId = null
         _state.update {
@@ -1579,16 +2151,71 @@ class PureViewModel(
                     val pageIndex = resumeProgress?.pageIndex
                         ?.coerceIn(0, chapterPages.pages.lastIndex.coerceAtLeast(0))
                         ?: 0
-                    val warmupCount = if (settings.readerTurboMode) 3 else 2
-                    readerEntryWarmupIndices(pageIndex, chapterPages.pages.size, warmupCount).forEach { index ->
-                        if (detailGeneration != detailRequestGeneration.get()) return@forEach
-                        val page = chapterPages.pages.getOrNull(index) ?: return@forEach
-                        runCatching {
-                            gateway.prefetchPage(page, settings.readerImageQuality, settings.readerTurboMode)
-                        }.onFailure { error -> error.rethrowCancellation() }
+                    chapterPreloader.schedule(chapter.id, chapterPages.pages, pageIndex)
+                    val warmupCount = when {
+                        settings.readerPrefetchMode == ReaderPrefetchMode.UltraAggressive -> 4
+                        settings.readerTurboMode -> 3
+                        else -> 2
                     }
+                    warmReaderPages(chapterPages.pages, pageIndex, warmupCount, settings)
                 }
                 .onFailure { error -> error.rethrowCancellation() }
+        }
+    }
+
+    private suspend fun warmReaderPages(
+        pages: List<JmPage>,
+        startPageIndex: Int,
+        pageBudget: Int,
+        settings: AppSettings,
+    ) {
+        readerEntryWarmupIndices(startPageIndex, pages.size, pageBudget)
+            .chunked(READER_WARMUP_CONCURRENCY)
+            .forEach { batch ->
+                coroutineScope {
+                    batch.map { index ->
+                        async(Dispatchers.IO) {
+                            val page = pages.getOrNull(index) ?: return@async
+                            runCatchingNonFatal {
+                                gateway.prefetchPage(
+                                    page,
+                                    settings.readerImageQuality,
+                                    settings.readerTurboMode,
+                                )
+                            }.onFailure { error -> error.rethrowCancellation() }
+                        }
+                    }.awaitAll()
+                }
+            }
+    }
+
+    private fun refillUltraReaderBuffer() {
+        readerBufferRefillJob?.cancel()
+        val snapshot = _state.value
+        val reader = snapshot.reader as? ReaderUiState.Ready ?: return
+        val settings = snapshot.settings
+        if (
+            !appInForeground.get() ||
+            settings.dataSaver ||
+            settings.readerPrefetchMode != ReaderPrefetchMode.UltraAggressive
+        ) return
+        readerBufferRefillJob = viewModelScope.launch {
+            val pages = withContext(Dispatchers.Default) {
+                reader.pages.map(DirectReaderPage::toJmPage)
+            }
+            val latestReader = _state.value.reader as? ReaderUiState.Ready ?: return@launch
+            if (latestReader.chapterId != reader.chapterId) return@launch
+            val startPageIndex = latestProgressSnapshot
+                ?.takeIf { it.comicId == reader.sourceId && it.chapterId == reader.chapterId }
+                ?.pageIndex
+                ?: reader.initialPageIndex
+            chapterPreloader.schedule(reader.chapterId, pages, startPageIndex)
+            warmReaderPages(
+                pages = pages,
+                startPageIndex = startPageIndex,
+                pageBudget = ULTRA_READER_ENTRY_READY_PAGES,
+                settings = settings,
+            )
         }
     }
 
@@ -1611,8 +2238,10 @@ class PureViewModel(
         initialPageIndex: Int,
         preserveCurrent: Boolean,
     ) {
+        cancelSourceRefreshForForeground()
         val requestGeneration = readerRequestGeneration.incrementAndGet()
-        chapterPreloader.cancelAll()
+        readerBufferRefillJob?.cancel()
+        chapterPreloader.cancelExcept(chapter.sourceChapterId)
         // Keep a same-chapter metadata request alive so the reader can reuse its
         // result. Only unrelated speculative work is cancelled; same-page image
         // work is already foreground-preemptible inside the gateway.
@@ -1674,22 +2303,36 @@ class PureViewModel(
                         startPageIndex = initialPageIndex,
                     )
                     val warmupSettings = _state.value.settings
-                    val warmupPage = chapterPages.pages.getOrNull(
-                        initialPageIndex.coerceIn(0, chapterPages.pages.lastIndex.coerceAtLeast(0)),
-                    )
-                    if (!warmupSettings.dataSaver && warmupPage != null) {
-                        // Start the first image as soon as chapter metadata is ready. The reader
-                        // composable will join the same gateway request instead of waiting for its
-                        // first frame to create the network work.
-                        launch(Dispatchers.IO) {
-                            if (requestGeneration != readerRequestGeneration.get()) return@launch
-                            runCatching {
-                                gateway.prefetchPage(
-                                    warmupPage,
-                                    warmupSettings.readerImageQuality,
-                                    warmupSettings.readerTurboMode,
-                                )
-                            }.onFailure { error -> error.rethrowCancellation() }
+                    if (
+                        !warmupSettings.dataSaver &&
+                        warmupSettings.readerPrefetchMode == ReaderPrefetchMode.UltraAggressive
+                    ) {
+                        // Ultra mode deliberately keeps the preparation screen until a small
+                        // decoded runway exists. Once content is shown, continuous scrolling can
+                        // refill the larger forward window without exposing per-page skeletons.
+                        warmReaderPages(
+                            pages = chapterPages.pages,
+                            startPageIndex = initialPageIndex,
+                            pageBudget = ULTRA_READER_ENTRY_READY_PAGES,
+                            settings = warmupSettings,
+                        )
+                    } else {
+                        val warmupPage = chapterPages.pages.getOrNull(
+                            initialPageIndex.coerceIn(0, chapterPages.pages.lastIndex.coerceAtLeast(0)),
+                        )
+                        if (!warmupSettings.dataSaver && warmupPage != null) {
+                            // Start the first image as soon as chapter metadata is ready. The
+                            // reader joins this request instead of waiting for its first frame.
+                            launch(Dispatchers.IO) {
+                                if (requestGeneration != readerRequestGeneration.get()) return@launch
+                                runCatchingNonFatal {
+                                    gateway.prefetchPage(
+                                        warmupPage,
+                                        warmupSettings.readerImageQuality,
+                                        warmupSettings.readerTurboMode,
+                                    )
+                                }.onFailure { error -> error.rethrowCancellation() }
+                            }
                         }
                     }
                     _state.update { state ->
@@ -1740,8 +2383,21 @@ class PureViewModel(
         val current = _state.value.reader
         when (current) {
             is ReaderUiState.Ready -> {
-                val resume = settingsStore.loadChapterProgress(current.sourceId, chapter.sourceChapterId)?.pageIndex ?: 0
-                openReader(current.sourceId, current.title, chapter, current.chapters, resume, preserveCurrent = true)
+                val selectionGeneration = readerRequestGeneration.incrementAndGet()
+                viewModelScope.launch {
+                    val resume = try {
+                        withContext(Dispatchers.IO) {
+                            settingsStore.loadChapterProgress(current.sourceId, chapter.sourceChapterId)?.pageIndex ?: 0
+                        }
+                    } catch (error: Throwable) {
+                        error.rethrowCancellation()
+                        0
+                    }
+                    if (selectionGeneration != readerRequestGeneration.get()) return@launch
+                    val latest = _state.value.reader as? ReaderUiState.Ready ?: return@launch
+                    if (latest.sourceId != current.sourceId || latest.title != current.title) return@launch
+                    openReader(current.sourceId, current.title, chapter, current.chapters, resume, preserveCurrent = true)
+                }
             }
             is ReaderUiState.Error -> openReader(current.sourceId, current.title, chapter, current.chapters, 0, preserveCurrent = false)
             else -> Unit
@@ -1780,6 +2436,7 @@ class PureViewModel(
     fun closeReader() {
         readerRequestGeneration.incrementAndGet()
         readerJob?.cancel()
+        readerBufferRefillJob?.cancel()
         chapterPreloader.cancelAll()
         _state.update { it.copy(reader = ReaderUiState.Idle) }
     }
@@ -1792,6 +2449,7 @@ class PureViewModel(
         onAspectRatio = onAspectRatio,
     )
     suspend fun prefetchReaderPage(page: DirectReaderPage) {
+        if (!appInForeground.get()) return
         val settings = _state.value.settings
         gateway.prefetchPage(page.toJmPage(), settings.readerImageQuality, settings.readerTurboMode)
     }
@@ -1836,22 +2494,9 @@ class PureViewModel(
         val signature = "$comicId|$chapterId|$safePageIndex|$pageCount"
         if (signature == lastProgressSignature) return
         lastProgressSignature = signature
-        val generation = progressPersistGeneration.incrementAndGet()
+        progressPersistGeneration.incrementAndGet()
         val snapshot = ReaderProgressSnapshot(comicId, chapterId, safePageIndex, pageCount)
         latestProgressSnapshot = snapshot
-        viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                progressWriteLock.withLock {
-                    if (generation != progressPersistGeneration.get()) return@withLock
-                    settingsStore.saveProgress(
-                        comicId = snapshot.comicId,
-                        chapterId = snapshot.chapterId,
-                        pageIndex = snapshot.pageIndex,
-                        pageCount = snapshot.pageCount,
-                    )
-                }
-            }
-        }
     }
 
     fun updateSettings(settings: AppSettings) {
@@ -1885,9 +2530,15 @@ class PureViewModel(
             )
         }
         settingsSaveJob?.cancel()
-        settingsSaveJob = viewModelScope.launch {
-            delay(250)
-            settingsStore.save(_state.value.settings)
+        val settingsGeneration = settingsPersistGeneration.incrementAndGet()
+        settingsSaveJob = persistenceScope.launch {
+            persistBestEffort {
+                delay(SETTINGS_SAVE_DEBOUNCE_MS)
+                if (settingsGeneration == settingsPersistGeneration.get()) {
+                    settingsStore.save(_state.value.settings)
+                    persistedSettingsGeneration = settingsGeneration
+                }
+            }
         }
         if (normalized.autoSelectSource != previous.autoSelectSource ||
             normalized.preferredSourceHost != previous.preferredSourceHost ||
@@ -1899,18 +2550,15 @@ class PureViewModel(
             )
         }
         if (normalized.readerPrefetchMode != ReaderPrefetchMode.UltraAggressive || normalized.dataSaver) {
+            readerBufferRefillJob?.cancel()
             chapterPreloader.cancelAll()
         } else if (
             previous.readerPrefetchMode != ReaderPrefetchMode.UltraAggressive ||
-            previous.dataSaver
+            previous.dataSaver ||
+            previous.readerImageQuality != normalized.readerImageQuality ||
+            previous.readerTurboMode != normalized.readerTurboMode
         ) {
-            (_state.value.reader as? ReaderUiState.Ready)?.let { reader ->
-                chapterPreloader.schedule(
-                    chapterId = reader.chapterId,
-                    pages = reader.pages.map(DirectReaderPage::toJmPage),
-                    startPageIndex = reader.initialPageIndex,
-                )
-            }
+            refillUltraReaderBuffer()
         }
     }
 
@@ -1943,6 +2591,17 @@ class PureViewModel(
                         state.copy(sourceStatus = state.sourceStatus.copy(checking = false, error = error.readable()))
                     }
                 }
+        }
+    }
+
+    private fun cancelSourceRefreshForForeground() {
+        if (sourceRefreshJob?.isActive != true && !_state.value.sourceStatus.checking) return
+        sourceRefreshRequestGeneration.incrementAndGet()
+        sourceRefreshJob?.cancel()
+        sourceRefreshJob = null
+        _state.update { state ->
+            if (!state.sourceStatus.checking) state
+            else state.copy(sourceStatus = state.sourceStatus.copy(checking = false))
         }
     }
 
@@ -2007,13 +2666,21 @@ class PureViewModel(
     }
 
     fun openDownloaded(item: DownloadedChapter) {
+        cancelSourceRefreshForForeground()
         val requestGeneration = readerRequestGeneration.incrementAndGet()
         readerWarmupJob?.cancel()
+        readerBufferRefillJob?.cancel()
         readerWarmupJob = null
         readerWarmupChapterId = null
         readerJob?.cancel()
         readerJob = viewModelScope.launch {
-            val files = downloadStore.localPages(item)
+            val files = try {
+                downloadStore.localPages(item)
+            } catch (error: Throwable) {
+                error.rethrowCancellation()
+                _state.update { it.copy(message = "无法读取本地章节：${error.readable()}") }
+                return@launch
+            }
             if (requestGeneration != readerRequestGeneration.get()) return@launch
             if (!item.complete || files.size != item.pageCount || files.isEmpty()) {
                 _state.update { state ->
@@ -2023,7 +2690,14 @@ class PureViewModel(
                 return@launch
             }
             val chapter = SourceChapterDto(item.chapterId, 1, item.chapterTitle)
-            val resumePageIndex = settingsStore.loadChapterProgress(item.comicId, item.chapterId)?.pageIndex ?: 0
+            val resumePageIndex = try {
+                withContext(Dispatchers.IO) {
+                    settingsStore.loadChapterProgress(item.comicId, item.chapterId)?.pageIndex ?: 0
+                }
+            } catch (error: Throwable) {
+                error.rethrowCancellation()
+                0
+            }
             val pages = withContext(Dispatchers.Default) {
                 files.mapIndexed { index, file ->
                     DirectReaderPage(
@@ -2087,6 +2761,7 @@ class PureViewModel(
     private fun downloadChapter(comic: JmComic, chapter: JmChapter) {
         val key = "${comic.id}:${chapter.id}"
         if (!downloadStore.start(key)) return
+        cancelSourceRefreshForForeground()
         _state.update { it.copy(downloadProgress = it.downloadProgress + (key to 0f)) }
         viewModelScope.launch {
             try {
@@ -2168,6 +2843,84 @@ class PureViewModel(
         _state.update { it.copy(message = null) }
     }
 
+    /** Persist the latest bounded snapshots without blocking the lifecycle/main thread. */
+    fun flushLocalState() {
+        enqueueLocalStateFlush(closeAfter = false)
+    }
+
+    fun setAppForeground(foreground: Boolean) {
+        appInForeground.set(foreground)
+        if (!foreground) {
+            cancelSourceRefreshForForeground()
+            chapterPreloader.cancelAll()
+            readerWarmupJob?.cancel()
+            readerBufferRefillJob?.cancel()
+            readerWarmupJob = null
+            readerWarmupChapterId = null
+        } else {
+            refillUltraReaderBuffer()
+        }
+    }
+
+    private fun enqueueLocalStateFlush(closeAfter: Boolean) {
+        // A lifecycle stop is common during rotation/backgrounding. Only flush snapshots that
+        // have actually changed since process start; otherwise every stop serializes the full
+        // library and performs a synchronous preference write on the persistence worker.
+        val favoritesGeneration = favoritesPersistGeneration.get()
+        val historyGeneration = historyPersistGeneration.get()
+        val settingsGeneration = settingsPersistGeneration.get()
+        val writeFavorites = favoritesGeneration > persistedFavoritesGeneration
+        val writeHistory = historyGeneration > persistedHistoryGeneration
+        val writeSettings = settingsGeneration > persistedSettingsGeneration
+        val progressGeneration = progressPersistGeneration.get()
+        val stateSnapshot = _state.value
+        val progressSnapshot = latestProgressSnapshot
+        settingsSaveJob?.cancel()
+        readerStateSaveJob?.cancel()
+        persistenceScope.launch {
+            try {
+                persistBestEffort {
+                    if (writeFavorites && favoritesGeneration == favoritesPersistGeneration.get()) {
+                        libraryStore.replaceFavorites(stateSnapshot.favorites)
+                        persistedFavoritesGeneration = favoritesGeneration
+                    }
+                    if (writeHistory && historyGeneration == historyPersistGeneration.get()) {
+                        libraryStore.replaceHistory(stateSnapshot.history)
+                        persistedHistoryGeneration = historyGeneration
+                    }
+                    if (
+                        progressSnapshot != null &&
+                        progressGeneration > persistedProgressGeneration &&
+                        progressGeneration == progressPersistGeneration.get()
+                    ) {
+                        settingsStore.saveProgress(
+                            comicId = progressSnapshot.comicId,
+                            chapterId = progressSnapshot.chapterId,
+                            pageIndex = progressSnapshot.pageIndex,
+                            pageCount = progressSnapshot.pageCount,
+                        )
+                        persistedProgressGeneration = progressGeneration
+                    }
+                    if (writeSettings && settingsGeneration == settingsPersistGeneration.get()) {
+                        settingsStore.save(stateSnapshot.settings)
+                        persistedSettingsGeneration = settingsGeneration
+                    }
+                }
+            } finally {
+                if (closeAfter) persistenceScope.cancel()
+            }
+        }
+    }
+
+    private suspend fun persistBestEffort(block: suspend () -> Unit) {
+        try {
+            block()
+        } catch (error: Throwable) {
+            error.rethrowCancellation()
+            // Local persistence failures must not crash an otherwise usable session.
+        }
+    }
+
     override fun onCleared() {
         homeRequestGeneration.incrementAndGet()
         categoryCatalogRequestGeneration.incrementAndGet()
@@ -2190,38 +2943,20 @@ class PureViewModel(
         detailJob?.cancel()
         commentsJob?.cancel()
         accountJob?.cancel()
+        favoriteFolderJob?.cancel()
         readerJob?.cancel()
         readerWarmupJob?.cancel()
+        readerBufferRefillJob?.cancel()
         chapterPreloader.cancelAll()
         settingsSaveJob?.cancel()
-        historySaveJob?.cancel()
+        readerStateSaveJob?.cancel()
         weeklyCatalogJob?.cancel()
         weeklyJob?.cancel()
         typeRankingJob?.cancel()
         sourceRefreshJob?.cancel()
         sourceScheduleJob?.cancel()
         updateCheckJob?.cancel()
-        // ViewModel scope jobs may be cancelled as part of clear(). Persist the
-        // final in-memory snapshots synchronously so a last tap made just before
-        // the activity is destroyed cannot disappear with the cancelled job.
-        favoritesPersistGeneration.incrementAndGet()
-        historyPersistGeneration.incrementAndGet()
-        progressPersistGeneration.incrementAndGet()
-        libraryWriteLock.withLock {
-            libraryStore.replaceFavorites(_state.value.favorites)
-            libraryStore.replaceHistory(_state.value.history)
-        }
-        latestProgressSnapshot?.let { snapshot ->
-            progressWriteLock.withLock {
-                settingsStore.saveProgress(
-                    comicId = snapshot.comicId,
-                    chapterId = snapshot.chapterId,
-                    pageIndex = snapshot.pageIndex,
-                    pageCount = snapshot.pageCount,
-                )
-            }
-        }
-        settingsStore.save(_state.value.settings)
+        enqueueLocalStateFlush(closeAfter = true)
         releaseClient.close()
         gateway.close()
         super.onCleared()
@@ -2242,10 +2977,16 @@ class PureViewModel(
 }
 
     private const val COMIC_CACHE_LIMIT = 48
-    private const val MAX_FAVORITE_ENTRIES = 200
+private const val MAX_FAVORITE_ENTRIES = 200
 private const val MAX_HISTORY_ENTRIES = 100
-private const val HISTORY_SAVE_DEBOUNCE_MS = 750L
+private const val LOCAL_STATE_SAVE_DEBOUNCE_MS = 5_000L
+private const val SETTINGS_SAVE_DEBOUNCE_MS = 250L
 private const val INITIAL_HOME_PRIORITY_TIMEOUT_MS = 2_500L
+private const val SOURCE_REFRESH_START_DELAY_MS = 10_000L
+private const val SOURCE_REFRESH_CHECK_INTERVAL_MS = 15L * 60L * 1_000L
+private const val ACCOUNT_SYNC_START_DELAY_MS = 4_000L
+private const val READER_WARMUP_CONCURRENCY = 2
+private const val ULTRA_READER_ENTRY_READY_PAGES = 3
 private const val MAX_PAGINATION_PAGE = 200
 private const val MAX_SEARCH_QUERY_LENGTH = 160
 private const val MAX_BROWSE_OPTION_LENGTH = 128

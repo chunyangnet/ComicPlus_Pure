@@ -24,7 +24,9 @@ data class DownloadedChapter(
 )
 
 class DownloadStore(context: Context) {
-    private val root = File(context.filesDir, "jm-downloads").apply { mkdirs() }
+    private val root by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        File(context.filesDir, "jm-downloads").apply { mkdirs() }
+    }
     private val _items = MutableStateFlow<List<DownloadedChapter>>(emptyList())
     val items: StateFlow<List<DownloadedChapter>> = _items.asStateFlow()
     private val running = ConcurrentHashMap<String, Boolean>()
@@ -344,7 +346,7 @@ internal fun hasCompletePageSet(pages: List<File>, expected: Int): Boolean =
             page.length() in 1..MAX_PAGE_FILE_BYTES
     }
 
-private fun File.readTextOrNull(): String? = runCatching {
+private fun File.readTextOrNull(): String? = runCatchingNonFatal {
     if (isFile && length() in 1..MAX_META_BYTES) readText() else null
 }.getOrNull()
 

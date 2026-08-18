@@ -5,8 +5,15 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.Crossfade
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -59,7 +66,10 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.net.toUri
@@ -81,6 +91,7 @@ import com.comicplus.app.ui.screens.SearchScreen
 import com.comicplus.app.ui.screens.SettingsScreen
 import com.comicplus.app.ui.theme.ComicPlusTheme
 import com.comicplus.app.ui.theme.White
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private enum class MainTab(val label: String, val outlined: ImageVector, val filled: ImageVector) {
@@ -91,12 +102,15 @@ private enum class MainTab(val label: String, val outlined: ImageVector, val fil
     Settings("设置", Icons.Outlined.Settings, Icons.Filled.Settings),
 }
 
+private enum class AppLayer { Main, OfficialBrowse, Search, Detail, Reader }
+
 @Composable
 fun PureApp() {
     val context = LocalContext.current
     val factory = remember(context) { PureViewModel.Factory(context.applicationContext) }
     val viewModel: PureViewModel = viewModel(factory = factory)
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val lifecycleOwner = LocalLifecycleOwner.current
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     var tabName by rememberSaveable { mutableStateOf(MainTab.Home.name) }
@@ -105,6 +119,21 @@ fun PureApp() {
     var searchInitialScope by rememberSaveable { mutableIntStateOf(0) }
     var officialBrowseVisible by rememberSaveable { mutableStateOf(false) }
     val favoriteKeys = remember(state.favorites) { state.favorites.mapTo(hashSetOf(), ComicUiItem::key) }
+
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> viewModel.setAppForeground(true)
+                Lifecycle.Event.ON_STOP -> {
+                    viewModel.setAppForeground(false)
+                    viewModel.flushLocalState()
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     LaunchedEffect(state.message) {
         state.message?.let {
@@ -125,49 +154,308 @@ fun PureApp() {
             LocalComicPlusReduceMotion provides state.settings.reduceMotion,
             LocalFavoritePendingKeys provides state.favoritePendingKeys,
         ) {
-            Box(Modifier.fillMaxSize()) {
-                when {
-                    state.reader !is ReaderUiState.Idle -> ReaderScreen(
-                        state = state.reader,
-                        settings = state.settings,
-                        sourceStatus = state.sourceStatus,
-                        loadPage = viewModel::loadReaderPage,
-                        prefetchPage = viewModel::prefetchReaderPage,
-                        cachedPage = viewModel::cachedReaderPage,
-                        onSelectChapter = viewModel::selectReaderChapter,
-                         loadChapterSegment = viewModel::loadReaderChapterSegment,
-                         onRetryChapter = viewModel::retryReaderChapter,
-                         onProgressChange = viewModel::recordReaderProgress,
-                         onSettingsChange = viewModel::updateSettings,
-                         onRefreshSources = { viewModel.refreshSources(force = true, updateOfficialList = true) },
-                         comments = state.comments,
-                         onOpenComments = viewModel::openComments,
-                         onRetryComments = viewModel::retryComments,
-                         onLoadMoreComments = viewModel::loadMoreComments,
-                         onClose = viewModel::closeReader,
-                    )
+            val readerVisible = state.reader !is ReaderUiState.Idle
+            val detailVisible = state.detail !is ComicResolveUiState.Idle
+            var retainedReaderState by remember { mutableStateOf<ReaderUiState?>(null) }
+            var retainedDetailState by remember { mutableStateOf<ComicResolveUiState?>(null) }
+            SideEffect {
+                if (readerVisible) retainedReaderState = state.reader
+                if (detailVisible) retainedDetailState = state.detail
+            }
+            LaunchedEffect(readerVisible, state.settings.reduceMotion) {
+                if (!readerVisible) {
+                    if (!state.settings.reduceMotion) delay(NAVIGATION_EXIT_MILLIS)
+                    retainedReaderState = null
+                }
+            }
+            LaunchedEffect(detailVisible, state.settings.reduceMotion) {
+                if (!detailVisible) {
+                    if (!state.settings.reduceMotion) delay(NAVIGATION_EXIT_MILLIS)
+                    retainedDetailState = null
+                }
+            }
 
-                    state.detail !is ComicResolveUiState.Idle -> {
-                        val ready = state.detail as? ComicResolveUiState.Ready
+            val displayedReaderState = if (readerVisible) state.reader else retainedReaderState
+            val displayedDetailState = if (detailVisible) state.detail else retainedDetailState
+            val navigationStack = remember(
+                officialBrowseVisible,
+                searchVisible,
+                detailVisible,
+                readerVisible,
+            ) {
+                buildList {
+                    add(AppLayer.Main)
+                    if (officialBrowseVisible) add(AppLayer.OfficialBrowse)
+                    if (searchVisible) add(AppLayer.Search)
+                    if (detailVisible) add(AppLayer.Detail)
+                    if (readerVisible) add(AppLayer.Reader)
+                }
+            }
+            val visibleLayers = remember(navigationStack) { navigationStack.takeLast(2).toSet() }
+            val topLayer = navigationStack.last()
+            val mainReduceMotion = state.settings.reduceMotion || topLayer != AppLayer.Main
+
+            Box(Modifier.fillMaxSize()) {
+                if (AppLayer.Main in visibleLayers) {
+                    CompositionLocalProvider(LocalComicPlusReduceMotion provides mainReduceMotion) {
+                        val currentTab = MainTab.entries.firstOrNull { it.name == tabName }
+                            ?: MainTab.Home
+                        Scaffold(
+                            containerColor = MaterialTheme.colorScheme.background,
+                            bottomBar = {
+                                ComicPlusBottomBar(currentTab, mainReduceMotion) { tabName = it.name }
+                            },
+                        ) { padding ->
+                            val modifier = Modifier.fillMaxSize().padding(padding)
+                            AnimatedContent(
+                                targetState = currentTab,
+                                transitionSpec = {
+                                    if (mainReduceMotion) {
+                                        EnterTransition.None togetherWith ExitTransition.None
+                                    } else {
+                                        val direction = if (targetState.ordinal > initialState.ordinal) 1 else -1
+                                        (
+                                            slideInHorizontally(tween(280)) { direction * it / 7 } +
+                                                fadeIn(tween(180))
+                                            ).togetherWith(
+                                            slideOutHorizontally(tween(220)) { -direction * it / 10 } +
+                                                fadeOut(tween(150)),
+                                        )
+                                    }
+                                },
+                                label = "main-tab-transition",
+                            ) { tab ->
+                                when (tab) {
+                                    MainTab.Home -> HomeScreen(
+                                        comics = state.home,
+                                        categories = state.categories,
+                                        isBootstrapping = state.loading,
+                                        isRefreshing = state.loading && state.home.isNotEmpty(),
+                                        discoveryItems = state.discoveryItems,
+                                        discoveryLoading = state.discoveryLoading,
+                                        discoveryExhausted = state.discoveryExhausted,
+                                        reduceMotion = mainReduceMotion,
+                                        onRefresh = viewModel::refreshHome,
+                                        onResolve = viewModel::openComic,
+                                        onOpenSearch = { query ->
+                                            searchInitialQuery = query
+                                            searchInitialScope = 0
+                                            searchVisible = true
+                                            if (query.isNotBlank()) viewModel.search(query)
+                                        },
+                                        onLoadMoreDiscovery = viewModel::loadMoreDiscovery,
+                                        onOpenCategory = { category ->
+                                            viewModel.selectCategory(category)
+                                            tabName = MainTab.Category.name
+                                        },
+                                        onOpenBrowse = { tabName = MainTab.Category.name },
+                                        onMessage = { message ->
+                                            scope.launch { snackbar.showSnackbar(message) }
+                                        },
+                                        modifier = modifier,
+                                        favoriteKeys = favoriteKeys,
+                                        onToggleFavorite = viewModel::toggleFavorite,
+                                    )
+
+                                    MainTab.Ranking -> RankingScreen(
+                                        state = state.rankings,
+                                        reduceMotion = mainReduceMotion,
+                                        onEnsureRankings = { viewModel.loadRankings() },
+                                        onSelectOrder = viewModel::loadRankings,
+                                        onOpenOfficialBrowse = { officialBrowseVisible = true },
+                                        onOpenSearch = { query ->
+                                            searchInitialQuery = query
+                                            searchInitialScope = 0
+                                            searchVisible = true
+                                            if (query.isNotBlank()) viewModel.search(query)
+                                        },
+                                        onClearSearch = viewModel::clearSearch,
+                                        onResolve = viewModel::openComic,
+                                        onMessage = { message ->
+                                            scope.launch { snackbar.showSnackbar(message) }
+                                        },
+                                        modifier = modifier,
+                                        favoriteKeys = favoriteKeys,
+                                        onToggleFavorite = viewModel::toggleFavorite,
+                                    )
+
+                                    MainTab.Category -> CategoryScreen(
+                                        categories = state.categories,
+                                        state = state.category,
+                                        reduceMotion = mainReduceMotion,
+                                        onEnsureCategories = viewModel::loadCategories,
+                                        onSelectCategory = viewModel::selectCategory,
+                                        onSelectOrder = viewModel::selectCategoryOrder,
+                                        onLoadMore = viewModel::loadMoreCategory,
+                                        onOpenSearch = { query ->
+                                            searchInitialQuery = query
+                                            searchInitialScope = 0
+                                            searchVisible = true
+                                            if (query.isNotBlank()) viewModel.search(query)
+                                        },
+                                        onClearSearch = viewModel::clearSearch,
+                                        onResolve = viewModel::openComic,
+                                        onMessage = { message ->
+                                            scope.launch { snackbar.showSnackbar(message) }
+                                        },
+                                        modifier = modifier,
+                                        favoriteKeys = favoriteKeys,
+                                        onToggleFavorite = viewModel::toggleFavorite,
+                                    )
+
+                                    MainTab.Library -> LibraryScreen(
+                                        favorites = state.favorites,
+                                        favoriteFolders = state.favoriteFolders,
+                                        history = state.history,
+                                        signedIn = state.account.signedIn,
+                                        onOpen = viewModel::openComic,
+                                        onToggleFavorite = viewModel::toggleFavorite,
+                                        onSelectFavoriteFolder = viewModel::selectFavoriteFolder,
+                                        onRetryFavoriteFolder = viewModel::retryFavoriteFolder,
+                                        onCreateFavoriteFolder = viewModel::createFavoriteFolder,
+                                        onMoveFavoriteToFolder = viewModel::moveFavoriteToFolder,
+                                        onClearHistory = viewModel::clearHistory,
+                                        modifier = modifier,
+                                    )
+
+                                    MainTab.Settings -> SettingsScreen(
+                                        settings = state.settings,
+                                        downloads = state.downloads,
+                                        account = state.account,
+                                        onLogin = viewModel::login,
+                                        onLogout = viewModel::logout,
+                                        onSyncFavorites = viewModel::syncOfficialFavorites,
+                                        sourceStatus = state.sourceStatus,
+                                        updateStatus = state.appUpdate,
+                                        onSettingsChange = viewModel::updateSettings,
+                                        onCheckUpdates = viewModel::checkForUpdates,
+                                        onOpenUpdate = { url ->
+                                            openExternalUrl(context, url) { message ->
+                                                scope.launch { snackbar.showSnackbar(message) }
+                                            }
+                                        },
+                                        onClearReaderCache = viewModel::clearReaderCache,
+                                        onRefreshSources = { viewModel.refreshSources(force = true) },
+                                        onOpenDownload = viewModel::openDownloaded,
+                                        onDeleteDownload = viewModel::deleteDownload,
+                                        modifier = modifier,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                PredictiveBackLayer(
+                    visible = officialBrowseVisible && AppLayer.OfficialBrowse in visibleLayers,
+                    enabled = topLayer == AppLayer.OfficialBrowse,
+                    reduceMotion = state.settings.reduceMotion,
+                    onBack = { officialBrowseVisible = false },
+                ) { layerModifier ->
+                    val layerReduceMotion = state.settings.reduceMotion || topLayer != AppLayer.OfficialBrowse
+                    CompositionLocalProvider(LocalComicPlusReduceMotion provides layerReduceMotion) {
+                        OfficialBrowseScreen(
+                            state = state.officialBrowse,
+                            categories = state.categories,
+                            reduceMotion = layerReduceMotion,
+                            onBack = { officialBrowseVisible = false },
+                            onEnsure = viewModel::ensureOfficialBrowse,
+                            onSelectWeeklyCategory = viewModel::selectWeeklyCategory,
+                            onSelectWeeklyType = viewModel::selectWeeklyType,
+                            onRetryWeekly = { viewModel.loadWeekly(force = true) },
+                            onOpenTag = { tag ->
+                                searchInitialQuery = tag
+                                searchInitialScope = 3
+                                searchVisible = true
+                                viewModel.search(tag, mainTag = 3)
+                            },
+                            onSelectTypeRanking = { slug, order ->
+                                viewModel.loadTypeRanking(slug, order)
+                            },
+                            onRetryTypeRanking = { viewModel.loadTypeRanking(force = true) },
+                            onResolve = viewModel::openComic,
+                            modifier = layerModifier,
+                            favoriteKeys = favoriteKeys,
+                            onToggleFavorite = viewModel::toggleFavorite,
+                        )
+                    }
+                }
+
+                PredictiveBackLayer(
+                    visible = searchVisible && AppLayer.Search in visibleLayers,
+                    enabled = topLayer == AppLayer.Search,
+                    reduceMotion = state.settings.reduceMotion,
+                    onBack = {
+                        searchVisible = false
+                        viewModel.clearSearch()
+                    },
+                ) { layerModifier ->
+                    val layerReduceMotion = state.settings.reduceMotion || topLayer != AppLayer.Search
+                    CompositionLocalProvider(LocalComicPlusReduceMotion provides layerReduceMotion) {
+                        SearchScreen(
+                            state = state.search,
+                            initialQuery = searchInitialQuery,
+                            initialScope = searchInitialScope,
+                            reduceMotion = layerReduceMotion,
+                            onBack = {
+                                searchVisible = false
+                                viewModel.clearSearch()
+                            },
+                            onSearch = { query, tag, order -> viewModel.search(query, tag, order) },
+                            onLoadMore = viewModel::loadMoreSearch,
+                            onResolve = viewModel::openComic,
+                            onRedirectConsumed = viewModel::consumeSearchRedirect,
+                            onMessage = { message ->
+                                scope.launch { snackbar.showSnackbar(message) }
+                            },
+                            modifier = layerModifier,
+                            favoriteKeys = favoriteKeys,
+                            onToggleFavorite = viewModel::toggleFavorite,
+                        )
+                    }
+                }
+
+                PredictiveBackLayer(
+                    visible = detailVisible && AppLayer.Detail in visibleLayers,
+                    enabled = topLayer == AppLayer.Detail,
+                    reduceMotion = state.settings.reduceMotion,
+                    onBack = viewModel::dismissDetail,
+                ) { layerModifier ->
+                    val detailState = displayedDetailState ?: return@PredictiveBackLayer
+                    val ready = detailState as? ComicResolveUiState.Ready
+                    val downloadedChapterIds = remember(state.downloads, ready?.jmId) {
+                        state.downloads
+                            .asSequence()
+                            .filter { it.comicId == ready?.jmId && it.complete }
+                            .mapTo(mutableSetOf(), DownloadedChapter::chapterId)
+                    }
+                    val downloadProgress = remember(state.downloadProgress) {
+                        state.downloadProgress.mapKeys { it.key.substringAfter(':') }
+                    }
+                    val layerReduceMotion = state.settings.reduceMotion || topLayer != AppLayer.Detail
+                    CompositionLocalProvider(LocalComicPlusReduceMotion provides layerReduceMotion) {
                         ComicDetailScreen(
-                            state = state.detail,
-                            reduceMotion = state.settings.reduceMotion,
+                            state = detailState,
+                            reduceMotion = layerReduceMotion,
                             autoResumeReading = state.settings.autoResumeReading,
                             chapterDescending = state.settings.chapterDescending,
                             onChapterDescendingChange = viewModel::updateChapterSort,
                             onBack = viewModel::dismissDetail,
-                            onShare = { detail -> shareComic(context, detail) { message -> scope.launch { snackbar.showSnackbar(message) } } },
+                            onShare = { detail ->
+                                shareComic(context, detail) { message ->
+                                    scope.launch { snackbar.showSnackbar(message) }
+                                }
+                            },
                             onRead = { detail, chapter ->
-                                // Tapping a chapter is an explicit request for
-                                // that chapter, so it starts at its first page.
                                 viewModel.openReader(detail, chapter, initialPageIndex = 0)
                             },
-                             onContinueReading = { detail, chapter, initialPageIndex ->
-                                 viewModel.openReader(detail, chapter, initialPageIndex)
-                             },
-                             onSelectCommentChapter = viewModel::selectCommentsChapter,
-                            downloadedChapterIds = state.downloads.filter { it.comicId == ready?.jmId && it.complete }.mapTo(mutableSetOf()) { it.chapterId },
-                            downloadProgress = state.downloadProgress.mapKeys { it.key.substringAfter(':') },
+                            modifier = layerModifier,
+                            onContinueReading = { detail, chapter, initialPageIndex ->
+                                viewModel.openReader(detail, chapter, initialPageIndex)
+                            },
+                            onOpenComments = viewModel::openComicComments,
+                            downloadedChapterIds = downloadedChapterIds,
+                            downloadProgress = downloadProgress,
                             onDownload = viewModel::downloadChapter,
                             isFavorite = ready?.let { "${it.source}:${it.jmId}" in favoriteKeys } ?: false,
                             onToggleFavorite = viewModel::toggleFavorite,
@@ -176,145 +464,39 @@ fun PureApp() {
                             onLoadMoreComments = viewModel::loadMoreComments,
                         )
                     }
-
-                    searchVisible -> SearchScreen(
-                        state = state.search,
-                        initialQuery = searchInitialQuery,
-                        initialScope = searchInitialScope,
-                        reduceMotion = state.settings.reduceMotion,
-                        onBack = { searchVisible = false; viewModel.clearSearch() },
-                        onSearch = { query, tag, order -> viewModel.search(query, tag, order) },
-                        onLoadMore = viewModel::loadMoreSearch,
-                        onResolve = viewModel::openComic,
-                        onRedirectConsumed = viewModel::consumeSearchRedirect,
-                        onMessage = { message -> scope.launch { snackbar.showSnackbar(message) } },
-                        favoriteKeys = favoriteKeys,
-                        onToggleFavorite = viewModel::toggleFavorite,
-                    )
-
-                    officialBrowseVisible -> OfficialBrowseScreen(
-                        state = state.officialBrowse,
-                        categories = state.categories,
-                        reduceMotion = state.settings.reduceMotion,
-                        onBack = { officialBrowseVisible = false },
-                        onEnsure = viewModel::ensureOfficialBrowse,
-                        onSelectWeeklyCategory = viewModel::selectWeeklyCategory,
-                        onSelectWeeklyType = viewModel::selectWeeklyType,
-                        onRetryWeekly = { viewModel.loadWeekly(force = true) },
-                        onOpenTag = { tag ->
-                            searchInitialQuery = tag
-                            searchInitialScope = 3
-                            searchVisible = true
-                            viewModel.search(tag, mainTag = 3)
-                        },
-                        onSelectTypeRanking = { slug, order -> viewModel.loadTypeRanking(slug, order) },
-                        onRetryTypeRanking = { viewModel.loadTypeRanking(force = true) },
-                        onResolve = viewModel::openComic,
-                        favoriteKeys = favoriteKeys,
-                        onToggleFavorite = viewModel::toggleFavorite,
-                    )
-
-                    else -> {
-                        val currentTab = MainTab.entries.firstOrNull { it.name == tabName } ?: MainTab.Home
-                        Scaffold(
-                            containerColor = MaterialTheme.colorScheme.background,
-                            bottomBar = { ComicPlusBottomBar(currentTab, state.settings.reduceMotion) { tabName = it.name } },
-                        ) { padding ->
-                            val modifier = Modifier.fillMaxSize().padding(padding)
-                            Crossfade(
-                                targetState = currentTab,
-                                animationSpec = tween(if (state.settings.reduceMotion) 0 else 220),
-                                label = "main-tab-transition",
-                            ) { tab ->
-                            when (tab) {
-                                MainTab.Home -> HomeScreen(
-                                    comics = state.home,
-                                    categories = state.categories,
-                                    isBootstrapping = state.loading,
-                                    isRefreshing = state.loading && state.home.isNotEmpty(),
-                                    discoveryItems = state.discoveryItems,
-                                    discoveryLoading = state.discoveryLoading,
-                                    discoveryExhausted = state.discoveryExhausted,
-                                    reduceMotion = state.settings.reduceMotion,
-                                    onRefresh = viewModel::refreshHome,
-                                    onResolve = viewModel::openComic,
-                                    onOpenSearch = { query -> searchInitialQuery = query; searchInitialScope = 0; searchVisible = true; if (query.isNotBlank()) viewModel.search(query) },
-                                    onLoadMoreDiscovery = viewModel::loadMoreDiscovery,
-                                    onOpenCategory = { category -> viewModel.selectCategory(category); tabName = MainTab.Category.name },
-                                    onOpenBrowse = { tabName = MainTab.Category.name },
-                                    onMessage = { message -> scope.launch { snackbar.showSnackbar(message) } },
-                                    modifier = modifier,
-                                    favoriteKeys = favoriteKeys,
-                                    onToggleFavorite = viewModel::toggleFavorite,
-                                )
-
-                                MainTab.Ranking -> RankingScreen(
-                                    state = state.rankings,
-                                    reduceMotion = state.settings.reduceMotion,
-                                    onEnsureRankings = { viewModel.loadRankings() },
-                                    onSelectOrder = viewModel::loadRankings,
-                                    onOpenOfficialBrowse = { officialBrowseVisible = true },
-                                    onOpenSearch = { query -> searchInitialQuery = query; searchInitialScope = 0; searchVisible = true; if (query.isNotBlank()) viewModel.search(query) },
-                                    onClearSearch = viewModel::clearSearch,
-                                    onResolve = viewModel::openComic,
-                                    onMessage = { message -> scope.launch { snackbar.showSnackbar(message) } },
-                                    modifier = modifier,
-                                    favoriteKeys = favoriteKeys,
-                                    onToggleFavorite = viewModel::toggleFavorite,
-                                )
-
-                                MainTab.Category -> CategoryScreen(
-                                    categories = state.categories,
-                                    state = state.category,
-                                    reduceMotion = state.settings.reduceMotion,
-                                    onEnsureCategories = viewModel::loadCategories,
-                                    onSelectCategory = viewModel::selectCategory,
-                                    onSelectOrder = viewModel::selectCategoryOrder,
-                                    onLoadMore = viewModel::loadMoreCategory,
-                                    onOpenSearch = { query -> searchInitialQuery = query; searchInitialScope = 0; searchVisible = true; if (query.isNotBlank()) viewModel.search(query) },
-                                    onClearSearch = viewModel::clearSearch,
-                                    onResolve = viewModel::openComic,
-                                    onMessage = { message -> scope.launch { snackbar.showSnackbar(message) } },
-                                    modifier = modifier,
-                                    favoriteKeys = favoriteKeys,
-                                    onToggleFavorite = viewModel::toggleFavorite,
-                                )
-
-                                MainTab.Library -> LibraryScreen(
-                                    favorites = state.favorites,
-                                    history = state.history,
-                                    signedIn = state.account.signedIn,
-                                    onOpen = viewModel::openComic,
-                                    onToggleFavorite = viewModel::toggleFavorite,
-                                    onClearHistory = viewModel::clearHistory,
-                                    modifier = modifier,
-                                )
-
-                                MainTab.Settings -> SettingsScreen(
-                                    settings = state.settings,
-                                    downloads = state.downloads,
-                                    account = state.account,
-                                    onLogin = viewModel::login,
-                                    onLogout = viewModel::logout,
-                                    onSyncFavorites = viewModel::syncOfficialFavorites,
-                                    sourceStatus = state.sourceStatus,
-                                    updateStatus = state.appUpdate,
-                                    onSettingsChange = viewModel::updateSettings,
-                                    onCheckUpdates = viewModel::checkForUpdates,
-                                    onOpenUpdate = { url ->
-                                        openExternalUrl(context, url) { message -> scope.launch { snackbar.showSnackbar(message) } }
-                                    },
-                                    onClearReaderCache = viewModel::clearReaderCache,
-                                    onRefreshSources = { viewModel.refreshSources(force = true) },
-                                    onOpenDownload = viewModel::openDownloaded,
-                                    onDeleteDownload = viewModel::deleteDownload,
-                                    modifier = modifier,
-                                )
-                            }
-                            }
-                        }
-                    }
                 }
+
+                PredictiveBackLayer(
+                    visible = readerVisible && AppLayer.Reader in visibleLayers,
+                    enabled = topLayer == AppLayer.Reader,
+                    reduceMotion = state.settings.reduceMotion,
+                    onBack = viewModel::closeReader,
+                ) { layerModifier ->
+                    val readerState = displayedReaderState ?: return@PredictiveBackLayer
+                    ReaderScreen(
+                        state = readerState,
+                        settings = state.settings,
+                        sourceStatus = state.sourceStatus,
+                        loadPage = viewModel::loadReaderPage,
+                        prefetchPage = viewModel::prefetchReaderPage,
+                        cachedPage = viewModel::cachedReaderPage,
+                        onSelectChapter = viewModel::selectReaderChapter,
+                        loadChapterSegment = viewModel::loadReaderChapterSegment,
+                        onRetryChapter = viewModel::retryReaderChapter,
+                        onProgressChange = viewModel::recordReaderProgress,
+                        onSettingsChange = viewModel::updateSettings,
+                        onRefreshSources = {
+                            viewModel.refreshSources(force = true, updateOfficialList = true)
+                        },
+                        comments = state.comments,
+                        onOpenComments = viewModel::openComments,
+                        onRetryComments = viewModel::retryComments,
+                        onLoadMoreComments = viewModel::loadMoreComments,
+                        onClose = viewModel::closeReader,
+                        modifier = layerModifier,
+                    )
+                }
+
                 SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(horizontal = 16.dp, vertical = 10.dp))
             }
         }
@@ -425,7 +607,7 @@ private fun shareComic(context: android.content.Context, state: ComicResolveUiSt
 }
 
 private fun openExternalUrl(context: Context, url: String, onMessage: (String) -> Unit) {
-    val uri = runCatching { url.toUri() }.getOrNull()
+    val uri = runCatchingNonFatal { url.toUri() }.getOrNull()
     if (uri == null || uri.scheme != "https") {
         onMessage("更新地址无效")
         return

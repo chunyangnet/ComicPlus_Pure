@@ -206,7 +206,13 @@ fun SettingsScreen(
                             ReaderPrefetchMode.Smart -> 3
                             ReaderPrefetchMode.Custom -> settings.readerPrefetchPages
                         }
-                        onSettingsChange(settings.copy(readerPrefetchMode = mode, readerPrefetchPages = pages))
+                        onSettingsChange(
+                            settings.copy(
+                                readerPrefetchMode = mode,
+                                readerPrefetchPages = pages,
+                                dataSaver = if (mode == ReaderPrefetchMode.UltraAggressive) false else settings.dataSaver,
+                            ),
+                        )
                     },
                     modifier = Modifier.fillMaxWidth().padding(horizontal = CpDimens.screenPadding),
                 )
@@ -214,7 +220,7 @@ fun SettingsScreen(
                     when (settings.readerPrefetchMode) {
                         ReaderPrefetchMode.Conservative -> "只保温相邻 1 页，优先降低内存和流量占用"
                         ReaderPrefetchMode.Aggressive -> "前后页并行保温，适合网速快且连续阅读"
-                        ReaderPrefetchMode.UltraAggressive -> "立即缓存整章源图，快速滑动时只需解码，流量和存储占用最高"
+                        ReaderPrefetchMode.UltraAggressive -> "首屏就绪后进入，沿滑动方向保持解码缓冲并提前准备下一话；流量、内存和存储占用最高"
                         ReaderPrefetchMode.Custom -> "按下方页数保温，并自动避让前台页面"
                         ReaderPrefetchMode.Smart -> "根据翻页速度、方向和设备内存自动调整"
                     },
@@ -823,7 +829,7 @@ private fun updateStatusSummary(status: AppUpdateUiState): String = when {
     else -> "当前版本 ${status.currentVersion.ifBlank { "未知" }}"
 }
 
-private fun formatReleaseDate(value: String): String = runCatching {
+private fun formatReleaseDate(value: String): String = com.comicplus.pure.runCatchingNonFatal {
     Instant.parse(value).atZone(ZoneId.systemDefault()).format(RELEASE_DATE_FORMAT)
 }.getOrDefault(value)
 

@@ -151,6 +151,24 @@ data class JmAccountUiState(
 }
 
 @Immutable
+data class JmFavoriteFolderUiItem(
+    val id: String,
+    val name: String,
+)
+
+@Immutable
+data class JmFavoriteFoldersUiState(
+    val folders: List<JmFavoriteFolderUiItem> = listOf(JmFavoriteFolderUiItem(id = "0", name = "全部")),
+    val selectedFolderId: String = "0",
+    val items: List<ComicUiItem> = emptyList(),
+    val total: Long = 0L,
+    val loading: Boolean = false,
+    val creating: Boolean = false,
+    val movingKey: String? = null,
+    val error: String? = null,
+)
+
+@Immutable
 data class CategoryUiState(
     val selectedSlug: String = "0",
     val order: String = "mr",
@@ -261,15 +279,32 @@ internal fun effectiveReaderPrefetchPages(
     memoryClassMb: Int = Int.MAX_VALUE,
     turboMode: Boolean = false,
     mode: ReaderPrefetchMode = ReaderPrefetchMode.Smart,
+    imageQuality: ReaderImageQuality = ReaderImageQuality.Medium,
     pageVelocityPagesPerSecond: Float = 0f,
     networkLatencyMs: Long? = null,
 ): Int {
     if (mode == ReaderPrefetchMode.Conservative && configuredPages <= 0) return 0
+    if (mode == ReaderPrefetchMode.UltraAggressive) {
+        if (dataSaver) return 1
+        val decodeProfileBudget = when {
+            turboMode -> 12
+            imageQuality == ReaderImageQuality.Low -> 10
+            imageQuality == ReaderImageQuality.Medium -> 8
+            else -> 6
+        }
+        val memoryBudget = when {
+            memoryClassMb < 384 -> if (turboMode) 3 else 2
+            memoryClassMb < 512 -> 4
+            memoryClassMb < 768 -> 8
+            else -> 12
+        }
+        return minOf(decodeProfileBudget, memoryBudget)
+    }
     val modeBase = when (mode) {
         ReaderPrefetchMode.Conservative -> configuredPages.coerceIn(0, 2)
         ReaderPrefetchMode.Smart -> configuredPages.coerceIn(0, 6)
         ReaderPrefetchMode.Aggressive -> configuredPages.coerceAtLeast(5).coerceIn(0, 6)
-        ReaderPrefetchMode.UltraAggressive -> 6
+        ReaderPrefetchMode.UltraAggressive -> error("handled above")
         ReaderPrefetchMode.Custom -> configuredPages.coerceIn(0, 6)
     }
     val velocityBoost = when {
@@ -319,6 +354,7 @@ data class PureUiState(
     val sourceStatus: JmSourceUiState = JmSourceUiState(),
     val appUpdate: AppUpdateUiState = AppUpdateUiState(),
     val favorites: List<ComicUiItem> = emptyList(),
+    val favoriteFolders: JmFavoriteFoldersUiState = JmFavoriteFoldersUiState(),
     val favoritePendingKeys: Set<String> = emptySet(),
     val history: List<ReadingHistoryItem> = emptyList(),
 )

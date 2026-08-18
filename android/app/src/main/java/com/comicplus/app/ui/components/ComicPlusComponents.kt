@@ -44,6 +44,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -56,7 +57,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
@@ -66,14 +66,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.IntSize
 import coil3.compose.AsyncImage
 import coil3.network.NetworkHeaders
 import coil3.network.httpHeaders
 import coil3.request.ImageRequest
 import coil3.request.crossfade
-import coil3.size.Precision
-import coil3.size.Scale
 import com.comicplus.pure.JmGateway
 import com.comicplus.app.ui.ComicUiItem
 import com.comicplus.app.ui.LocalComicPlusReduceMotion
@@ -445,6 +442,8 @@ fun ComicPosterCard(
     modifier: Modifier = Modifier,
     isFavorite: Boolean = false,
     onToggleFavorite: (() -> Unit)? = null,
+    onMoveFavorite: (() -> Unit)? = null,
+    moveFavoriteLoading: Boolean = false,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     Column(
@@ -474,6 +473,35 @@ fun ComicPosterCard(
                     modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
                     favoriteKey = comic.key,
                 )
+            }
+            if (onMoveFavorite != null) {
+                Surface(
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp).size(32.dp),
+                    shape = CircleShape,
+                    color = Color(0xD91B2029),
+                    shadowElevation = 1.dp,
+                ) {
+                    IconButton(
+                        onClick = onMoveFavorite,
+                        enabled = !moveFavoriteLoading,
+                        modifier = Modifier.fillMaxSize(),
+                    ) {
+                        if (moveFavoriteLoading) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(15.dp),
+                                color = White,
+                                strokeWidth = 1.8.dp,
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Outlined.SwapVert,
+                                contentDescription = "移动到收藏夹",
+                                tint = White,
+                                modifier = Modifier.size(17.dp),
+                            )
+                        }
+                    }
+                }
             }
         }
         Spacer(Modifier.height(10.dp))
@@ -636,48 +664,45 @@ fun ComicCover(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    var measuredSize by remember(coverUrl) { mutableStateOf(IntSize.Zero) }
     if (coverUrl.isNullOrBlank()) {
         CoverFallback(title, accentIndex, modifier)
         return
     }
-    val headers = remember {
-        NetworkHeaders.Builder().apply {
-            JmGateway.imageRequestHeaders().forEach { (name, value) -> set(name, value) }
-        }.build()
-    }
-    val decodeSize = remember(measuredSize) { optimizedCoverDecodeSize(measuredSize) }
+    val mirrorUrls = remember(coverUrl) { JmGateway.coverMirrorUrls(coverUrl) }
+    var mirrorIndex by remember(coverUrl) { mutableIntStateOf(0) }
+    var imageLoaded by remember(coverUrl) { mutableStateOf(false) }
+    val activeUrl = mirrorUrls[mirrorIndex.coerceIn(0, mirrorUrls.lastIndex)]
     val cacheIdentity = remember(coverUrl) { canonicalCoverCacheIdentity(coverUrl) }
-    val request = remember(context, coverUrl, cacheIdentity, headers, decodeSize) {
-        if (decodeSize == IntSize.Zero) null else {
-            ImageRequest.Builder(context)
-                .data(coverUrl)
-                .httpHeaders(headers)
-                // Keep one stable memory entry per URL/size pair even when the
-                // surrounding list item is recomposed or moved off-screen.
-                .memoryCacheKey("cover:$cacheIdentity:${decodeSize.width}x${decodeSize.height}")
-                // Disk stores the fetched source and can be reused for cards,
-                // rankings, and the larger detail header.
-                .diskCacheKey("cover:$cacheIdentity")
-                .size(decodeSize.width, decodeSize.height)
-                .scale(Scale.FILL)
-                .precision(Precision.INEXACT)
-                .crossfade(120)
-                .build()
-        }
+    val request = remember(context, activeUrl, cacheIdentity) {
+        ImageRequest.Builder(context)
+            .data(activeUrl)
+            .httpHeaders(JM_IMAGE_HEADERS)
+            // AsyncImage resolves the decode size from its constraints. Keeping
+            // only the canonical disk key avoids a blank measurement frame and
+            // lets equivalent JM mirrors share the fetched source.
+            .diskCacheKey("cover:$cacheIdentity")
+            .crossfade(120)
+            .build()
     }
-    Box(modifier.onSizeChanged { measuredSize = it }) {
-        CoverFallback(title, accentIndex, Modifier.fillMaxSize())
-        if (request != null) {
-            AsyncImage(
-                model = request,
-                contentDescription = title,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
-            )
-        }
+    Box(modifier) {
+        if (!imageLoaded) CoverFallback(title, accentIndex, Modifier.fillMaxSize())
+        AsyncImage(
+            model = request,
+            contentDescription = title,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize(),
+            onSuccess = { imageLoaded = true },
+            onError = {
+                imageLoaded = false
+                if (mirrorIndex < mirrorUrls.lastIndex) mirrorIndex++
+            },
+        )
     }
 }
+
+private val JM_IMAGE_HEADERS = NetworkHeaders.Builder().apply {
+    JmGateway.imageRequestHeaders().forEach { (name, value) -> set(name, value) }
+}.build()
 
 private val JM_COVER_CACHE_PATH = Regex(
     "^/media/albums/[A-Za-z0-9_-]{1,128}\\.(?:jpg|jpeg|png|webp)$",
@@ -691,18 +716,6 @@ internal fun canonicalCoverCacheIdentity(url: String): String {
         append(parsed.encodedPath)
         parsed.encodedQuery?.let { query -> append('?').append(query) }
     }
-}
-
-internal fun optimizedCoverDecodeSize(size: IntSize): IntSize {
-    if (size.width <= 0 || size.height <= 0) return IntSize.Zero
-    val longEdge = maxOf(size.width, size.height)
-    val scale = minOf(1f, MAX_COVER_DECODE_EDGE_PX / longEdge.toFloat())
-    fun bucket(value: Int): Int = ((value * scale).toInt().coerceAtLeast(1) + COVER_SIZE_BUCKET_PX - 1) /
-        COVER_SIZE_BUCKET_PX * COVER_SIZE_BUCKET_PX
-    return IntSize(
-        width = bucket(size.width).coerceAtMost(MAX_COVER_DECODE_EDGE_PX),
-        height = bucket(size.height).coerceAtMost(MAX_COVER_DECODE_EDGE_PX),
-    )
 }
 
 @Composable
@@ -773,6 +786,3 @@ private fun coverGradient(index: Int): List<Color> = when (index.mod(6)) {
     4 -> listOf(Color(0xFF493F69), Color(0xFF9284C5))
     else -> listOf(Color(0xFF30495A), Color(0xFF7D99A7))
 }
-
-private const val COVER_SIZE_BUCKET_PX = 64
-private const val MAX_COVER_DECODE_EDGE_PX = 1088

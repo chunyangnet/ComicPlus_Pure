@@ -35,12 +35,13 @@ internal suspend fun prefetchReaderPages(
         ?.let { (position.pageIndex - it.pageIndex).coerceIn(-1, 1) }
         ?.takeUnless { it == 0 }
         ?: 1
-    val indices = readerPrefetchPlan(
+    val indices = readerPrefetchPlanForMode(
         currentPageIndex = position.pageIndex,
         pageCount = segment.pages.size,
         distance = prefetchDistance,
         direction = movementDirection,
-        includeOpposite = settings.readerMode == ReaderMode.Paged,
+        readerMode = settings.readerMode,
+        prefetchMode = settings.readerPrefetchMode,
     )
     if (indices.isEmpty()) return
 
@@ -74,3 +75,20 @@ internal suspend fun prefetchReaderPages(
         pages.forEach { page -> prefetch(page) }
     }
 }
+
+internal fun readerPrefetchPlanForMode(
+    currentPageIndex: Int,
+    pageCount: Int,
+    distance: Int,
+    direction: Int,
+    readerMode: ReaderMode,
+    prefetchMode: ReaderPrefetchMode,
+): List<Int> = readerPrefetchPlan(
+    currentPageIndex = currentPageIndex,
+    pageCount = pageCount,
+    distance = distance,
+    direction = direction,
+    // Pages behind the current position have already been decoded. Ultra mode spends the
+    // entire live window ahead of the current travel direction so a long fling cannot outrun it.
+    includeOpposite = readerMode == ReaderMode.Paged && prefetchMode != ReaderPrefetchMode.UltraAggressive,
+)
