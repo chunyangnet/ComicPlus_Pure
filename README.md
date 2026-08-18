@@ -5,6 +5,19 @@
 [Download](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.4.0/Comic-Plus-release-v1.4.0.apk)  | [下载](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.4.0/Comic-Plus-release-v1.4.0.apk)  | [ダウンロード](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.4.0/Comic-Plus-release-v1.4.0.apk)<br>
 [![Download](https://img.shields.io/badge/Download-Comic%20Plus-blue?style=flat&logo=android)](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.4.0/Comic-Plus-release-v1.4.0.apk)
 ---
+
+> [!CAUTION]
+> 严重警告
+>
+> **严禁在任何公开平台,包括LINUX DO公开/无等级分区宣传、回帖此文章/分享本GitHub项目**
+>
+> 嚴禁在任何公開平台，包括 LINUX DO於公開/無等級分區宣傳、回帖本文、分享本 GitHub 專案。
+>
+> Strictly prohibited: promotion of this article, replying posts, and sharing of this GitHub project within public or non‑hierarchical sections of any public platforms, including LINUX DO.
+>
+> LINUX DO を含む一切の公開プラットフォームの公開・無階層区分エリアにて、本記事の宣伝、返信投稿、ならびに本 GitHub プロジェクトの共有を厳禁します。
+
+
 ## 简介 / Introduction / 紹介
 
 Speed, performance, lightweight, experience — you have never experienced Comic Plus like this before.  
