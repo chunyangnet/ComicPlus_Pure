@@ -30,7 +30,6 @@ import com.comicplus.app.ui.ReaderChapterSegment
 import com.comicplus.app.ui.ReaderPrefetchMode
 import com.comicplus.app.ui.ReadingHistoryItem
 import com.comicplus.app.ui.key
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
@@ -108,7 +107,6 @@ class PureViewModel(
     private var readerWarmupChapterId: String? = null
     private var lastProgressSignature: String? = null
     private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
-    private val localLibraryLoaded = CompletableDeferred<Unit>()
     private val progressPersistGeneration = AtomicLong()
     @Volatile private var latestProgressSnapshot: ReaderProgressSnapshot? = null
     @Volatile private var persistedProgressGeneration = 0L
@@ -118,6 +116,7 @@ class PureViewModel(
     @Volatile private var persistedFavoritesGeneration = 0L
     @Volatile private var persistedHistoryGeneration = 0L
     @Volatile private var persistedSettingsGeneration = 0L
+    @Volatile private var sessionPersistenceError = SESSION_PERSISTENCE_ERROR
     private var settingsSaveJob: Job? = null
     private var readerStateSaveJob: Job? = null
     private var sourceRefreshJob: Job? = null
@@ -147,6 +146,7 @@ class PureViewModel(
     private val favoriteOperations = ConcurrentHashMap.newKeySet<String>()
     private val favoriteOperationGeneration = AtomicLong()
     private val favoriteMutationRevision = AtomicLong()
+    private var automaticReloginAttempts = 0
 
     init {
         viewModelScope.launch {
@@ -175,7 +175,10 @@ class PureViewModel(
                     state.copy(
                         favorites = loadedFavorites,
                         history = loadedHistory,
-                        favoriteFolders = if (!state.account.signedIn) {
+                        favoriteFolders = if (
+                            !state.account.signedIn ||
+                            state.account.syncing && state.favoriteFolders.items.isEmpty()
+                        ) {
                             state.favoriteFolders.copy(
                                 items = loadedFavorites,
                                 total = loadedFavorites.size.toLong(),
@@ -189,18 +192,13 @@ class PureViewModel(
                 throw error
             } catch (_: Exception) {
                 // Keep the in-memory defaults when a corrupt or unavailable local snapshot fails.
-            } finally {
-                localLibraryLoaded.complete(Unit)
             }
         }
         viewModelScope.launch {
             downloadStore.items.collect { downloads -> _state.update { it.copy(downloads = downloads) } }
         }
         sessionStore?.let { store ->
-            accountJob = viewModelScope.launch {
-                localLibraryLoaded.await()
-                withContext(Dispatchers.IO) { store.load() }?.let { session -> restoreAccount(session) }
-            }
+            restoreStoredSessionIfNeeded(store)
         }
         refreshHome()
         viewModelScope.launch {
@@ -1144,9 +1142,11 @@ class PureViewModel(
             }
             .distinctBy(JmFavoriteFolderUiItem::id)
 
-    private suspend fun saveStoredSession(session: JmSession): Boolean {
+    private suspend fun saveStoredSession(session: JmSession, credentials: JmCredentials? = null): Boolean {
         val store = sessionStore ?: return true
-        return withContext(Dispatchers.IO) { store.save(session) }
+        val result = withContext(Dispatchers.IO) { store.save(session, credentials) }
+        if (!result.saved) sessionPersistenceError = result.failureMessage ?: SESSION_PERSISTENCE_ERROR
+        return result.saved
     }
 
     private suspend fun saveLatestGatewaySession(fallback: JmSession? = null): Boolean {
@@ -1154,9 +1154,99 @@ class PureViewModel(
         return saveStoredSession(session)
     }
 
-    private suspend fun clearStoredSession() {
+    private suspend fun clearStoredSession(keepCredentials: Boolean = false) {
         val store = sessionStore ?: return
-        withContext(Dispatchers.IO) { store.clear() }
+        withContext(Dispatchers.IO) {
+            if (keepCredentials) store.clearSession() else store.clear()
+        }
+    }
+
+    private fun restoreStoredSessionIfNeeded(store: JmSessionStore? = null) {
+        val resolvedStore = store ?: sessionStore ?: return
+        if (accountJob?.isActive == true) return
+        if (_state.value.account.status !in setOf(JmAccountStatus.SignedOut, JmAccountStatus.Error)) return
+        accountJob = viewModelScope.launch {
+            val session = loadStoredSessionWithRetry(resolvedStore)
+            when {
+                session != null -> restoreAccount(session)
+                else -> loadStoredCredentialsWithRetry(resolvedStore)?.let { credentials ->
+                    automaticRelogin(credentials)
+                }
+            }
+        }
+    }
+
+    private suspend fun loadStoredSessionWithRetry(store: JmSessionStore): JmSession? {
+        repeat(SESSION_LOAD_ATTEMPTS) { attempt ->
+            withContext(Dispatchers.IO) { store.load() }?.let { return it }
+            val hasStoredSession = withContext(Dispatchers.IO) { store.hasStoredSession() }
+            if (attempt == SESSION_LOAD_ATTEMPTS - 1 || !hasStoredSession) return null
+            delay(SESSION_LOAD_RETRY_DELAY_MS * (attempt + 1L))
+        }
+        return null
+    }
+
+    private suspend fun loadStoredCredentialsWithRetry(store: JmSessionStore): JmCredentials? {
+        repeat(SESSION_LOAD_ATTEMPTS) { attempt ->
+            withContext(Dispatchers.IO) { store.loadCredentials() }?.let { return it }
+            val hasStoredCredentials = withContext(Dispatchers.IO) { store.hasStoredCredentials() }
+            if (attempt == SESSION_LOAD_ATTEMPTS - 1 || !hasStoredCredentials) return null
+            delay(SESSION_LOAD_RETRY_DELAY_MS * (attempt + 1L))
+        }
+        return null
+    }
+
+    private suspend fun automaticRelogin(credentials: JmCredentials): Boolean {
+        if (automaticReloginAttempts >= MAX_AUTOMATIC_RELOGIN_ATTEMPTS) return false
+        automaticReloginAttempts++
+        _state.update {
+            it.copy(
+                account = JmAccountUiState(status = JmAccountStatus.SigningIn),
+                message = "JM 登录状态已失效，正在自动重新登录",
+            )
+        }
+        return try {
+            val account = gateway.login(credentials.username, credentials.password)
+            val session = gateway.session() ?: throw JmAuthException("JM 自动登录未返回有效会话")
+            val sessionPersisted = saveStoredSession(session, credentials)
+            if (!sessionPersisted) {
+                _state.update {
+                    it.copy(
+                        account = JmAccountUiState(
+                            status = JmAccountStatus.Error,
+                            error = sessionPersistenceError,
+                        ),
+                        message = sessionPersistenceError,
+                    )
+                }
+                false
+            } else {
+                automaticReloginAttempts = 0
+                _state.update {
+                    it.copy(
+                        account = JmAccountUiState(
+                            status = JmAccountStatus.SignedIn,
+                            uid = account.uid,
+                            username = account.username,
+                            favoriteCount = account.favoriteCount,
+                        ),
+                        message = "JM 已自动重新登录",
+                    )
+                }
+                true
+            }
+        } catch (error: Throwable) {
+            error.rethrowCancellation()
+            gateway.clearSession()
+            if (error is JmAuthException) clearStoredSession()
+            _state.update {
+                it.copy(
+                    account = JmAccountUiState(status = JmAccountStatus.Error, error = error.readable()),
+                    message = error.readable(),
+                )
+            }
+            false
+        }
     }
 
     private suspend fun restoreAccount(session: JmSession) {
@@ -1197,6 +1287,7 @@ class PureViewModel(
         try {
             val account = JmAccount(uid = session.uid, username = session.username)
             val favorites = gateway.favoriteCollection { partial ->
+                saveLatestGatewaySession(session)
                 publishOfficialAccount(
                     account = account.copy(favoriteCount = partial.total),
                     favorites = partial,
@@ -1216,7 +1307,7 @@ class PureViewModel(
                     state.copy(
                         account = state.account.copy(
                             syncing = false,
-                            error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                            error = sessionPersistenceError.takeUnless { sessionPersisted },
                         ),
                     )
                 }
@@ -1232,7 +1323,7 @@ class PureViewModel(
                         return@update state.copy(
                             account = state.account.copy(
                                 syncing = false,
-                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                error = sessionPersistenceError.takeUnless { sessionPersisted },
                             ),
                         )
                     }
@@ -1244,7 +1335,7 @@ class PureViewModel(
                             syncing = false,
                             error = listOfNotNull(
                                 error.readable(),
-                                SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                sessionPersistenceError.takeUnless { sessionPersisted },
                             ).joinToString("；"),
                         ),
                     )
@@ -1271,10 +1362,12 @@ class PureViewModel(
             try {
                 val account = gateway.login(username, password)
                 val session = gateway.session() ?: throw JmAuthException("JM 登录未返回有效会话")
-                saveStoredSession(session)
+                automaticReloginAttempts = 0
+                saveStoredSession(session, JmCredentials(account.username, password))
                 val mutationRevision = favoriteMutationRevision.get()
                 val syncError = try {
                     val favorites = gateway.favoriteCollection { partial ->
+                        saveLatestGatewaySession(session)
                         publishOfficialAccount(
                             account = account,
                             favorites = partial,
@@ -1313,7 +1406,7 @@ class PureViewModel(
                             account = state.account.copy(
                                 error = listOfNotNull(
                                     state.account.error,
-                                    SESSION_PERSISTENCE_ERROR,
+                                    sessionPersistenceError,
                                 ).distinct().joinToString("；"),
                             ),
                         )
@@ -1324,7 +1417,7 @@ class PureViewModel(
                         message = if (mutationRevision != favoriteMutationRevision.get()) {
                             state.message
                         } else if (!sessionPersisted) {
-                            "JM 登录成功，但登录状态无法写入本机"
+                            "JM 登录成功，但${sessionPersistenceError}"
                         } else if (syncError == null) {
                             "已登录 JM 官方账号 ${account.username}"
                         } else {
@@ -1391,6 +1484,7 @@ class PureViewModel(
                 val account = JmAccount(uid = current.uid, username = current.username)
                 val favorites = gateway.favoriteCollection { partial ->
                     if (operationGeneration != favoriteOperationGeneration.get()) return@favoriteCollection
+                    saveLatestGatewaySession()
                     publishOfficialAccount(
                         account = account,
                         favorites = partial,
@@ -1408,7 +1502,7 @@ class PureViewModel(
                 )
                 if (published && !sessionPersisted) {
                     _state.update { state ->
-                        state.copy(account = state.account.copy(error = SESSION_PERSISTENCE_ERROR))
+                        state.copy(account = state.account.copy(error = sessionPersistenceError))
                     }
                 }
                 _state.update { state ->
@@ -1431,7 +1525,7 @@ class PureViewModel(
                                 syncing = false,
                                 error = listOfNotNull(
                                     "收藏同步失败：${error.readable()}",
-                                    SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                    sessionPersistenceError.takeUnless { sessionPersisted },
                                 ).joinToString("；"),
                             ),
                             message = "JM 收藏同步失败",
@@ -1524,7 +1618,7 @@ class PureViewModel(
                     if (state.favoriteFolders.selectedFolderId != safeFolderId) return@update state
                     state.copy(
                         account = state.account.copy(
-                            error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted || !published },
+                            error = sessionPersistenceError.takeUnless { sessionPersisted || !published },
                         ),
                         favoriteFolders = state.favoriteFolders.copy(loading = false),
                     )
@@ -1544,7 +1638,7 @@ class PureViewModel(
                         if (state.favoriteFolders.selectedFolderId != safeFolderId) return@update state
                         state.copy(
                             account = state.account.copy(
-                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                error = sessionPersistenceError.takeUnless { sessionPersisted },
                             ),
                             favoriteFolders = state.favoriteFolders.copy(
                                 loading = false,
@@ -1602,7 +1696,7 @@ class PureViewModel(
                     _state.update { state ->
                         state.copy(
                             account = state.account.copy(
-                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                error = sessionPersistenceError.takeUnless { sessionPersisted },
                             ),
                             favoriteFolders = state.favoriteFolders.copy(
                                 folders = folders,
@@ -1623,7 +1717,7 @@ class PureViewModel(
                     _state.update { state ->
                         state.copy(
                             account = state.account.copy(
-                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                error = sessionPersistenceError.takeUnless { sessionPersisted },
                             ),
                             favoriteFolders = state.favoriteFolders.copy(creating = false),
                             message = "创建收藏夹失败：${error.readable()}",
@@ -1685,7 +1779,7 @@ class PureViewModel(
                         }
                         state.copy(
                             account = state.account.copy(
-                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                error = sessionPersistenceError.takeUnless { sessionPersisted },
                             ),
                             favoriteFolders = state.favoriteFolders.copy(
                                 items = sourceItems,
@@ -1706,7 +1800,7 @@ class PureViewModel(
                     _state.update { state ->
                         state.copy(
                             account = state.account.copy(
-                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                error = sessionPersistenceError.takeUnless { sessionPersisted },
                             ),
                             favoriteFolders = state.favoriteFolders.copy(movingKey = null),
                             message = "移动收藏失败：${error.readable()}",
@@ -1726,7 +1820,9 @@ class PureViewModel(
         favoriteOperationGeneration.incrementAndGet()
         favoriteFolderRequestGeneration.incrementAndGet()
         gateway.clearSession()
-        clearStoredSession()
+        clearStoredSession(keepCredentials = true)
+        val credentials = sessionStore?.let { loadStoredCredentialsWithRetry(it) }
+        if (credentials != null && automaticRelogin(credentials)) return
         _state.update { state ->
             state.copy(
                 account = JmAccountUiState(status = JmAccountStatus.Error, error = error.readable()),
@@ -1832,7 +1928,7 @@ class PureViewModel(
                                 state.favoriteFolders.items.any { it.key == item.key }
                             state.copy(
                                 account = state.account.copy(
-                                    error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                    error = sessionPersistenceError.takeUnless { sessionPersisted },
                                 ),
                                 favoriteFolders = if (removeFromSelectedFolder) {
                                     state.favoriteFolders.copy(
@@ -1872,7 +1968,7 @@ class PureViewModel(
                                 if (operationGeneration != favoriteOperationGeneration.get()) return@update state
                                 state.copy(
                                     account = state.account.copy(
-                                        error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                        error = sessionPersistenceError.takeUnless { sessionPersisted },
                                     ),
                                     message = if (isOfficiallyFavorite) {
                                         "网络响应较慢，已按官方收藏夹确认为已收藏"
@@ -1888,7 +1984,7 @@ class PureViewModel(
                                 if (operationGeneration != favoriteOperationGeneration.get()) return@update state
                                 state.copy(
                                     account = state.account.copy(
-                                        error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                        error = sessionPersistenceError.takeUnless { sessionPersisted },
                                     ),
                                     message = "JM 收藏操作失败，已恢复原状态：${error.readable()}",
                                 )
@@ -1913,7 +2009,7 @@ class PureViewModel(
                         if (operationGeneration != favoriteOperationGeneration.get()) return@update state
                         state.copy(
                             account = state.account.copy(
-                                error = SESSION_PERSISTENCE_ERROR.takeUnless { sessionPersisted },
+                                error = sessionPersistenceError.takeUnless { sessionPersisted },
                             ),
                             message = "JM 收藏操作失败，已恢复原状态：${error.readable()}",
                         )
@@ -2858,6 +2954,7 @@ class PureViewModel(
             readerWarmupJob = null
             readerWarmupChapterId = null
         } else {
+            restoreStoredSessionIfNeeded()
             refillUltraReaderBuffer()
         }
     }
@@ -2985,6 +3082,9 @@ private const val INITIAL_HOME_PRIORITY_TIMEOUT_MS = 2_500L
 private const val SOURCE_REFRESH_START_DELAY_MS = 10_000L
 private const val SOURCE_REFRESH_CHECK_INTERVAL_MS = 15L * 60L * 1_000L
 private const val ACCOUNT_SYNC_START_DELAY_MS = 4_000L
+private const val SESSION_LOAD_ATTEMPTS = 3
+private const val SESSION_LOAD_RETRY_DELAY_MS = 250L
+private const val MAX_AUTOMATIC_RELOGIN_ATTEMPTS = 1
 private const val READER_WARMUP_CONCURRENCY = 2
 private const val ULTRA_READER_ENTRY_READY_PAGES = 3
 private const val MAX_PAGINATION_PAGE = 200

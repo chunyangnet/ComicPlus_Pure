@@ -535,6 +535,22 @@ class JmGatewayProtocolTest {
     }
 
     @Test
+    fun loginPersistsTheResponseCookieInsteadOfAStalePayloadToken() {
+        assertEquals("cookie-session", JmGateway.selectLoginAvs("payload-session", "cookie-session"))
+        assertEquals("payload-session", JmGateway.selectLoginAvs("payload-session", null))
+        assertEquals("payload-session", JmGateway.selectLoginAvs("payload-session", ""))
+    }
+
+    @Test
+    fun sessionCookieAcceptsExactAndParentApiDomainsOnly() {
+        val hosts = listOf("www.cdngwc.cc", "api.example.com")
+        assertEquals(true, JmGateway.isCookieDomainForHosts("www.cdngwc.cc", hosts))
+        assertEquals(true, JmGateway.isCookieDomainForHosts("cdngwc.cc", hosts))
+        assertEquals(false, JmGateway.isCookieDomainForHosts("evil-cdngwc.cc", hosts))
+        assertEquals(false, JmGateway.isCookieDomainForHosts("www.api.example.com", hosts))
+    }
+
+    @Test
     fun authenticatedHostCooldownSkipsRecentFailuresButAlwaysKeepsOneFallback() {
         assertEquals(
             listOf("expired.example", "healthy.example"),

@@ -130,11 +130,17 @@ data class JmAccount(
     val favoriteCount: Long? = null,
 )
 
-/** The only credential retained by the app is the short-lived AVS session cookie. */
+/** Short-lived AVS session data restored across process restarts. */
 data class JmSession(
     val uid: String,
     val username: String,
     val avs: String,
+)
+
+/** Credentials retained only when the user opts into automatic re-login. */
+data class JmCredentials(
+    val username: String,
+    val password: String,
 )
 
 @Immutable

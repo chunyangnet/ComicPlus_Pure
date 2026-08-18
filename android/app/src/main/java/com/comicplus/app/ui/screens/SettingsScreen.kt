@@ -518,7 +518,7 @@ private fun JmAccountSettings(
 
                 else -> {
                     Text(
-                        "登录 JM 官方账号后，收藏会在设备间同步；密码不会保存在本机。",
+                        "密码会以加密形式保存在本机，仅用于登录状态失效时自动重新登录。",
                         color = Muted,
                         style = MaterialTheme.typography.bodySmall,
                     )

@@ -234,6 +234,7 @@ class JmGateway(context: Context) {
     @Volatile private var autoSelectSource = true
     @Volatile private var preferredSourceHost: String? = null
     @Volatile private var authenticatedSession: JmSession? = null
+    @Volatile private var loginResponseAvs: String? = null
 
     fun setSourcePreferences(
         autoSelect: Boolean,
@@ -288,6 +289,7 @@ class JmGateway(context: Context) {
 
     fun clearSession() {
         authenticatedSession = null
+        loginResponseAvs = null
         cookies.clear()
         initializedCookieHosts.clear()
     }
@@ -704,7 +706,8 @@ class JmGateway(context: Context) {
             allowUnauthenticated = true,
         )
         val accountPayload = payload.optJSONObject("data") ?: payload
-        val avs = firstJsonString(accountPayload, "s", "AVS", "avs").take(MAX_AVS_LENGTH)
+        val payloadAvs = firstJsonString(accountPayload, "s", "AVS", "avs").take(MAX_AVS_LENGTH)
+        val avs = selectLoginAvs(payloadAvs, loginResponseAvs)
         val status = firstJsonString(accountPayload, "status", "result").lowercase()
         if (avs.isBlank() || status in setOf("error", "fail", "failed", "false")) {
             throw JmAuthException(
@@ -2571,6 +2574,14 @@ class JmGateway(context: Context) {
         ensureCookies(domain)
         val timestamp = epochSeconds()
         val result = execute(domain, path, timestamp, APP_TOKEN_PROTOCOL_KEY, form).use { response ->
+            if (path == "/login") {
+                loginResponseAvs = Cookie.parseAll(response.request.url, response.headers)
+                    .lastOrNull { cookie ->
+                        cookie.name.equals("AVS", ignoreCase = true) &&
+                            cookie.value.isNotBlank() && cookie.value.length <= MAX_AVS_LENGTH
+                    }
+                    ?.value
+            }
             val envelope = JSONObject(response.body.readStringLimited(MAX_API_RESPONSE_BYTES))
             val responseCode = envelope.int("code") ?: response.code
             if (!response.isSuccessful || responseCode != 200) {
@@ -2634,7 +2645,7 @@ class JmGateway(context: Context) {
     private fun updateAuthenticatedSessionFromCookie(cookie: Cookie) {
         if (!cookie.name.equals("AVS", ignoreCase = true)) return
         val domain = cookie.domain.lowercase()
-        if (domain !in domains && domain !in officialDomains) return
+        if (!isCookieDomainForHosts(domain, domains + officialDomains)) return
         val updatedAvs = cookie.value.takeIf { it.isNotBlank() && it.length <= MAX_AVS_LENGTH } ?: return
         val current = authenticatedSession ?: return
         if (current.avs != updatedAvs) authenticatedSession = current.copy(avs = updatedAvs)
@@ -2991,6 +3002,19 @@ class JmGateway(context: Context) {
             lastWarmedAt != null && now >= lastWarmedAt && now - lastWarmedAt < IMAGE_WARMUP_REUSE_MILLIS
         internal fun shouldInvalidateRestoredSession(authFailures: Int, otherFailures: Int): Boolean =
             authFailures > 0 && otherFailures == 0
+        internal fun selectLoginAvs(payloadAvs: String, responseCookieAvs: String?): String =
+            responseCookieAvs
+                ?.take(MAX_AVS_LENGTH)
+                ?.takeIf(String::isNotBlank)
+                ?: payloadAvs.take(MAX_AVS_LENGTH)
+        internal fun isCookieDomainForHosts(cookieDomain: String, hosts: Collection<String>): Boolean {
+            val domain = cookieDomain.trim().trimStart('.').lowercase()
+            if (domain.isBlank() || domain.length > 253 || !safeHost.matches(domain)) return false
+            return hosts.any { rawHost ->
+                val host = rawHost.trim().lowercase()
+                host == domain || host.endsWith(".$domain")
+            }
+        }
         internal fun prioritizeHostsByFailureCooldown(
             candidates: List<String>,
             failedAt: Map<String, Long>,
