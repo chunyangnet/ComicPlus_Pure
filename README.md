@@ -2,8 +2,8 @@
 
 [![License: Personal Non-Commercial Learning](https://img.shields.io/badge/license-personal%20non--commercial-red.svg)](LICENSE)
 
-[Download](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.4.1/Comic-Plus-release-v1.4.1.apk) | [下载](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.4.1/Comic-Plus-release-v1.4.1.apk) | [ダウンロード](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.4.1/Comic-Plus-release-v1.4.1.apk)<br>
-[![Download](https://img.shields.io/badge/Download-Comic%20Plus-blue?style=flat&logo=android)](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.4.1/Comic-Plus-release-v1.4.1.apk)
+[Download](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.5.0/Comic-Plus-release-v1.5.0.apk) | [下载](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.5.0/Comic-Plus-release-v1.5.0.apk) | [ダウンロード](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.5.0/Comic-Plus-release-v1.5.0.apk)<br>
+[![Download](https://img.shields.io/badge/Download-Comic%20Plus-blue?style=flat&logo=android)](https://github.com/chunyangnet/ComicPlus_Pure/releases/download/v1.5.0/Comic-Plus-release-v1.5.0.apk)
 
 ---
 
