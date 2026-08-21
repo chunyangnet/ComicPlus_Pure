@@ -1,6 +1,7 @@
 package com.comicplus.pure
 
 import com.comicplus.app.ui.ComicUiItem
+import com.comicplus.app.ui.JmFavoriteFolderUiItem
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -83,6 +84,24 @@ class LibraryStoreTest {
         store.replaceFavorites(listOf(comic("2"), comic("2"), comic("3")))
 
         assertEquals(listOf("2", "3"), store.loadFavorites().map(ComicUiItem::jmId))
+    }
+
+    @Test
+    fun favoriteFolderSnapshotsKeepTheAllFolderAndRemainAccountScoped() {
+        val store = LibraryStore()
+        store.replaceFavoriteFolders(
+            ownerId = "42",
+            folders = listOf(
+                JmFavoriteFolderUiItem(id = "7", name = "稍后阅读"),
+                JmFavoriteFolderUiItem(id = "7", name = "重复项"),
+            ),
+        )
+
+        assertEquals(
+            listOf("0", "7"),
+            store.loadFavoriteFolders("42").map(JmFavoriteFolderUiItem::id),
+        )
+        assertEquals(listOf("0"), store.loadFavoriteFolders("99").map(JmFavoriteFolderUiItem::id))
     }
 
     @Test

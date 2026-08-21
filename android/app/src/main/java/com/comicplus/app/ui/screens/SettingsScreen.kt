@@ -36,6 +36,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
@@ -65,6 +66,8 @@ import com.comicplus.app.ui.AppSettings
 import com.comicplus.app.ui.AppUpdateUiState
 import com.comicplus.app.ui.JmAccountStatus
 import com.comicplus.app.ui.JmAccountUiState
+import com.comicplus.app.ui.JmDailyStatus
+import com.comicplus.app.ui.JmDailyUiState
 import com.comicplus.app.ui.markdownToAnnotatedString
 import com.comicplus.app.ui.LocalComicPlusReduceMotion
 import com.comicplus.app.ui.ReaderDirection
@@ -82,6 +85,7 @@ import com.comicplus.app.ui.theme.Muted
 import com.comicplus.app.ui.theme.SurfaceSoft
 import com.comicplus.app.ui.theme.White
 import com.comicplus.pure.DownloadedChapter
+import com.comicplus.pure.isSignedToday
 import com.comicplus.app.ui.JmSourceUiState
 import com.comicplus.app.ui.JmSourceUiItem
 import java.text.SimpleDateFormat
@@ -91,6 +95,167 @@ import java.time.format.DateTimeFormatter
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
+
+@Composable
+fun ProfileScreen(
+    account: JmAccountUiState,
+    daily: JmDailyUiState,
+    favoriteCount: Int,
+    historyCount: Int,
+    downloads: List<DownloadedChapter>,
+    sourceStatus: JmSourceUiState,
+    updateStatus: AppUpdateUiState,
+    onOpenSettings: () -> Unit,
+    onLogin: (String, String) -> Unit,
+    onLogout: () -> Unit,
+    onSyncFavorites: () -> Unit,
+    onLoadDaily: () -> Unit,
+    onCheckIn: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var jmUsername by remember { mutableStateOf(account.username) }
+    var jmPassword by remember { mutableStateOf("") }
+    LaunchedEffect(account.username, account.status) {
+        if (account.username.isNotBlank()) jmUsername = account.username
+        if (account.status == JmAccountStatus.SignedIn) jmPassword = ""
+    }
+
+    Column(modifier.fillMaxSize().background(Canvas)) {
+        ComicPlusTopBar(
+            title = "个人",
+            subtitle = if (account.signedIn) "${account.username.ifBlank { "JM 官方账号" }} · 账号与本机数据" else "账号与本机数据",
+            actions = listOf(
+                com.comicplus.app.ui.components.AppBarAction(
+                    icon = Icons.Outlined.Settings,
+                    label = "设置",
+                    onClick = onOpenSettings,
+                ),
+            ),
+        )
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(bottom = 32.dp),
+        ) {
+            item {
+                SettingsSectionTitle("JM 官方账号")
+                JmAccountSettings(
+                    account = account,
+                    username = jmUsername,
+                    password = jmPassword,
+                    onUsernameChange = { jmUsername = it.take(128) },
+                    onPasswordChange = { jmPassword = it.take(512) },
+                    onLogin = {
+                        onLogin(jmUsername.trim(), jmPassword)
+                        jmPassword = ""
+                    },
+                    onLogout = onLogout,
+                    onSyncFavorites = onSyncFavorites,
+                )
+            }
+            item {
+                ProfileMetrics(
+                    favoriteCount = account.favoriteCount?.coerceAtMost(Int.MAX_VALUE.toLong())?.toInt() ?: favoriteCount,
+                    historyCount = historyCount,
+                    downloadCount = downloads.count(DownloadedChapter::complete),
+                )
+            }
+            if (account.signedIn) {
+                item {
+                    DailyCheckInCard(
+                        daily = daily,
+                        onLoad = onLoadDaily,
+                        onCheckIn = onCheckIn,
+                        modifier = Modifier.padding(horizontal = CpDimens.screenPadding),
+                    )
+                }
+            }
+            item {
+                SettingsSectionTitle("服务状态")
+                ProfileStatusPanel(sourceStatus, updateStatus)
+            }
+            item {
+                Text(
+                    "Comic Plus · 阅读记录、设置与下载均保存在本机",
+                    modifier = Modifier.fillMaxWidth().padding(top = 28.dp).navigationBarsPadding(),
+                    color = Muted,
+                    style = MaterialTheme.typography.bodySmall,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfileMetrics(favoriteCount: Int, historyCount: Int, downloadCount: Int) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = CpDimens.screenPadding, vertical = 12.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        listOf(
+            "收藏" to favoriteCount,
+            "历史" to historyCount,
+            "离线" to downloadCount,
+        ).forEachIndexed { index, (label, value) ->
+            Surface(
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(if (index == 0) 16.dp else 8.dp),
+                color = if (index == 0) MaterialTheme.colorScheme.primaryContainer else SurfaceSoft,
+            ) {
+                Column(Modifier.padding(horizontal = 10.dp, vertical = 13.dp)) {
+                    Text(
+                        value.toString(),
+                        color = if (index == 0) MaterialTheme.colorScheme.onPrimaryContainer else Ink,
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        label,
+                        color = if (index == 0) MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = .68f) else Muted,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfileStatusPanel(sourceStatus: JmSourceUiState, updateStatus: AppUpdateUiState) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = CpDimens.screenPadding),
+        shape = RoundedCornerShape(CpDimens.cardRadius),
+        color = MaterialTheme.colorScheme.surface,
+    ) {
+        Column(Modifier.padding(horizontal = 15.dp, vertical = 5.dp)) {
+            ProfileStatusRow(
+                icon = Icons.Outlined.NetworkCheck,
+                title = "JM 官方源",
+                description = sourceStatusSummary(sourceStatus),
+                warning = sourceStatus.error != null,
+            )
+            Box(Modifier.fillMaxWidth().height(1.dp).background(MaterialTheme.colorScheme.outlineVariant))
+            ProfileStatusRow(
+                icon = Icons.Outlined.SystemUpdateAlt,
+                title = "应用版本 ${updateStatus.currentVersion.ifBlank { "未知" }}",
+                description = updateStatusSummary(updateStatus),
+                warning = updateStatus.error != null,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ProfileStatusRow(icon: ImageVector, title: String, description: String, warning: Boolean) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+        Icon(icon, null, tint = if (warning) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, color = Ink, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
+            Text(description, color = if (warning) MaterialTheme.colorScheme.error else Muted, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
 
 @Composable
 fun SettingsScreen(
@@ -105,23 +270,23 @@ fun SettingsScreen(
     onOpenUpdate: (String) -> Unit,
     onOpenDownload: (DownloadedChapter) -> Unit,
     onDeleteDownload: (DownloadedChapter) -> Unit,
+    onBack: () -> Unit,
     modifier: Modifier = Modifier,
-    account: JmAccountUiState = JmAccountUiState(),
-    onLogin: (String, String) -> Unit = { _, _ -> },
-    onLogout: () -> Unit = {},
-    onSyncFavorites: () -> Unit = {},
 ) {
     var pendingDelete by remember { mutableStateOf<DownloadedChapter?>(null) }
     var showUpdateDetails by remember { mutableStateOf(false) }
-    var jmUsername by remember { mutableStateOf(account.username) }
-    var jmPassword by remember { mutableStateOf("") }
-    LaunchedEffect(account.username, account.status) {
-        if (account.username.isNotBlank()) jmUsername = account.username
-        if (account.status == JmAccountStatus.SignedIn) jmPassword = ""
-    }
     LaunchedEffect(Unit) { onCheckUpdates(false) }
     Column(modifier.fillMaxSize().background(Canvas)) {
-        ComicPlusTopBar(title = "设置", subtitle = "应用设置、JM 账号与下载管理", actions = emptyList())
+        ComicPlusTopBar(
+            title = "设置",
+            subtitle = "阅读、外观、连接与存储",
+            actions = emptyList(),
+            leading = {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "返回", tint = Ink)
+                }
+            },
+        )
         LazyColumn(modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 32.dp)) {
             item {
                 SettingsSectionTitle("外观")
@@ -253,6 +418,12 @@ fun SettingsScreen(
                 SettingsSwitchRow(Icons.Outlined.Cached, "自动续读", "仅在本机保存章节与页码", settings.autoResumeReading) {
                     onSettingsChange(settings.copy(autoResumeReading = it))
                 }
+                SettingsSwitchRow(
+                    Icons.Outlined.FormatListNumbered,
+                    "按顺序加载漫画页",
+                    "开启后必须完成上一页，才会继续请求下一页；默认关闭",
+                    settings.sequentialPageLoading,
+                ) { onSettingsChange(settings.copy(sequentialPageLoading = it)) }
                 SettingsSwitchRow(Icons.Outlined.Cached, "保持屏幕常亮", "仅在阅读器打开期间生效", settings.keepScreenOn) {
                     onSettingsChange(settings.copy(keepScreenOn = it))
                 }
@@ -267,22 +438,6 @@ fun SettingsScreen(
                         ),
                     )
                 }
-            }
-            item {
-                SettingsSectionTitle("JM 官方账号")
-                JmAccountSettings(
-                    account = account,
-                    username = jmUsername,
-                    password = jmPassword,
-                    onUsernameChange = { jmUsername = it.take(128) },
-                    onPasswordChange = { jmPassword = it.take(512) },
-                    onLogin = {
-                        onLogin(jmUsername.trim(), jmPassword)
-                        jmPassword = ""
-                    },
-                    onLogout = onLogout,
-                    onSyncFavorites = onSyncFavorites,
-                )
             }
             item {
                 SettingsSectionTitle("本地存储")
@@ -575,6 +730,74 @@ private fun JmAccountSettings(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DailyCheckInCard(
+    daily: JmDailyUiState,
+    onLoad: () -> Unit,
+    onCheckIn: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    LaunchedEffect(daily.status) {
+        if (daily.status == JmDailyStatus.Idle) onLoad()
+    }
+    val info = daily.info
+    val todaySigned = daily.confirmedToday || info?.isSignedToday() == true
+    Surface(
+        modifier = modifier.fillMaxWidth().padding(top = 13.dp),
+        color = SurfaceSoft,
+        shape = RoundedCornerShape(CpDimens.controlRadius),
+    ) {
+        Column(Modifier.padding(13.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Outlined.EmojiEvents, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("每日签到", color = Ink, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold)
+                    Text(
+                        when {
+                            daily.loading -> "正在读取官方签到状态…"
+                            daily.checking -> "正在提交签到…"
+                            todaySigned -> "今日已签到"
+                            info?.dailyId.isNullOrBlank() -> "当前没有可用的签到活动"
+                            else -> "签到可领取官方活动奖励"
+                        },
+                        color = if (daily.error != null) MaterialTheme.colorScheme.error else Muted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                TextButton(onClick = onLoad, enabled = !daily.loading && !daily.checking) {
+                    Text("刷新")
+                }
+            }
+            info?.let { current ->
+                val signedCount = current.records.count { it.signed }
+                Text(
+                    "本月已签到 $signedCount 天${current.eventName.takeIf(String::isNotBlank)?.let { " · $it" }.orEmpty()}",
+                    modifier = Modifier.padding(top = 8.dp),
+                    color = Muted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Button(
+                    onClick = onCheckIn,
+                    enabled = !todaySigned && !daily.loading && !daily.checking && current.dailyId.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                ) {
+                    if (daily.checking) CircularProgressIndicator(Modifier.size(17.dp), color = MaterialTheme.colorScheme.onPrimary, strokeWidth = 2.dp)
+                    else Icon(Icons.Outlined.CheckCircle, null, modifier = Modifier.size(17.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (todaySigned) "今日已签到" else "立即签到")
+                }
+            }
+            daily.message?.takeIf(String::isNotBlank)?.let { message ->
+                Text(message, modifier = Modifier.padding(top = 7.dp), color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
+            }
+            daily.error?.takeIf(String::isNotBlank)?.let { error ->
+                Text(error, modifier = Modifier.padding(top = 7.dp), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             }
         }
     }

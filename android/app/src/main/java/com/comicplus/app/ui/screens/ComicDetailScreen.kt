@@ -65,6 +65,7 @@ import com.comicplus.app.ui.markdownToAnnotatedString
 import com.comicplus.app.ui.rememberDelayedBusyIndicator
 import com.comicplus.app.ui.components.ComicCover
 import com.comicplus.app.ui.components.CpDimens
+import com.comicplus.app.ui.components.ExpandableTagFlow
 import com.comicplus.app.ui.components.FavoriteButton
 import com.comicplus.app.ui.components.PillRow
 import com.comicplus.app.ui.components.SearchCapsule
@@ -103,6 +104,7 @@ fun ComicDetailScreen(
     onDownload: (ComicResolveUiState.Ready, SourceChapterDto) -> Unit = { _, _ -> },
     isFavorite: Boolean = false,
     onToggleFavorite: (ComicResolveUiState.Ready) -> Unit = {},
+    onOpenTag: (String) -> Unit = {},
     comments: JmCommentsUiState = JmCommentsUiState(),
     onRetryComments: () -> Unit = {},
     onLoadMoreComments: () -> Unit = {},
@@ -148,6 +150,7 @@ fun ComicDetailScreen(
                 onDownload = onDownload,
                 isFavorite = isFavorite,
                 onToggleFavorite = { onToggleFavorite(state) },
+                onOpenTag = onOpenTag,
                 comments = comments,
                 onRetryComments = onRetryComments,
                 onLoadMoreComments = onLoadMoreComments,
@@ -262,6 +265,7 @@ private fun DetailReady(
     onDownload: (ComicResolveUiState.Ready, SourceChapterDto) -> Unit,
     isFavorite: Boolean,
     onToggleFavorite: () -> Unit,
+    onOpenTag: (String) -> Unit,
     comments: JmCommentsUiState,
     onRetryComments: () -> Unit,
     onLoadMoreComments: () -> Unit,
@@ -403,6 +407,7 @@ private fun DetailReady(
                     state,
                     isFavorite = isFavorite,
                     onToggleFavorite = onToggleFavorite,
+                    onOpenTag = onOpenTag,
                     modifier = Modifier.padding(horizontal = CpDimens.screenPadding),
                 )
                 Spacer(Modifier.height(14.dp))
@@ -1000,6 +1005,7 @@ private fun ComicDetailHeader(
     state: ComicResolveUiState.Ready,
     isFavorite: Boolean,
     onToggleFavorite: () -> Unit,
+    onOpenTag: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val favoriteKey = "${state.source}:${state.jmId}"
@@ -1088,6 +1094,21 @@ private fun ComicDetailHeader(
                 }
             }
         }
+    }
+    if (state.tags.isNotEmpty()) {
+        Spacer(Modifier.height(14.dp))
+        Text(
+            "标签",
+            modifier = Modifier.fillMaxWidth().padding(horizontal = CpDimens.screenPadding),
+            color = Muted,
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.Bold,
+        )
+        Spacer(Modifier.height(7.dp))
+        ExpandableTagFlow(
+            labels = state.tags,
+            onSelected = { index -> state.tags.getOrNull(index)?.let(onOpenTag) },
+        )
     }
     if (state.description.isNotBlank()) {
         val description by produceState<AnnotatedString?>(initialValue = null, key1 = state.description) {

@@ -7,6 +7,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 internal data class SystemRouteSnapshot(
     val networkHandle: Long?,
@@ -27,12 +28,16 @@ internal fun systemRouteChanged(
 internal object SystemVpnMonitor {
     private val started = AtomicBoolean(false)
     private val listeners = CopyOnWriteArrayList<() -> Unit>()
+    private val routeGenerationCounter = AtomicLong()
     private val snapshotLock = Any()
     private var snapshot: SystemRouteSnapshot? = null
 
     @Volatile
     var isVpnActive: Boolean = false
         private set
+
+    val routeGeneration: Long
+        get() = routeGenerationCounter.get()
 
     fun start(context: Context) {
         if (!started.compareAndSet(false, true)) return
@@ -70,7 +75,10 @@ internal object SystemVpnMonitor {
             isVpnActive = current.vpnActive
             routeChanged
         }
-        if (changed) listeners.forEach { listener -> runCatchingNonFatal(listener) }
+        if (changed) {
+            routeGenerationCounter.incrementAndGet()
+            listeners.forEach { listener -> runCatchingNonFatal(listener) }
+        }
     }
 }
 

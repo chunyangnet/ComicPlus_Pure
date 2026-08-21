@@ -6,6 +6,8 @@ import com.comicplus.app.data.source.DirectReaderPage
 import com.comicplus.app.data.source.SourceChapterDto
 import com.comicplus.app.data.source.SourceIds
 import com.comicplus.pure.DownloadedChapter
+import com.comicplus.pure.JmDailyInfo
+import java.time.LocalDate
 
 @Immutable
 data class ComicUiItem(
@@ -150,6 +152,27 @@ data class JmAccountUiState(
     val signedIn: Boolean get() = status == JmAccountStatus.SignedIn
 }
 
+enum class JmDailyStatus {
+    Idle,
+    Loading,
+    Ready,
+    Checking,
+    Error,
+}
+
+@Immutable
+data class JmDailyUiState(
+    val status: JmDailyStatus = JmDailyStatus.Idle,
+    val info: JmDailyInfo? = null,
+    val confirmedEpochDay: Long? = null,
+    val message: String? = null,
+    val error: String? = null,
+) {
+    val loading: Boolean get() = status == JmDailyStatus.Loading
+    val checking: Boolean get() = status == JmDailyStatus.Checking
+    val confirmedToday: Boolean get() = confirmedEpochDay == LocalDate.now().toEpochDay()
+}
+
 @Immutable
 data class JmFavoriteFolderUiItem(
     val id: String,
@@ -195,6 +218,7 @@ sealed interface ComicResolveUiState {
         val chapters: List<SourceChapterDto>,
         val resumeChapterId: String? = null,
         val resumePageIndex: Int = 0,
+        val tags: List<String> = emptyList(),
     ) : ComicResolveUiState
     data class Error(val source: String, val jmId: String, val message: String) : ComicResolveUiState
 }
@@ -259,6 +283,7 @@ data class AppSettings(
     val reduceMotion: Boolean = false,
     val tapToToggleReaderMenu: Boolean = true,
     val autoResumeReading: Boolean = true,
+    val sequentialPageLoading: Boolean = false,
     val dataSaver: Boolean = false,
     val autoSelectSource: Boolean = true,
     val preferredSourceHost: String? = null,
@@ -343,6 +368,7 @@ data class PureUiState(
     val detail: ComicResolveUiState = ComicResolveUiState.Idle,
     val comments: JmCommentsUiState = JmCommentsUiState(),
     val account: JmAccountUiState = JmAccountUiState(),
+    val daily: JmDailyUiState = JmDailyUiState(),
     val reader: ReaderUiState = ReaderUiState.Idle,
     val settings: AppSettings = AppSettings(),
     val message: String? = null,

@@ -136,6 +136,10 @@ class JmGateway(context: Context) {
     private val removeRouteChangeListener = SystemVpnMonitor.registerRouteChangeListener {
         evictConnectionsAsync(client, sourceProbeClient)
         failedAuthenticatedHosts.clear()
+        // A VPN/proxy switch can invalidate the lightweight /setting handshake even
+        // though the domain name and AVS cookie are unchanged. Force every route to
+        // re-establish that handshake before the next authenticated request.
+        initializedCookieHosts.clear()
         warmedImageHosts.clear()
     }
     private val cacheDir by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
@@ -896,6 +900,25 @@ class JmGateway(context: Context) {
             ),
             success = setOf("success", "ok", "1"),
         )
+    }
+
+    /** Reads the signed-in user's current official daily check-in calendar. */
+    suspend fun dailyInfo(): JmDailyInfo {
+        val session = authenticatedSession ?: throw JmAuthException("请先登录 JM 官方账号")
+        val payload = requestAuthenticatedJson("/daily?user_id=${encode(session.uid)}")
+        return withContext(Dispatchers.Default) { parseDailyInfo(payload) }
+    }
+
+    /** Submits today's official daily check-in for the current account. */
+    suspend fun dailyCheck(dailyId: String): JmDailyCheckResult {
+        val session = authenticatedSession ?: throw JmAuthException("请先登录 JM 官方账号")
+        require(dailyId.matches(safeNumericId)) { "签到活动编号无效" }
+        val payload = requestPostJson(
+            path = "/daily_chk",
+            form = mapOf("user_id" to session.uid, "daily_id" to dailyId),
+            retryAcrossDomains = false,
+        )
+        return withContext(Dispatchers.Default) { parseDailyCheckResult(payload) }
     }
 
     private fun requireAuthenticated() {

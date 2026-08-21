@@ -27,7 +27,7 @@ internal suspend fun prefetchReaderPages(
     prefetchPage: suspend (DirectReaderPage) -> Unit,
     cachedPage: (DirectReaderPage) -> Bitmap?,
 ) {
-    if (prefetchDistance <= 0) return
+    if (prefetchDistance <= 0 || settings.sequentialPageLoading) return
 
     val segment = loadedSegments.firstOrNull { it.chapterId == position.chapterId } ?: initialSegment
     val movementDirection = previousPosition

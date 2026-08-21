@@ -2,11 +2,13 @@ package com.comicplus.app.ui
 
 import com.comicplus.app.data.source.DirectReaderPage
 import com.comicplus.app.ui.screens.pagerPageToReadingIndex
+import com.comicplus.app.ui.screens.canLoadSequentialPage
 import com.comicplus.app.ui.screens.readerPagedPrefetchIndices
 import com.comicplus.app.ui.screens.readerPrefetchPlan
 import com.comicplus.app.ui.screens.readerPrefetchPlanForMode
 import com.comicplus.app.ui.screens.readerPrefetchIndices
 import com.comicplus.app.ui.screens.readingIndexToPagerPage
+import com.comicplus.app.ui.screens.sequentialPageLoadOrder
 import com.comicplus.app.ui.screens.shouldPreloadNextChapter
 import com.comicplus.app.ui.screens.verticalListIndexForPosition
 import com.comicplus.app.ui.screens.verticalPagePositionByDelta
@@ -17,6 +19,42 @@ class ReaderPrefetchTest {
     @Test
     fun readerDefaultsToMediumQuality() {
         assertEquals(ReaderImageQuality.Medium, AppSettings().readerImageQuality)
+        assertEquals(false, AppSettings().sequentialPageLoading)
+    }
+
+    @Test
+    fun sequentialLoadingWaitsForThePreviousPageAndPreviousChapter() {
+        assertEquals(true, canLoadSequentialPage(pageIndex = 4, startPageIndex = 4, loadedThroughPageIndex = 3))
+        assertEquals(false, canLoadSequentialPage(pageIndex = 5, startPageIndex = 4, loadedThroughPageIndex = 3))
+        assertEquals(true, canLoadSequentialPage(pageIndex = 5, startPageIndex = 4, loadedThroughPageIndex = 4))
+        assertEquals(
+            false,
+            canLoadSequentialPage(
+                pageIndex = 0,
+                startPageIndex = 0,
+                loadedThroughPageIndex = -1,
+                previousChapterComplete = false,
+            ),
+        )
+    }
+
+    @Test
+    fun sequentialLoadOrderIncludesEveryPredecessorFromTheResumePage() {
+        val pages = listOf("1.jpg", "2.jpg", "3.jpg").mapIndexed { index, file ->
+            DirectReaderPage(
+                index = index + 1,
+                photoId = "10",
+                fileName = file,
+                scrambleId = "0",
+                url = "https://example.com/$file",
+                referer = "https://example.com/",
+            )
+        }
+
+        assertEquals(
+            listOf("2.jpg", "3.jpg"),
+            sequentialPageLoadOrder(pages.drop(1), pages.last()).map(DirectReaderPage::fileName),
+        )
     }
 
     @Test

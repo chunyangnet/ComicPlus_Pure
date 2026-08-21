@@ -3,6 +3,7 @@ package com.comicplus.pure
 import android.content.Context
 import androidx.core.content.edit
 import com.comicplus.app.ui.ComicUiItem
+import com.comicplus.app.ui.JmFavoriteFolderUiItem
 import com.comicplus.app.ui.ReadingHistoryItem
 import com.comicplus.app.ui.key
 import org.json.JSONArray
@@ -18,13 +19,26 @@ class LibraryStore(context: Context? = null) {
     private val lock = Any()
     private var memoryFavorites: List<ComicUiItem> = emptyList()
     private var memoryHistory: List<ReadingHistoryItem> = emptyList()
+    private val memoryFavoriteFolders = mutableMapOf<String, List<JmFavoriteFolderUiItem>>()
     private var favoritesLoaded = false
     private var historyLoaded = false
+    private val favoriteFoldersLoaded = mutableSetOf<String>()
 
     fun loadFavorites(): List<ComicUiItem> = synchronized(lock) { readFavoritesLocked() }
 
     fun loadHistory(): List<ReadingHistoryItem> = synchronized(lock) {
         readHistoryLocked().sortedByDescending(ReadingHistoryItem::updatedAt)
+    }
+
+    /** Folder names are cached per JM account so a cold start does not hide them until sync finishes. */
+    fun loadFavoriteFolders(ownerId: String): List<JmFavoriteFolderUiItem> = synchronized(lock) {
+        val ownerKey = favoriteFolderOwnerKey(ownerId) ?: return@synchronized defaultFavoriteFolders()
+        readFavoriteFoldersLocked(ownerKey)
+    }
+
+    fun replaceFavoriteFolders(ownerId: String, folders: List<JmFavoriteFolderUiItem>) = synchronized(lock) {
+        val ownerKey = favoriteFolderOwnerKey(ownerId) ?: return@synchronized
+        writeFavoriteFoldersLocked(ownerKey, folders)
     }
 
     /** Returns the new favorite state. */
@@ -143,6 +157,28 @@ class LibraryStore(context: Context? = null) {
         return memoryHistory
     }
 
+    private fun readFavoriteFoldersLocked(ownerKey: String): List<JmFavoriteFolderUiItem> {
+        if (ownerKey in favoriteFoldersLoaded) return memoryFavoriteFolders[ownerKey].orEmpty()
+        val raw = preferences?.getString(favoriteFoldersPreferenceKey(ownerKey), null)
+        val array = raw?.let(::parseLibraryArray)
+        val folders = if (array == null) {
+            defaultFavoriteFolders()
+        } else {
+            runCatchingNonFatal {
+                val entryLimit = array.length().coerceAtMost(MAX_FAVORITE_FOLDERS)
+                buildList(entryLimit) {
+                    for (index in 0 until entryLimit) {
+                        array.optJSONObject(index)?.toFavoriteFolder()?.let(::add)
+                    }
+                }
+            }.getOrElse { emptyList() }
+                .let(::normalizeFavoriteFolders)
+        }
+        memoryFavoriteFolders[ownerKey] = folders
+        favoriteFoldersLoaded += ownerKey
+        return folders
+    }
+
     private fun writeFavoritesLocked(items: List<ComicUiItem>) {
         memoryFavorites = items
         favoritesLoaded = true
@@ -157,6 +193,15 @@ class LibraryStore(context: Context? = null) {
         if (preferences == null) return
         val value = JSONArray().apply { items.forEach { put(it.toJson()) } }.toString()
         preferences.edit(commit = true) { putString(HISTORY_KEY, value) }
+    }
+
+    private fun writeFavoriteFoldersLocked(ownerKey: String, folders: List<JmFavoriteFolderUiItem>) {
+        val normalized = normalizeFavoriteFolders(folders)
+        memoryFavoriteFolders[ownerKey] = normalized
+        favoriteFoldersLoaded += ownerKey
+        if (preferences == null) return
+        val value = JSONArray().apply { normalized.forEach { put(it.toJson()) } }.toString()
+        preferences.edit(commit = true) { putString(favoriteFoldersPreferenceKey(ownerKey), value) }
     }
 
     private fun ComicUiItem.toJson(): JSONObject = JSONObject()
@@ -209,6 +254,8 @@ class LibraryStore(context: Context? = null) {
         const val PREFERENCES_NAME = "comicplus_pure_library"
         const val FAVORITES_KEY = "favorites_v1"
         const val HISTORY_KEY = "history_v1"
+        private const val FAVORITE_FOLDERS_KEY_PREFIX = "favorite_folders_v1_"
+        private const val MAX_FAVORITE_FOLDERS = 100
         const val MAX_FAVORITES = 200
         const val MAX_HISTORY = 100
         internal const val MAX_LIBRARY_JSON_CHARS = 512 * 1024
@@ -228,6 +275,45 @@ class LibraryStore(context: Context? = null) {
                 .take(MAX_HISTORY),
         )
     }
+
+    private fun JmFavoriteFolderUiItem.toJson(): JSONObject = JSONObject()
+        .put("id", id.take(MAX_LIBRARY_ID_LENGTH))
+        .put("name", name.take(MAX_LIBRARY_FIELD_LENGTH))
+
+    private fun JSONObject.toFavoriteFolder(): JmFavoriteFolderUiItem? {
+        val id = optString("id").trim().take(MAX_LIBRARY_ID_LENGTH).takeIf(String::isNotBlank) ?: return null
+        val name = optString("name").trim().take(MAX_LIBRARY_FIELD_LENGTH)
+            .ifBlank { if (id == "0") "全部" else "收藏夹 $id" }
+        return JmFavoriteFolderUiItem(id = id, name = name)
+    }
+    private fun favoriteFolderOwnerKey(ownerId: String): String? {
+        val normalized = ownerId.trim().take(MAX_LIBRARY_ID_LENGTH)
+        if (normalized.isBlank()) return null
+        return normalized.encodeToByteArray().joinToString(separator = "") { byte ->
+            "%02x".format(byte.toInt() and 0xff)
+        }
+    }
+
+    private fun favoriteFoldersPreferenceKey(ownerKey: String): String =
+        "$FAVORITE_FOLDERS_KEY_PREFIX$ownerKey"
+
+    private fun defaultFavoriteFolders(): List<JmFavoriteFolderUiItem> =
+        listOf(JmFavoriteFolderUiItem(id = "0", name = "全部"))
+
+    private fun normalizeFavoriteFolders(folders: List<JmFavoriteFolderUiItem>): List<JmFavoriteFolderUiItem> =
+        (defaultFavoriteFolders() + folders)
+            .map { folder ->
+                val id = folder.id.trim().take(MAX_LIBRARY_ID_LENGTH)
+                JmFavoriteFolderUiItem(
+                    id = id,
+                    name = folder.name.trim().take(MAX_LIBRARY_FIELD_LENGTH)
+                        .ifBlank { if (id == "0") "全部" else "收藏夹 $id" },
+                )
+            }
+            .filter { it.id.isNotBlank() }
+            .distinctBy(JmFavoriteFolderUiItem::id)
+            .take(MAX_FAVORITE_FOLDERS)
+            .ifEmpty(::defaultFavoriteFolders)
 }
 
 private fun ComicUiItem.sanitized(): ComicUiItem? {

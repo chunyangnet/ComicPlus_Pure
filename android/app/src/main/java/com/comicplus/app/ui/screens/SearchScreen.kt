@@ -227,6 +227,9 @@ private fun SearchResultList(
         state.items.isNotEmpty() && state.hasMore && !state.loadingMore && state.error == null,
     )
     val currentOnLoadMore = rememberUpdatedState(onLoadMore)
+    LaunchedEffect(state.query, state.mainTag, state.order) {
+        listState.scrollToItem(0)
+    }
     // Loading and item-count changes must not restart this collector: if the
     // viewport is still near the end, a restart would immediately chain pages.
     LaunchedEffect(listState, state.query, state.mainTag, state.order) {
@@ -265,6 +268,7 @@ private fun SearchResultList(
 				).joinToString("  ·  "),
 				isFavorite = comic.key in favoriteKeys,
 				onToggleFavorite = { onToggleFavorite(comic) },
+				coverWidthOverride = 60.dp,
 			)
         }
         if (state.loadingMore) item("loading-more") {
@@ -290,7 +294,7 @@ private fun SearchResultList(
 private fun SearchSkeleton(reduceMotion: Boolean) {
     val brush = rememberShimmerBrush(animated = !reduceMotion)
     Column(Modifier.padding(horizontal = CpDimens.screenPadding, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        repeat(7) { ShimmerBlock(brush, Modifier.fillMaxWidth().height(82.dp), RoundedCornerShape(CpDimens.controlRadius)) }
+        repeat(7) { ShimmerBlock(brush, Modifier.fillMaxWidth().height(96.dp), RoundedCornerShape(CpDimens.controlRadius)) }
     }
 }
 

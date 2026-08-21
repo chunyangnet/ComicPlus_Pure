@@ -6,6 +6,7 @@ import org.junit.Test
 import org.json.JSONObject
 import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import java.time.LocalDate
 
 class JmGatewayProtocolTest {
     @Test
@@ -130,6 +131,55 @@ class JmGatewayProtocolTest {
                 ?.objectsOrValues(limit = 2)
                 ?.mapNotNull(Any?::primitiveContent),
         )
+    }
+
+    @Test
+    fun dailyPayloadParsesNestedCalendarAndAliases() {
+        val info = parseDailyInfo(
+            JSONObject(
+                """
+                {
+                  "data": {
+                    "daily_id": "42",
+                    "event_name": "8月签到",
+                    "currentProgress": "3",
+                    "three_days_coin": "150",
+                    "record": [
+                      [{"date":"2026-08-20","signed":true,"bonus":false}],
+                      [{"date":"21","is_sign":"1","bonus":"true"}]
+                    ]
+                  }
+                }
+                """.trimIndent(),
+            ),
+        )
+
+        assertEquals("42", info.dailyId)
+        assertEquals("8月签到", info.eventName)
+        assertEquals(150L, info.threeDaysCoin)
+        assertEquals(2, info.records.size)
+        assertEquals(true, info.records[1].signed)
+        assertEquals(true, info.records[1].bonus)
+    }
+
+    @Test
+    fun dailyCheckResultAcceptsAlreadySignedAndRejectsFailures() {
+        assertEquals(true, parseDailyCheckResult(JSONObject("""{"msg":"今天已经签到过了"}""")).accepted)
+        assertEquals(true, parseDailyCheckResult(JSONObject("""{"status":"success","msg":"签到成功"}""")).accepted)
+        assertEquals(false, parseDailyCheckResult(JSONObject("""{"status":"error","msg":"请求失败"}""")).accepted)
+    }
+
+    @Test
+    fun dailyInfoRecognizesFullDateAndDayOnlyRecords() {
+        val info = JmDailyInfo(
+            dailyId = "1",
+            records = listOf(
+                JmDailyRecord(date = "2026-08-21", signed = true),
+                JmDailyRecord(date = "21", signed = true),
+            ),
+        )
+        assertEquals(true, info.isSignedToday(LocalDate.of(2026, 8, 21)))
+        assertEquals(false, info.isSignedToday(LocalDate.of(2026, 8, 22)))
     }
 
     @Test

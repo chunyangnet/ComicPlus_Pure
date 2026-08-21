@@ -28,6 +28,7 @@ internal class JmChapterPreloader(
         if (
             settings.readerPrefetchMode != ReaderPrefetchMode.UltraAggressive ||
             settings.dataSaver ||
+            settings.sequentialPageLoading ||
             pages.isEmpty() ||
             jobs[chapterId]?.isActive == true
         ) return

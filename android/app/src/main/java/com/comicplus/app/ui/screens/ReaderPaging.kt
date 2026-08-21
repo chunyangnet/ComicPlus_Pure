@@ -1,6 +1,11 @@
 package com.comicplus.app.ui.screens
 
 import com.comicplus.app.ui.ReaderDirection
+import android.graphics.Bitmap
+import com.comicplus.app.data.source.DirectReaderPage
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 internal data class ReaderProgressPosition(
     val chapterId: String,
@@ -119,3 +124,67 @@ internal fun shouldPreloadNextChapter(
     val safePageIndex = currentPageIndex.coerceIn(0, pageCount - 1)
     return pageCount - safePageIndex - 1 <= distance
 }
+
+internal fun canLoadSequentialPage(
+    pageIndex: Int,
+    startPageIndex: Int,
+    loadedThroughPageIndex: Int,
+    previousChapterComplete: Boolean = true,
+): Boolean {
+    if (!previousChapterComplete || pageIndex < 0) return false
+    val safeStart = startPageIndex.coerceAtLeast(0)
+    return pageIndex <= safeStart || pageIndex <= loadedThroughPageIndex + 1
+}
+
+internal fun sequentialPageLoadOrder(
+    sequence: List<DirectReaderPage>,
+    target: DirectReaderPage,
+): List<DirectReaderPage> {
+    val targetKey = target.sequentialLoadKey()
+    val targetIndex = sequence.indexOfFirst { it.sequentialLoadKey() == targetKey }
+    return if (targetIndex >= 0) sequence.subList(0, targetIndex + 1) else listOf(target)
+}
+
+internal class SequentialPageLoadGate {
+    private val mutex = Mutex()
+    private val completed = HashSet<String>()
+    private val completion = HashMap<String, CompletableDeferred<Unit>>()
+
+    suspend fun awaitAvailable(page: DirectReaderPage) {
+        val waiter = mutex.withLock {
+            val key = page.sequentialLoadKey()
+            if (key in completed) return@withLock null
+            completion.getOrPut(key) { CompletableDeferred() }
+        }
+        waiter?.await()
+    }
+
+    suspend fun load(
+        sequence: List<DirectReaderPage>,
+        target: DirectReaderPage,
+        cachedPage: (DirectReaderPage) -> Bitmap?,
+        loader: suspend (DirectReaderPage, Boolean) -> Bitmap,
+    ): Bitmap = mutex.withLock {
+        val targetKey = target.sequentialLoadKey()
+        var targetBitmap: Bitmap? = null
+        sequentialPageLoadOrder(sequence, target).forEach { page ->
+            val key = page.sequentialLoadKey()
+            val isTarget = key == targetKey
+            val cached = cachedPage(page)
+            if (key in completed && !isTarget) return@forEach
+            val bitmap = cached ?: loader(page, isTarget)
+            completed += key
+            completion.remove(key)?.complete(Unit)
+            if (isTarget) targetBitmap = bitmap
+        }
+        targetBitmap ?: cachedPage(target)?.also {
+            completed += targetKey
+            completion.remove(targetKey)?.complete(Unit)
+        } ?: loader(target, true).also {
+            completed += targetKey
+            completion.remove(targetKey)?.complete(Unit)
+        }
+    }
+}
+
+private fun DirectReaderPage.sequentialLoadKey(): String = "$photoId|$fileName"

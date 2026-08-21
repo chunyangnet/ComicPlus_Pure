@@ -125,6 +125,7 @@ internal fun JmComic.toResolveState(progress: LocalReadingProgress?) = ComicReso
     title = title,
     description = description,
     coverUrl = coverUrl,
+    tags = tags,
     cacheState = "direct",
     refreshing = false,
     chapters = chapters.map { SourceChapterDto(it.id, it.index, it.title) },

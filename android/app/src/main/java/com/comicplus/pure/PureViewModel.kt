@@ -19,6 +19,8 @@ import com.comicplus.app.ui.JmBrowseOptionUi
 import com.comicplus.app.ui.JmCommentsUiState
 import com.comicplus.app.ui.JmAccountStatus
 import com.comicplus.app.ui.JmAccountUiState
+import com.comicplus.app.ui.JmDailyStatus
+import com.comicplus.app.ui.JmDailyUiState
 import com.comicplus.app.ui.JmFavoriteFolderUiItem
 import com.comicplus.app.ui.JmFavoriteFoldersUiState
 import com.comicplus.app.ui.JmTagGroupUi
@@ -53,6 +55,7 @@ import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.ConcurrentHashMap
+import java.time.LocalDate
 
 class PureViewModel(
     private val gateway: JmGateway,
@@ -100,6 +103,8 @@ class PureViewModel(
     private var detailJob: Job? = null
     private var commentsJob: Job? = null
     private var accountJob: Job? = null
+    private var dailyJob: Job? = null
+    private var favoriteCatalogJob: Job? = null
     private var favoriteFolderJob: Job? = null
     private var readerJob: Job? = null
     private var readerWarmupJob: Job? = null
@@ -147,6 +152,12 @@ class PureViewModel(
     private val favoriteOperationGeneration = AtomicLong()
     private val favoriteMutationRevision = AtomicLong()
     private var automaticReloginAttempts = 0
+    private var lastGatewayRouteGeneration = SystemVpnMonitor.routeGeneration
+    private val removeRouteChangeListener = SystemVpnMonitor.registerRouteChangeListener {
+        if (appInForeground.get()) {
+            viewModelScope.launch { handleSystemRouteChange() }
+        }
+    }
 
     init {
         viewModelScope.launch {
@@ -1132,6 +1143,70 @@ class PureViewModel(
                 .take(MAX_FAVORITE_ENTRIES)
         }
 
+    private suspend fun loadCachedFavoriteFolders(ownerId: String): List<JmFavoriteFolderUiItem> =
+        withContext(Dispatchers.IO) { libraryStore.loadFavoriteFolders(ownerId) }
+
+    private fun persistFavoriteFoldersSnapshot(ownerId: String, folders: List<JmFavoriteFolderUiItem>) {
+        if (ownerId.isBlank()) return
+        val snapshot = folders
+        persistenceScope.launch {
+            libraryStore.replaceFavoriteFolders(ownerId, snapshot)
+        }
+    }
+
+    private fun refreshFavoriteFolderCatalog(session: JmSession) {
+        favoriteCatalogJob?.cancel()
+        favoriteCatalogJob = viewModelScope.launch {
+            try {
+                val page = gateway.favoritePage(page = 1, folderId = "0")
+                val fetchedFolders = page.folders.toFavoriteFolderUiItems()
+                var foldersToPersist: List<JmFavoriteFolderUiItem>? = null
+                _state.update { state ->
+                    if (
+                        !state.account.signedIn ||
+                        state.account.uid != session.uid ||
+                        state.account.username != session.username
+                    ) return@update state
+                    val folders = fetchedFolders.takeIf { it.size > 1 || state.favoriteFolders.folders.size <= 1 }
+                        ?: state.favoriteFolders.folders
+                    val selectedFolderId = state.favoriteFolders.selectedFolderId
+                        .takeIf { selected -> folders.any { it.id == selected } }
+                        ?: "0"
+                    foldersToPersist = folders
+                    state.copy(
+                        account = state.account.copy(
+                            favoriteCount = state.account.favoriteCount ?: page.total,
+                        ),
+                        favoriteFolders = state.favoriteFolders.copy(
+                            folders = folders,
+                            selectedFolderId = selectedFolderId,
+                            items = if (selectedFolderId == "0") state.favorites else state.favoriteFolders.items,
+                            total = if (selectedFolderId == "0") page.total else state.favoriteFolders.total,
+                            error = null,
+                        ),
+                    )
+                }
+                foldersToPersist?.let { persistFavoriteFoldersSnapshot(session.uid, it) }
+                saveLatestGatewaySession(session)
+            } catch (error: Throwable) {
+                error.rethrowCancellation()
+                _state.update { state ->
+                    if (
+                        !state.account.signedIn ||
+                        state.account.uid != session.uid ||
+                        state.account.username != session.username ||
+                        state.favoriteFolders.folders.size > 1
+                    ) return@update state
+                    state.copy(
+                        favoriteFolders = state.favoriteFolders.copy(
+                            error = "收藏分类自动刷新失败：${error.readable()}",
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
     private fun List<JmFavoriteFolder>.toFavoriteFolderUiItems(): List<JmFavoriteFolderUiItem> =
         (listOf(JmFavoriteFolder(id = "0", name = "全部")) + this)
             .map { folder ->
@@ -1202,6 +1277,7 @@ class PureViewModel(
         _state.update {
             it.copy(
                 account = JmAccountUiState(status = JmAccountStatus.SigningIn),
+                daily = JmDailyUiState(),
                 message = "JM 登录状态已失效，正在自动重新登录",
             )
         }
@@ -1221,6 +1297,7 @@ class PureViewModel(
                 }
                 false
             } else {
+                val cachedFolders = loadCachedFavoriteFolders(account.uid)
                 automaticReloginAttempts = 0
                 _state.update {
                     it.copy(
@@ -1230,15 +1307,27 @@ class PureViewModel(
                             username = account.username,
                             favoriteCount = account.favoriteCount,
                         ),
+                        favoriteFolders = it.favoriteFolders.copy(
+                            folders = cachedFolders,
+                            items = it.favorites,
+                            total = it.favorites.size.toLong(),
+                            loading = false,
+                            error = null,
+                        ),
                         message = "JM 已自动重新登录",
                     )
                 }
+                refreshFavoriteFolderCatalog(session)
                 true
             }
         } catch (error: Throwable) {
             error.rethrowCancellation()
             gateway.clearSession()
-            if (error is JmAuthException) clearStoredSession()
+            if (error is JmAuthException) {
+                clearStoredSession()
+            } else {
+                automaticReloginAttempts = 0
+            }
             _state.update {
                 it.copy(
                     account = JmAccountUiState(status = JmAccountStatus.Error, error = error.readable()),
@@ -1250,6 +1339,8 @@ class PureViewModel(
     }
 
     private suspend fun restoreAccount(session: JmSession) {
+        favoriteCatalogJob?.cancel()
+        val cachedFolders = loadCachedFavoriteFolders(session.uid)
         _state.update {
             it.copy(
                 account = JmAccountUiState(
@@ -1258,6 +1349,7 @@ class PureViewModel(
                     username = session.username,
                 ),
                 favoriteFolders = JmFavoriteFoldersUiState(
+                    folders = cachedFolders,
                     items = it.favorites,
                     total = it.favorites.size.toLong(),
                 ),
@@ -1316,6 +1408,8 @@ class PureViewModel(
             error.rethrowCancellation()
             if (error is JmAuthException) {
                 invalidateFavoriteFolderSession(error)
+            } else if (recoverRestoredSession(error)) {
+                return
             } else {
                 val sessionPersisted = saveLatestGatewaySession(session)
                 _state.update { state ->
@@ -1346,6 +1440,8 @@ class PureViewModel(
 
     fun login(username: String, password: String) {
         cancelSourceRefreshForForeground()
+        dailyJob?.cancel()
+        favoriteCatalogJob?.cancel()
         favoriteFolderRequestGeneration.incrementAndGet()
         favoriteFolderJob?.cancel()
         accountJob?.cancel()
@@ -1353,6 +1449,7 @@ class PureViewModel(
             _state.update {
                 it.copy(
                     account = JmAccountUiState(status = JmAccountStatus.SigningIn),
+                    daily = JmDailyUiState(),
                     favoriteFolders = JmFavoriteFoldersUiState(
                         items = it.favorites,
                         total = it.favorites.size.toLong(),
@@ -1364,6 +1461,23 @@ class PureViewModel(
                 val session = gateway.session() ?: throw JmAuthException("JM 登录未返回有效会话")
                 automaticReloginAttempts = 0
                 saveStoredSession(session, JmCredentials(account.username, password))
+                val cachedFolders = loadCachedFavoriteFolders(account.uid)
+                _state.update { state ->
+                    state.copy(
+                        account = JmAccountUiState(
+                            status = JmAccountStatus.SignedIn,
+                            uid = account.uid,
+                            username = account.username,
+                            favoriteCount = account.favoriteCount,
+                            syncing = true,
+                        ),
+                        favoriteFolders = state.favoriteFolders.copy(
+                            folders = cachedFolders,
+                            items = state.favorites,
+                            total = state.favorites.size.toLong(),
+                        ),
+                    )
+                }
                 val mutationRevision = favoriteMutationRevision.get()
                 val syncError = try {
                     val favorites = gateway.favoriteCollection { partial ->
@@ -1442,7 +1556,9 @@ class PureViewModel(
     fun logout() {
         favoriteOperationGeneration.incrementAndGet()
         favoriteFolderRequestGeneration.incrementAndGet()
+        favoriteCatalogJob?.cancel()
         favoriteFolderJob?.cancel()
+        dailyJob?.cancel()
         _state.update { it.copy(favoritePendingKeys = emptySet()) }
         accountJob?.cancel()
         accountJob = viewModelScope.launch {
@@ -1453,6 +1569,7 @@ class PureViewModel(
             _state.update {
                 it.copy(
                     account = JmAccountUiState(),
+                    daily = JmDailyUiState(),
                     favorites = cachedFavorites,
                     favoriteFolders = JmFavoriteFoldersUiState(
                         items = cachedFavorites,
@@ -1464,6 +1581,133 @@ class PureViewModel(
         }
     }
 
+    fun loadDaily(force: Boolean = false) {
+        val account = _state.value.account
+        if (!account.signedIn) {
+            _state.update { it.copy(message = "请先登录 JM 官方账号") }
+            return
+        }
+        val current = _state.value.daily
+        if (!force && current.info != null && current.status == JmDailyStatus.Ready) return
+        dailyJob?.cancel()
+        dailyJob = viewModelScope.launch {
+            _state.update { it.copy(daily = current.copy(status = JmDailyStatus.Loading, error = null)) }
+            try {
+                val info = gateway.dailyInfo()
+                _state.update { state ->
+                    state.copy(
+                        daily = JmDailyUiState(
+                            status = JmDailyStatus.Ready,
+                            info = info,
+                            confirmedEpochDay = when {
+                                info.isSignedToday() -> LocalDate.now().toEpochDay()
+                                current.confirmedToday -> current.confirmedEpochDay
+                                else -> null
+                            },
+                            message = current.message,
+                        ),
+                    )
+                }
+            } catch (error: Throwable) {
+                error.rethrowCancellation()
+                if (error is JmAuthException) {
+                    invalidateFavoriteFolderSession(error)
+                    _state.update { it.copy(daily = JmDailyUiState()) }
+                } else {
+                    _state.update { state ->
+                        state.copy(daily = JmDailyUiState(status = JmDailyStatus.Error, info = current.info, error = error.readable()))
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * A restored AVS can remain locally valid while the route used for the first
+     * authenticated request has just changed (VPN/proxy hand-off is the common
+     * case). Give the source pool one fresh chance, then use the encrypted
+     * credentials for a single bounded re-login instead of forcing the user to
+     * press logout/login manually.
+     */
+    private suspend fun recoverRestoredSession(error: Throwable): Boolean {
+        if (error !is JmSourceException && error !is JmApiException) return false
+        val store = sessionStore ?: return false
+        runCatching { gateway.refreshSourceList(force = true, updateOfficialList = true) }
+            .onFailure { refreshError -> refreshError.rethrowCancellation() }
+        gateway.clearSession()
+        clearStoredSession(keepCredentials = true)
+        val credentials = loadStoredCredentialsWithRetry(store) ?: return false
+        return automaticRelogin(credentials)
+    }
+
+    fun checkIn() {
+        val account = _state.value.account
+        val info = _state.value.daily.info
+        if (!account.signedIn) {
+            _state.update { it.copy(message = "请先登录 JM 官方账号") }
+            return
+        }
+        if (info == null || info.dailyId.isBlank()) {
+            loadDaily(force = true)
+            return
+        }
+        if (_state.value.daily.checking) return
+        dailyJob?.cancel()
+        dailyJob = viewModelScope.launch {
+            _state.update { it.copy(daily = it.daily.copy(status = JmDailyStatus.Checking, error = null)) }
+            try {
+                val result = gateway.dailyCheck(info.dailyId)
+                if (result.accepted) {
+                    val message = result.message.ifBlank { if (result.alreadySigned) "今日已签到" else "签到成功" }
+                    _state.update {
+                        it.copy(
+                            daily = it.daily.copy(
+                                status = JmDailyStatus.Loading,
+                                confirmedEpochDay = LocalDate.now().toEpochDay(),
+                                message = message,
+                                error = null,
+                            ),
+                        )
+                    }
+                    try {
+                        val refreshed = gateway.dailyInfo()
+                        _state.update { state ->
+                            state.copy(
+                                daily = JmDailyUiState(
+                                    status = JmDailyStatus.Ready,
+                                    info = refreshed,
+                                    confirmedEpochDay = LocalDate.now().toEpochDay(),
+                                    message = message,
+                                ),
+                            )
+                        }
+                    } catch (refreshError: Throwable) {
+                        refreshError.rethrowCancellation()
+                        if (refreshError is JmAuthException) {
+                            invalidateFavoriteFolderSession(refreshError)
+                            _state.update { it.copy(daily = JmDailyUiState()) }
+                        } else {
+                            _state.update { state ->
+                                state.copy(daily = state.daily.copy(status = JmDailyStatus.Error, error = refreshError.readable()))
+                            }
+                        }
+                    }
+                } else {
+                    val message = result.message.ifBlank { "签到失败" }
+                    _state.update { it.copy(daily = it.daily.copy(status = JmDailyStatus.Error, error = message), message = message) }
+                }
+            } catch (error: Throwable) {
+                error.rethrowCancellation()
+                if (error is JmAuthException) {
+                    invalidateFavoriteFolderSession(error)
+                    _state.update { it.copy(daily = JmDailyUiState()) }
+                } else {
+                    _state.update { it.copy(daily = it.daily.copy(status = JmDailyStatus.Error, error = error.readable()), message = error.readable()) }
+                }
+            }
+        }
+    }
+
     fun syncOfficialFavorites() {
         val current = _state.value.account
         if (!current.signedIn || current.syncing) {
@@ -1471,6 +1715,7 @@ class PureViewModel(
             return
         }
         cancelSourceRefreshForForeground()
+        favoriteCatalogJob?.cancel()
         val operationGeneration = favoriteOperationGeneration.get()
         accountJob?.cancel()
         accountJob = viewModelScope.launch {
@@ -1586,6 +1831,7 @@ class PureViewModel(
                     val items = mapFavoriteItems(collection.items)
                     val fetchedFolders = collection.folders.toFavoriteFolderUiItems()
                     var published = false
+                    var foldersToPersist: List<JmFavoriteFolderUiItem>? = null
                     if (requestGeneration != favoriteFolderRequestGeneration.get()) return false
                     _state.update { state ->
                         if (
@@ -1593,17 +1839,22 @@ class PureViewModel(
                             mutationRevision != favoriteMutationRevision.get() ||
                             state.favoriteFolders.selectedFolderId != safeFolderId
                         ) return@update state
+                        val folders = fetchedFolders.takeIf { candidates -> candidates.any { it.id == safeFolderId } }
+                            ?: state.favoriteFolders.folders
                         published = true
+                        foldersToPersist = folders
                         state.copy(
                             favoriteFolders = state.favoriteFolders.copy(
-                                folders = fetchedFolders.takeIf { folders -> folders.any { it.id == safeFolderId } }
-                                    ?: state.favoriteFolders.folders,
+                                folders = folders,
                                 items = items,
                                 total = collection.total,
                                 loading = false,
                                 error = null,
                             ),
                         )
+                    }
+                    if (published) {
+                        foldersToPersist?.let { persistFavoriteFoldersSnapshot(_state.value.account.uid, it) }
                     }
                     return published
                 }
@@ -1707,6 +1958,7 @@ class PureViewModel(
                                 ?: "收藏夹已创建",
                         )
                     }
+                    persistFavoriteFoldersSnapshot(_state.value.account.uid, folders)
                 }
             } catch (error: Throwable) {
                 error.rethrowCancellation()
@@ -1819,14 +2071,18 @@ class PureViewModel(
     private suspend fun invalidateFavoriteFolderSession(error: JmAuthException) {
         favoriteOperationGeneration.incrementAndGet()
         favoriteFolderRequestGeneration.incrementAndGet()
+        favoriteCatalogJob?.cancel()
         gateway.clearSession()
         clearStoredSession(keepCredentials = true)
         val credentials = sessionStore?.let { loadStoredCredentialsWithRetry(it) }
         if (credentials != null && automaticRelogin(credentials)) return
+        val cachedFolders = loadCachedFavoriteFolders(_state.value.account.uid)
         _state.update { state ->
             state.copy(
                 account = JmAccountUiState(status = JmAccountStatus.Error, error = error.readable()),
+                daily = JmDailyUiState(),
                 favoriteFolders = JmFavoriteFoldersUiState(
+                    folders = cachedFolders,
                     items = state.favorites,
                     total = state.favorites.size.toLong(),
                 ),
@@ -1858,7 +2114,9 @@ class PureViewModel(
             } else {
                 fetchedItems
             }
-            val folders = fetchedFolders.takeIf { it.size > 1 || state.favoriteFolders.folders.size <= 1 }
+            val folders = fetchedFolders.takeIf {
+                !mergeWithCached || it.size > 1 || state.favoriteFolders.folders.size <= 1
+            }
                 ?: state.favoriteFolders.folders
             val selectedFolderId = state.favoriteFolders.selectedFolderId
                 .takeIf { selected -> folders.any { it.id == selected } }
@@ -1891,7 +2149,10 @@ class PureViewModel(
                 ),
             )
         }
-        if (published && !mergeWithCached) persistFavoritesSnapshot()
+        if (published) {
+            persistFavoriteFoldersSnapshot(account.uid, _state.value.favoriteFolders.folders)
+            if (!mergeWithCached) persistFavoritesSnapshot()
+        }
         return published
     }
 
@@ -2141,6 +2402,20 @@ class PureViewModel(
         persistHistorySnapshot()
     }
 
+    fun removeHistory(item: ReadingHistoryItem) {
+        val key = item.comic.key
+        var removed = false
+        _state.update { state ->
+            if (state.history.none { it.comic.key == key }) return@update state
+            removed = true
+            state.copy(
+                history = state.history.filterNot { it.comic.key == key },
+                message = "已删除《${item.comic.title}》的阅读历史",
+            )
+        }
+        if (removed) persistHistorySnapshot()
+    }
+
     private fun recordHistorySnapshot(
         item: ComicUiItem,
         chapterId: String? = null,
@@ -2265,7 +2540,8 @@ class PureViewModel(
         pageBudget: Int,
         settings: AppSettings,
     ) {
-        readerEntryWarmupIndices(startPageIndex, pages.size, pageBudget)
+        val effectivePageBudget = if (settings.sequentialPageLoading) 1 else pageBudget
+        readerEntryWarmupIndices(startPageIndex, pages.size, effectivePageBudget)
             .chunked(READER_WARMUP_CONCURRENCY)
             .forEach { batch ->
                 coroutineScope {
@@ -2293,6 +2569,7 @@ class PureViewModel(
         if (
             !appInForeground.get() ||
             settings.dataSaver ||
+            settings.sequentialPageLoading ||
             settings.readerPrefetchMode != ReaderPrefetchMode.UltraAggressive
         ) return
         readerBufferRefillJob = viewModelScope.launch {
@@ -2645,7 +2922,11 @@ class PureViewModel(
                 updateOfficialList = normalized.autoUpdateSourceList && !previous.autoUpdateSourceList,
             )
         }
-        if (normalized.readerPrefetchMode != ReaderPrefetchMode.UltraAggressive || normalized.dataSaver) {
+        if (
+            normalized.readerPrefetchMode != ReaderPrefetchMode.UltraAggressive ||
+            normalized.dataSaver ||
+            normalized.sequentialPageLoading
+        ) {
             readerBufferRefillJob?.cancel()
             chapterPreloader.cancelAll()
         } else if (
@@ -2954,8 +3235,37 @@ class PureViewModel(
             readerWarmupJob = null
             readerWarmupChapterId = null
         } else {
-            restoreStoredSessionIfNeeded()
+            if (SystemVpnMonitor.routeGeneration != lastGatewayRouteGeneration) {
+                handleSystemRouteChange()
+            } else {
+                restoreStoredSessionIfNeeded()
+            }
             refillUltraReaderBuffer()
+        }
+    }
+
+    private fun handleSystemRouteChange() {
+        val routeGeneration = SystemVpnMonitor.routeGeneration
+        if (routeGeneration == lastGatewayRouteGeneration) return
+        lastGatewayRouteGeneration = routeGeneration
+        automaticReloginAttempts = 0
+        when (_state.value.account.status) {
+            JmAccountStatus.SignedIn,
+            JmAccountStatus.Restoring,
+            -> gateway.session()?.let { session ->
+                accountJob?.cancel()
+                accountJob = viewModelScope.launch { restoreAccount(session) }
+            }
+
+            JmAccountStatus.SignedOut,
+            JmAccountStatus.Error,
+            -> {
+                accountJob?.cancel()
+                accountJob = null
+                restoreStoredSessionIfNeeded()
+            }
+
+            JmAccountStatus.SigningIn -> Unit
         }
     }
 
@@ -3040,6 +3350,8 @@ class PureViewModel(
         detailJob?.cancel()
         commentsJob?.cancel()
         accountJob?.cancel()
+        dailyJob?.cancel()
+        favoriteCatalogJob?.cancel()
         favoriteFolderJob?.cancel()
         readerJob?.cancel()
         readerWarmupJob?.cancel()
@@ -3053,6 +3365,7 @@ class PureViewModel(
         sourceRefreshJob?.cancel()
         sourceScheduleJob?.cancel()
         updateCheckJob?.cancel()
+        removeRouteChangeListener()
         enqueueLocalStateFlush(closeAfter = true)
         releaseClient.close()
         gateway.close()

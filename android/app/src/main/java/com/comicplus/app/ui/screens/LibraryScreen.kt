@@ -2,6 +2,7 @@ package com.comicplus.app.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -70,6 +71,7 @@ fun LibraryScreen(
     onOpen: (ComicUiItem) -> Unit,
     onToggleFavorite: (ComicUiItem) -> Unit,
     onClearHistory: () -> Unit,
+    onDeleteHistory: (ReadingHistoryItem) -> Unit,
     modifier: Modifier = Modifier,
     favoriteFolders: JmFavoriteFoldersUiState = JmFavoriteFoldersUiState(),
     onSelectFavoriteFolder: (String) -> Unit = {},
@@ -83,6 +85,7 @@ fun LibraryScreen(
     var showCreateFolderDialog by remember { mutableStateOf(false) }
     var newFolderName by rememberSaveable { mutableStateOf("") }
     var movingComic by remember { mutableStateOf<ComicUiItem?>(null) }
+    var pendingHistoryDelete by remember { mutableStateOf<ReadingHistoryItem?>(null) }
     val section = LibrarySection.entries.firstOrNull { it.name == sectionName } ?: LibrarySection.Favorites
     val favoriteKeys = remember(favorites) { favorites.mapTo(hashSetOf(), ComicUiItem::key) }
     val selectedFolder = favoriteFolders.folders.firstOrNull { it.id == favoriteFolders.selectedFolderId }
@@ -154,6 +157,7 @@ fun LibraryScreen(
                 favoriteKeys = favoriteKeys,
                 onOpen = onOpen,
                 onToggleFavorite = onToggleFavorite,
+                onDelete = { pendingHistoryDelete = it },
             )
         }
     }
@@ -168,6 +172,25 @@ fun LibraryScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showClearDialog = false }) { Text("取消") }
+            },
+        )
+    }
+
+    pendingHistoryDelete?.let { entry ->
+        AlertDialog(
+            onDismissRequest = { pendingHistoryDelete = null },
+            title = { Text("删除历史记录") },
+            text = { Text("确定删除《${entry.comic.title}》的阅读历史吗？收藏和阅读进度不会受影响。") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        pendingHistoryDelete = null
+                        onDeleteHistory(entry)
+                    },
+                ) { Text("删除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingHistoryDelete = null }) { Text("取消") }
             },
         )
     }
@@ -310,6 +333,7 @@ private fun HistoryList(
     favoriteKeys: Set<String>,
     onOpen: (ComicUiItem) -> Unit,
     onToggleFavorite: (ComicUiItem) -> Unit,
+    onDelete: (ReadingHistoryItem) -> Unit,
 ) {
     if (items.isEmpty()) {
         LibraryEmptyState("还没有阅读历史", "打开一部漫画后，它会自动出现在这里。")
@@ -325,6 +349,7 @@ private fun HistoryList(
                 isFavorite = entry.comic.key in favoriteKeys,
                 onOpen = { onOpen(entry.comic) },
                 onToggleFavorite = { onToggleFavorite(entry.comic) },
+                onDelete = { onDelete(entry) },
             )
         }
     }
@@ -336,13 +361,21 @@ private fun HistoryRow(
     isFavorite: Boolean,
     onOpen: () -> Unit,
     onToggleFavorite: () -> Unit,
+    onDelete: () -> Unit,
 ) {
     val summary = remember(entry.updatedAt, entry.pageIndex, entry.pageCount) {
         historySummary(entry)
     }
     // Keep history compact enough to scan while still exposing the resume context.
     Surface(
-        modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp).clickable(onClick = onOpen),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 10.dp)
+            .combinedClickable(
+                onClick = onOpen,
+                onLongClickLabel = "删除历史记录",
+                onLongClick = onDelete,
+            ),
         shape = RoundedCornerShape(CpDimens.controlRadius),
         color = MaterialTheme.colorScheme.surface,
     ) {

@@ -2,6 +2,7 @@ package com.comicplus.pure
 
 import androidx.compose.runtime.Immutable
 import java.io.IOException
+import java.time.LocalDate
 
 @Immutable
 data class JmRanking(
@@ -129,6 +130,62 @@ data class JmAccount(
     val avatarUrl: String? = null,
     val favoriteCount: Long? = null,
 )
+
+/** The signed-in user's official daily check-in calendar. */
+@Immutable
+data class JmDailyInfo(
+    val dailyId: String,
+    val eventName: String = "",
+    val currentProgress: String = "",
+    val records: List<JmDailyRecord> = emptyList(),
+    val threeDaysCoin: Long? = null,
+    val threeDaysExp: Long? = null,
+    val sevenDaysCoin: Long? = null,
+    val sevenDaysExp: Long? = null,
+)
+
+fun JmDailyInfo.isSignedToday(today: LocalDate = LocalDate.now()): Boolean = records.any { record ->
+    if (!record.signed) return@any false
+    val raw = record.date.trim()
+    val parsed = runCatching { LocalDate.parse(raw.take(10)) }.getOrNull()
+    parsed == today || parsed == null && raw.toIntOrNull() == today.dayOfMonth
+}
+
+@Immutable
+data class JmDailyRecord(
+    val date: String = "",
+    val signed: Boolean = false,
+    val bonus: Boolean = false,
+)
+
+/** Result returned by the official daily check-in mutation. */
+@Immutable
+data class JmDailyCheckResult(
+    val status: String = "",
+    val message: String = "",
+) {
+    val alreadySigned: Boolean
+        get() = message.contains("已签到") || message.contains("已簽到") ||
+            message.contains("already", ignoreCase = true)
+
+    val rejected: Boolean
+        get() = !alreadySigned && (
+            status.lowercase() in setOf("error", "fail", "failed", "false", "0", "400", "403") ||
+                message.contains("失败") || message.contains("失敗") ||
+                message.contains("错误") || message.contains("錯誤") ||
+                message.contains("invalid", ignoreCase = true) ||
+                message.contains("error", ignoreCase = true) ||
+                message.contains("fail", ignoreCase = true)
+            )
+
+    val accepted: Boolean
+        get() = !rejected && (alreadySigned || message.contains("成功") ||
+            message.contains("success", ignoreCase = true) || status.isBlank() ||
+            status.equals("ok", ignoreCase = true) ||
+            status.equals("success", ignoreCase = true) ||
+            status.equals("true", ignoreCase = true) ||
+            status == "1" || status == "200")
+}
 
 /** Short-lived AVS session data restored across process restarts. */
 data class JmSession(

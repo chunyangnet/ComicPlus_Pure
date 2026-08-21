@@ -132,6 +132,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
@@ -588,6 +589,7 @@ private fun ReaderContent(
                     chapters = state.chapters,
                     listState = listState,
                     settings = settings,
+                    sequentialStartPageIndex = initialPageIndex,
                     loadPage = loadPage,
                     prefetchPage = prefetchPage,
                     cachedPage = cachedPage,
@@ -615,14 +617,18 @@ private fun ReaderContent(
         } else {
             PagedReaderPages(
                 pages = activeSegment.pages,
+                initialPageIndex = initialPageIndex,
                 pagerState = pagerState,
                 direction = settings.readerDirection,
                 imageQuality = settings.readerImageQuality,
                 turboMode = settings.readerTurboMode,
+                sequentialLoading = settings.sequentialPageLoading,
                 loadPage = loadPage,
                 cachedPage = cachedPage,
                 requestProfileKey = readerRequestProfileKey,
                 beyondViewportPageCount = if (
+                    settings.sequentialPageLoading
+                ) 0 else if (
                     settings.readerPrefetchMode == ReaderPrefetchMode.UltraAggressive
                 ) 2 else 1,
                 retryAllKey = retryAllKey,
@@ -917,6 +923,7 @@ private fun VerticalReaderPages(
     chapters: List<SourceChapterDto>,
     listState: androidx.compose.foundation.lazy.LazyListState,
     settings: AppSettings,
+    sequentialStartPageIndex: Int,
     loadPage: suspend (DirectReaderPage, (Float) -> Unit) -> Bitmap,
     prefetchPage: suspend (DirectReaderPage) -> Unit,
     cachedPage: (DirectReaderPage) -> Bitmap?,
@@ -937,6 +944,12 @@ private fun VerticalReaderPages(
     val warmingChapters = remember(segments.firstOrNull()?.chapterId) { mutableStateMapOf<String, Boolean>() }
     val chaptersById = remember(chapters) { chapters.associateBy(SourceChapterDto::sourceChapterId) }
     val segmentSnapshot = remember(segments, segments.size) { segments.toList() }
+    val sequentialGate = remember(segments.firstOrNull()?.chapterId) { SequentialPageLoadGate() }
+    val sequentialPages = remember(segmentSnapshot, sequentialStartPageIndex) {
+        segmentSnapshot.flatMapIndexed { index, segment ->
+            if (index == 0) segment.pages.drop(sequentialStartPageIndex.coerceAtLeast(0)) else segment.pages
+        }
+    }
     val segmentPositions = remember(segmentSnapshot) {
         segmentSnapshot.associate { segment ->
             segment.chapterId to ReaderSegmentPosition(
@@ -1009,13 +1022,15 @@ private fun VerticalReaderPages(
                         }
                     }
                     if (
-                        settings.readerTurboMode ||
-                        settings.readerPrefetchMode == ReaderPrefetchMode.UltraAggressive
+                        !settings.sequentialPageLoading && (
+                            settings.readerTurboMode ||
+                                settings.readerPrefetchMode == ReaderPrefetchMode.UltraAggressive
+                            )
                     ) {
                         warmPages.chunked(2).forEach { batch ->
                             coroutineScope { batch.map { page -> async { warm(page) } }.awaitAll() }
                         }
-                    } else {
+                    } else if (!settings.sequentialPageLoading) {
                         warmPages.forEach { page -> warm(page) }
                     }
                     warmingChapters.remove(chapter.sourceChapterId)
@@ -1037,6 +1052,7 @@ private fun VerticalReaderPages(
         settings.readerPrefetchPages,
         settings.readerPrefetchMode,
         settings.dataSaver,
+        settings.sequentialPageLoading,
     ) {
         snapshotFlow {
             listState.layoutInfo.visibleItemsInfo
@@ -1044,6 +1060,15 @@ private fun VerticalReaderPages(
                 .maxWithOrNull(compareBy<ReaderProgressPosition>({ it.chapterIndex }, { it.pageIndex }))
         }.distinctUntilChanged().collect { position ->
             if (position == null) return@collect
+            if (settings.sequentialPageLoading) {
+                val segment = segmentSnapshot.firstOrNull { it.chapterId == position.chapterId }
+                val lastPage = segment?.pages?.lastOrNull()
+                if (lastPage != null && position.pageIndex >= lastPage.index - 1) {
+                    sequentialGate.awaitAvailable(lastPage)
+                    if (isActive) chapters.getOrNull(position.chapterIndex + 1)?.let(::requestNextChapter)
+                }
+                return@collect
+            }
             val preloadDistance = when {
                 settings.dataSaver || settings.readerPrefetchMode == ReaderPrefetchMode.Conservative ->
                     NEXT_CHAPTER_MIN_PRELOAD_PAGES
@@ -1091,9 +1116,16 @@ private fun VerticalReaderPages(
                     // Every page already in the viewport is user-visible work. The most
                     // prominent page remains the progress anchor, but adjacent visible pages
                     // must not be demoted to background decoding and cause a blank on fling.
-                    foreground = pageKey == foregroundPageKey || pageKey in visiblePageKeys,
+                    foreground = if (settings.sequentialPageLoading) {
+                        pageKey == foregroundPageKey
+                    } else {
+                        pageKey == foregroundPageKey || pageKey in visiblePageKeys
+                    },
                     onTapFraction = { onToggleChrome() },
                     onFailureChanged = { onFailureChanged(page, it) },
+                    sequentialLoading = settings.sequentialPageLoading,
+                    sequentialGate = sequentialGate,
+                    sequentialPages = sequentialPages,
                 )
             }
             val currentChapter = chaptersById[segment.chapterId]
@@ -1214,10 +1246,12 @@ private fun ChapterCommentEntry(
 @Composable
 private fun PagedReaderPages(
     pages: List<DirectReaderPage>,
+    initialPageIndex: Int,
     pagerState: PagerState,
     direction: ReaderDirection,
     imageQuality: ReaderImageQuality,
     turboMode: Boolean,
+    sequentialLoading: Boolean,
     loadPage: suspend (DirectReaderPage, (Float) -> Unit) -> Bitmap,
     cachedPage: (DirectReaderPage) -> Bitmap?,
     requestProfileKey: String,
@@ -1228,6 +1262,10 @@ private fun PagedReaderPages(
     onFailureChanged: (DirectReaderPage, Boolean) -> Unit,
 ) {
     val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val sequentialPages = remember(pages, initialPageIndex) {
+        pages.drop(initialPageIndex.coerceIn(0, pages.size))
+    }
+    val sequentialGate = remember(sequentialPages) { SequentialPageLoadGate() }
     val leftEdgeDelta = if (direction == ReaderDirection.LeftToRight) -1 else 1
     fun movePage(delta: Int) {
         val currentIndex = pagerPageToReadingIndex(pagerState.currentPage, pages.size, direction)
@@ -1265,6 +1303,9 @@ private fun PagedReaderPages(
                     }
                 },
                 onFailureChanged = { onFailureChanged(page, it) },
+                sequentialLoading = sequentialLoading,
+                sequentialGate = sequentialGate,
+                sequentialPages = sequentialPages,
             )
         }
     }
@@ -1507,6 +1548,9 @@ private fun ReaderPage(
     foreground: Boolean = true,
     onTapFraction: (Float) -> Unit,
     onFailureChanged: (Boolean) -> Unit,
+    sequentialLoading: Boolean = false,
+    sequentialGate: SequentialPageLoadGate? = null,
+    sequentialPages: List<DirectReaderPage> = emptyList(),
 ) {
     var retryKey by rememberSaveable(page.photoId, page.fileName) { mutableIntStateOf(0) }
     var pageAspectRatio by remember(page.photoId, page.fileName) {
@@ -1527,11 +1571,27 @@ private fun ReaderPage(
         requestProfileKey,
     ) {
         value = cachedResult
-        if (value != null || !foreground) return@produceState
+        if (!foreground) return@produceState
         value = try {
-            Result.success(
-                loadPage(page) { ratio -> pageAspectRatio = ratio.coerceIn(0.05f, 8f) },
-            )
+            if (sequentialLoading && sequentialGate != null) {
+                Result.success(
+                    sequentialGate.load(
+                        sequence = sequentialPages,
+                        target = page,
+                        cachedPage = cachedPage,
+                    ) { candidate, isTarget ->
+                        loadPage(candidate) { ratio ->
+                            if (isTarget) pageAspectRatio = ratio.coerceIn(0.05f, 8f)
+                        }
+                    },
+                )
+            } else if (value != null) {
+                value!!
+            } else {
+                Result.success(
+                    loadPage(page) { ratio -> pageAspectRatio = ratio.coerceIn(0.05f, 8f) },
+                )
+            }
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {

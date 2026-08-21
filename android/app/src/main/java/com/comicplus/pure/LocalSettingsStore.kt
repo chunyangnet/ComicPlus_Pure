@@ -65,6 +65,7 @@ class LocalSettingsStore(context: Context) {
             reduceMotion = preferences.getBoolean("reduce_motion", false),
             tapToToggleReaderMenu = preferences.getBoolean("tap_menu", true),
             autoResumeReading = preferences.getBoolean("auto_resume", true),
+            sequentialPageLoading = preferences.getBoolean("sequential_page_loading", false),
             dataSaver = normalizedDataSaver,
             autoSelectSource = preferences.getBoolean("auto_select_source", true),
             preferredSourceHost = preferences.getString("preferred_source_host", null)
@@ -96,6 +97,7 @@ class LocalSettingsStore(context: Context) {
             putBoolean("reduce_motion", settings.reduceMotion)
             putBoolean("tap_menu", settings.tapToToggleReaderMenu)
             putBoolean("auto_resume", settings.autoResumeReading)
+            putBoolean("sequential_page_loading", settings.sequentialPageLoading)
             putBoolean("data_saver", normalizedDataSaver)
             putBoolean("auto_select_source", settings.autoSelectSource)
             putString("preferred_source_host", settings.preferredSourceHost?.take(MAX_HOST_LENGTH))

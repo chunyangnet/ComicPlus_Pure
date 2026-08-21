@@ -88,6 +88,7 @@ import com.comicplus.app.ui.screens.OfficialBrowseScreen
 import com.comicplus.app.ui.screens.ReaderScreen
 import com.comicplus.app.ui.screens.RankingScreen
 import com.comicplus.app.ui.screens.SearchScreen
+import com.comicplus.app.ui.screens.ProfileScreen
 import com.comicplus.app.ui.screens.SettingsScreen
 import com.comicplus.app.ui.theme.ComicPlusTheme
 import com.comicplus.app.ui.theme.White
@@ -99,10 +100,27 @@ private enum class MainTab(val label: String, val outlined: ImageVector, val fil
     Ranking("排行", Icons.Outlined.EmojiEvents, Icons.Filled.EmojiEvents),
     Category("分类", Icons.Outlined.Category, Icons.Filled.Category),
     Library("书架", Icons.Outlined.FavoriteBorder, Icons.Filled.Favorite),
-    Settings("设置", Icons.Outlined.Settings, Icons.Filled.Settings),
+    Profile("个人", Icons.Outlined.Person, Icons.Filled.Person),
 }
 
-private enum class AppLayer { Main, OfficialBrowse, Search, Detail, Reader }
+internal enum class AppLayer { Main, Settings, OfficialBrowse, Search, Detail, Reader }
+
+internal fun appNavigationStack(
+    settingsVisible: Boolean,
+    officialBrowseVisible: Boolean,
+    searchVisible: Boolean,
+    searchReturnToDetail: Boolean,
+    detailVisible: Boolean,
+    readerVisible: Boolean,
+): List<AppLayer> = buildList {
+    add(AppLayer.Main)
+    if (settingsVisible) add(AppLayer.Settings)
+    if (officialBrowseVisible) add(AppLayer.OfficialBrowse)
+    if (searchVisible && !searchReturnToDetail) add(AppLayer.Search)
+    if (detailVisible) add(AppLayer.Detail)
+    if (readerVisible) add(AppLayer.Reader)
+    if (searchVisible && searchReturnToDetail) add(AppLayer.Search)
+}
 
 @Composable
 fun PureApp() {
@@ -117,7 +135,10 @@ fun PureApp() {
     var searchVisible by rememberSaveable { mutableStateOf(false) }
     var searchInitialQuery by rememberSaveable { mutableStateOf("") }
     var searchInitialScope by rememberSaveable { mutableIntStateOf(0) }
+    var searchReturnToDetail by rememberSaveable { mutableStateOf(false) }
+    var searchWasVisibleBeforeTag by rememberSaveable { mutableStateOf(false) }
     var officialBrowseVisible by rememberSaveable { mutableStateOf(false) }
+    var settingsVisible by rememberSaveable { mutableStateOf(false) }
     val favoriteKeys = remember(state.favorites) { state.favorites.mapTo(hashSetOf(), ComicUiItem::key) }
 
     DisposableEffect(lifecycleOwner, viewModel) {
@@ -139,6 +160,13 @@ fun PureApp() {
         state.message?.let {
             snackbar.showSnackbar(it)
             viewModel.clearMessage()
+        }
+    }
+
+    LaunchedEffect(state.detail) {
+        if (state.detail is ComicResolveUiState.Idle && searchReturnToDetail) {
+            searchReturnToDetail = false
+            searchWasVisibleBeforeTag = false
         }
     }
 
@@ -179,19 +207,26 @@ fun PureApp() {
             val displayedDetailState = if (detailVisible) state.detail else retainedDetailState
             val navigationStack = remember(
                 officialBrowseVisible,
+                settingsVisible,
                 searchVisible,
+                searchReturnToDetail,
                 detailVisible,
                 readerVisible,
             ) {
-                buildList {
-                    add(AppLayer.Main)
-                    if (officialBrowseVisible) add(AppLayer.OfficialBrowse)
-                    if (searchVisible) add(AppLayer.Search)
-                    if (detailVisible) add(AppLayer.Detail)
-                    if (readerVisible) add(AppLayer.Reader)
-                }
+                appNavigationStack(
+                    settingsVisible = settingsVisible,
+                    officialBrowseVisible = officialBrowseVisible,
+                    searchVisible = searchVisible,
+                    searchReturnToDetail = searchReturnToDetail,
+                    detailVisible = detailVisible,
+                    readerVisible = readerVisible,
+                )
             }
-            val visibleLayers = remember(navigationStack) { navigationStack.takeLast(2).toSet() }
+            // Keep every previously opened browse layer composed underneath the
+            // current detail/reader surface. Besides making the back transition
+            // feel native, this preserves each LazyColumn/LazyGrid scroll anchor
+            // when a user opens a comic and returns to the exact card they chose.
+            val visibleLayers = remember(navigationStack) { navigationStack.toSet() }
             val topLayer = navigationStack.last()
             val mainReduceMotion = state.settings.reduceMotion || topLayer != AppLayer.Main
 
@@ -240,6 +275,8 @@ fun PureApp() {
                                         onOpenSearch = { query ->
                                             searchInitialQuery = query
                                             searchInitialScope = 0
+                                            searchReturnToDetail = false
+                                            searchWasVisibleBeforeTag = false
                                             searchVisible = true
                                             if (query.isNotBlank()) viewModel.search(query)
                                         },
@@ -266,6 +303,8 @@ fun PureApp() {
                                         onOpenSearch = { query ->
                                             searchInitialQuery = query
                                             searchInitialScope = 0
+                                            searchReturnToDetail = false
+                                            searchWasVisibleBeforeTag = false
                                             searchVisible = true
                                             if (query.isNotBlank()) viewModel.search(query)
                                         },
@@ -290,6 +329,8 @@ fun PureApp() {
                                         onOpenSearch = { query ->
                                             searchInitialQuery = query
                                             searchInitialScope = 0
+                                            searchReturnToDetail = false
+                                            searchWasVisibleBeforeTag = false
                                             searchVisible = true
                                             if (query.isNotBlank()) viewModel.search(query)
                                         },
@@ -315,35 +356,57 @@ fun PureApp() {
                                         onCreateFavoriteFolder = viewModel::createFavoriteFolder,
                                         onMoveFavoriteToFolder = viewModel::moveFavoriteToFolder,
                                         onClearHistory = viewModel::clearHistory,
+                                        onDeleteHistory = viewModel::removeHistory,
                                         modifier = modifier,
                                     )
 
-                                    MainTab.Settings -> SettingsScreen(
-                                        settings = state.settings,
-                                        downloads = state.downloads,
+                                    MainTab.Profile -> ProfileScreen(
                                         account = state.account,
+                                        daily = state.daily,
+                                        favoriteCount = state.favorites.size,
+                                        historyCount = state.history.size,
+                                        downloads = state.downloads,
+                                        sourceStatus = state.sourceStatus,
+                                        updateStatus = state.appUpdate,
+                                        onOpenSettings = { settingsVisible = true },
                                         onLogin = viewModel::login,
                                         onLogout = viewModel::logout,
                                         onSyncFavorites = viewModel::syncOfficialFavorites,
-                                        sourceStatus = state.sourceStatus,
-                                        updateStatus = state.appUpdate,
-                                        onSettingsChange = viewModel::updateSettings,
-                                        onCheckUpdates = viewModel::checkForUpdates,
-                                        onOpenUpdate = { url ->
-                                            openExternalUrl(context, url) { message ->
-                                                scope.launch { snackbar.showSnackbar(message) }
-                                            }
-                                        },
-                                        onClearReaderCache = viewModel::clearReaderCache,
-                                        onRefreshSources = { viewModel.refreshSources(force = true) },
-                                        onOpenDownload = viewModel::openDownloaded,
-                                        onDeleteDownload = viewModel::deleteDownload,
+                                        onLoadDaily = { viewModel.loadDaily(force = true) },
+                                        onCheckIn = viewModel::checkIn,
                                         modifier = modifier,
                                     )
                                 }
                             }
                         }
                     }
+                }
+
+                PredictiveBackLayer(
+                    visible = settingsVisible && AppLayer.Settings in visibleLayers,
+                    enabled = topLayer == AppLayer.Settings,
+                    reduceMotion = state.settings.reduceMotion,
+                    onBack = { settingsVisible = false },
+                ) { layerModifier ->
+                    SettingsScreen(
+                        settings = state.settings,
+                        downloads = state.downloads,
+                        sourceStatus = state.sourceStatus,
+                        updateStatus = state.appUpdate,
+                        onSettingsChange = viewModel::updateSettings,
+                        onCheckUpdates = viewModel::checkForUpdates,
+                        onOpenUpdate = { url ->
+                            openExternalUrl(context, url) { message ->
+                                scope.launch { snackbar.showSnackbar(message) }
+                            }
+                        },
+                        onClearReaderCache = viewModel::clearReaderCache,
+                        onRefreshSources = { viewModel.refreshSources(force = true) },
+                        onOpenDownload = viewModel::openDownloaded,
+                        onDeleteDownload = viewModel::deleteDownload,
+                        onBack = { settingsVisible = false },
+                        modifier = layerModifier,
+                    )
                 }
 
                 PredictiveBackLayer(
@@ -366,6 +429,8 @@ fun PureApp() {
                             onOpenTag = { tag ->
                                 searchInitialQuery = tag
                                 searchInitialScope = 3
+                                searchReturnToDetail = false
+                                searchWasVisibleBeforeTag = false
                                 searchVisible = true
                                 viewModel.search(tag, mainTag = 3)
                             },
@@ -386,8 +451,11 @@ fun PureApp() {
                     enabled = topLayer == AppLayer.Search,
                     reduceMotion = state.settings.reduceMotion,
                     onBack = {
-                        searchVisible = false
-                        viewModel.clearSearch()
+                        val restorePreviousSearch = searchReturnToDetail && searchWasVisibleBeforeTag
+                        searchVisible = restorePreviousSearch
+                        searchReturnToDetail = false
+                        searchWasVisibleBeforeTag = false
+                        if (!restorePreviousSearch) viewModel.clearSearch()
                     },
                 ) { layerModifier ->
                     val layerReduceMotion = state.settings.reduceMotion || topLayer != AppLayer.Search
@@ -398,12 +466,19 @@ fun PureApp() {
                             initialScope = searchInitialScope,
                             reduceMotion = layerReduceMotion,
                             onBack = {
-                                searchVisible = false
-                                viewModel.clearSearch()
+                                val restorePreviousSearch = searchReturnToDetail && searchWasVisibleBeforeTag
+                                searchVisible = restorePreviousSearch
+                                searchReturnToDetail = false
+                                searchWasVisibleBeforeTag = false
+                                if (!restorePreviousSearch) viewModel.clearSearch()
                             },
                             onSearch = { query, tag, order -> viewModel.search(query, tag, order) },
                             onLoadMore = viewModel::loadMoreSearch,
-                            onResolve = viewModel::openComic,
+                            onResolve = { comic ->
+                                searchReturnToDetail = false
+                                searchWasVisibleBeforeTag = false
+                                viewModel.openComic(comic)
+                            },
                             onRedirectConsumed = viewModel::consumeSearchRedirect,
                             onMessage = { message ->
                                 scope.launch { snackbar.showSnackbar(message) }
@@ -459,6 +534,14 @@ fun PureApp() {
                             onDownload = viewModel::downloadChapter,
                             isFavorite = ready?.let { "${it.source}:${it.jmId}" in favoriteKeys } ?: false,
                             onToggleFavorite = viewModel::toggleFavorite,
+                            onOpenTag = { tag ->
+                                searchInitialQuery = tag
+                                searchInitialScope = 3
+                                searchWasVisibleBeforeTag = searchVisible
+                                searchReturnToDetail = true
+                                searchVisible = true
+                                viewModel.search(tag, mainTag = 3)
+                            },
                             comments = state.comments,
                             onRetryComments = viewModel::retryComments,
                             onLoadMoreComments = viewModel::loadMoreComments,

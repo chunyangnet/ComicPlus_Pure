@@ -15,6 +15,8 @@ private const val MAX_FAVORITE_TITLE_LENGTH = 500
 private const val MAX_FAVORITE_DESCRIPTION_LENGTH = 50_000
 private const val MAX_FAVORITE_FIELD_LENGTH = 512
 internal const val MAX_FAVORITE_FOLDER_NAME_LENGTH = 80
+private const val MAX_DAILY_FIELD_LENGTH = 512
+private const val MAX_DAILY_MESSAGE_LENGTH = 240
 internal val safeNumericId = Regex("^\\d{1,12}$")
 private val favoriteImageFilePattern = Regex(
     "^[A-Za-z0-9_-]{1,128}\\.(?:jpg|jpeg|png|webp)$",
@@ -257,6 +259,63 @@ internal fun firstJsonLong(value: JSONObject, vararg keys: String): Long? {
         value.long(key)?.let { return it }
     }
     return null
+}
+
+internal fun parseDailyInfo(payload: JSONObject): JmDailyInfo {
+    val root = payload.optJSONObject("data") ?: payload
+    val dailyId = firstJsonString(root, "daily_id", "dailyId", "id")
+        .take(MAX_ACCOUNT_FIELD_LENGTH)
+        .takeIf(safeNumericId::matches)
+        .orEmpty()
+    val records = firstJsonArray(root, "record", "records")
+        ?.objectsOrValues(366)
+        ?.flatMap { row ->
+            when (row) {
+                is JSONArray -> row.objectsOrValues(62)
+                else -> listOf(row)
+            }
+        }
+        ?.mapNotNull { value ->
+            val item = value as? JSONObject ?: return@mapNotNull null
+            JmDailyRecord(
+                date = firstJsonString(item, "date", "day").take(MAX_ACCOUNT_FIELD_LENGTH),
+                signed = jsonBoolean(item, "signed", "is_sign", "isSigned"),
+                bonus = jsonBoolean(item, "bonus", "has_bonus", "hasExtraBonus"),
+            )
+        }
+        .orEmpty()
+    return JmDailyInfo(
+        dailyId = dailyId,
+        eventName = firstJsonString(root, "event_name", "eventName", "name").take(MAX_DAILY_FIELD_LENGTH),
+        currentProgress = firstJsonString(root, "currentProgress", "current_progress", "progress").take(MAX_DAILY_FIELD_LENGTH),
+        records = records.take(366),
+        threeDaysCoin = firstJsonLong(root, "three_days_coin", "threeDaysCoin"),
+        threeDaysExp = firstJsonLong(root, "three_days_exp", "threeDaysExp"),
+        sevenDaysCoin = firstJsonLong(root, "seven_days_coin", "sevenDaysCoin"),
+        sevenDaysExp = firstJsonLong(root, "seven_days_exp", "sevenDaysExp"),
+    )
+}
+
+internal fun parseDailyCheckResult(payload: JSONObject): JmDailyCheckResult {
+    val root = payload.optJSONObject("data") ?: payload
+    return JmDailyCheckResult(
+        status = firstJsonString(root, "status", "result", "code").take(MAX_ACCOUNT_FIELD_LENGTH),
+        message = firstJsonString(root, "msg", "message", "errorMsg").take(MAX_DAILY_MESSAGE_LENGTH),
+    )
+}
+
+private fun jsonBoolean(value: JSONObject, vararg keys: String): Boolean {
+    keys.forEach { key ->
+        when (val raw = value.opt(key)) {
+            is Boolean -> return raw
+            is Number -> return raw.toInt() != 0
+            is String -> when (raw.trim().lowercase()) {
+                "1", "true", "yes", "y", "signed" -> return true
+                "0", "false", "no", "n", "unsigned" -> return false
+            }
+        }
+    }
+    return false
 }
 
 internal fun parseJsonInt(value: Any?): Int? {

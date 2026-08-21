@@ -220,9 +220,37 @@ internal object ComicPlusIcons {
             }
 
         private var _settings: ImageVector? = null
+
+        val Person: ImageVector
+            get() {
+                if (_person != null) return _person!!
+                _person = materialIcon(name = "Outlined.Person") {
+                    materialPath {
+                        moveTo(12.0f, 12.0f)
+                        curveTo(14.21f, 12.0f, 16.0f, 10.21f, 16.0f, 8.0f)
+                        reflectiveCurveTo(14.21f, 4.0f, 12.0f, 4.0f)
+                        reflectiveCurveTo(8.0f, 5.79f, 8.0f, 8.0f)
+                        reflectiveCurveTo(9.79f, 12.0f, 12.0f, 12.0f)
+                        close()
+                        moveTo(12.0f, 14.0f)
+                        curveTo(7.58f, 14.0f, 4.0f, 16.24f, 4.0f, 19.0f)
+                        verticalLineTo(20.0f)
+                        horizontalLineTo(20.0f)
+                        verticalLineTo(19.0f)
+                        curveTo(20.0f, 16.24f, 16.42f, 14.0f, 12.0f, 14.0f)
+                        close()
+                    }
+                }
+                return _person!!
+            }
+
+        private var _person: ImageVector? = null
     }
 
     object Outlined {
+        val Person: ImageVector
+            get() = Filled.Person
+
         val ChevronRight: ImageVector
             get() {
                 if (_chevronRight != null) {

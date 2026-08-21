@@ -5,15 +5,10 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -33,13 +28,11 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -55,15 +48,14 @@ import com.comicplus.app.ui.JmTypeRankingUiState
 import com.comicplus.app.ui.JmWeeklyUiState
 import com.comicplus.app.ui.components.ComicPlusTopBar
 import com.comicplus.app.ui.components.CpDimens
+import com.comicplus.app.ui.components.ExpandableTagFlow
 import com.comicplus.app.ui.components.PillRow
 import com.comicplus.app.ui.components.RankingRow
 import com.comicplus.app.ui.components.ShimmerBlock
 import com.comicplus.app.ui.components.rememberShimmerBrush
 import com.comicplus.app.ui.theme.Canvas
 import com.comicplus.app.ui.theme.Ink
-import com.comicplus.app.ui.theme.InkSoft
 import com.comicplus.app.ui.theme.Muted
-import com.comicplus.app.ui.theme.SurfaceSoft
 
 private enum class OfficialBrowseSection(val label: String) {
     Weekly("每周必看"),
@@ -211,7 +203,6 @@ private fun WeeklyBrowse(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TagBrowse(
     state: JmOfficialBrowseUiState,
@@ -223,36 +214,23 @@ private fun TagBrowse(
         state.tagGroups.isEmpty() -> OfficialEmptyState("官方标签目录暂不可用", null)
         else -> LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(horizontal = CpDimens.screenPadding, vertical = 4.dp),
+            contentPadding = PaddingValues(vertical = 4.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
             items(state.tagGroups, key = { it.title }, contentType = { "tag-group" }) { group ->
-                Column {
-                    Text(group.title, color = Ink, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Column(Modifier.fillMaxWidth()) {
+                    Text(
+                        group.title,
+                        modifier = Modifier.padding(horizontal = CpDimens.screenPadding),
+                        color = Ink,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
                     Spacer(Modifier.height(9.dp))
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        group.tags.forEach { tag ->
-                            val interaction = remember(tag) { MutableInteractionSource() }
-                            Surface(
-                                modifier = Modifier.clickable(
-                                    interactionSource = interaction,
-                                    indication = LocalIndication.current,
-                                ) { onOpenTag(tag) },
-                                shape = RoundedCornerShape(8.dp),
-                                color = SurfaceSoft,
-                            ) {
-                                Text(
-                                    tag,
-                                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
-                                    color = InkSoft,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                            }
-                        }
-                    }
+                    ExpandableTagFlow(
+                        labels = group.tags,
+                        onSelected = { index -> group.tags.getOrNull(index)?.let(onOpenTag) },
+                    )
                 }
             }
             item("tag-bottom-space") { Spacer(Modifier.height(22.dp)) }

@@ -17,6 +17,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -47,6 +49,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -60,11 +63,14 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
 import coil3.network.NetworkHeaders
@@ -299,6 +305,130 @@ fun PillRow(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun ExpandableTagFlow(
+    labels: List<String>,
+    onSelected: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+    collapsedRows: Int = 3,
+    contentPadding: PaddingValues = PaddingValues(horizontal = CpDimens.screenPadding),
+) {
+    if (labels.isEmpty()) return
+    var expanded by rememberSaveable(labels) { mutableStateOf(false) }
+    val visibleRows = collapsedRows.coerceAtLeast(1)
+    val textStyle = MaterialTheme.typography.bodyMedium
+    val textMeasurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    BoxWithConstraints(modifier = modifier.fillMaxWidth().padding(contentPadding)) {
+        val availableWidthPx = with(density) { maxWidth.roundToPx() }
+        val horizontalSpacingPx = with(density) { 8.dp.roundToPx() }
+        val horizontalChipPaddingPx = with(density) { 24.dp.roundToPx() }
+        val collapsedCount = remember(
+            labels,
+            availableWidthPx,
+            visibleRows,
+            textStyle,
+            density.fontScale,
+            horizontalSpacingPx,
+            horizontalChipPaddingPx,
+        ) {
+            val widths = labels.map { label ->
+                (textMeasurer.measure(label, textStyle).size.width + horizontalChipPaddingPx)
+                    .coerceAtMost(availableWidthPx)
+            }
+            collapsedTagItemCount(
+                itemWidths = widths,
+                availableWidth = availableWidthPx,
+                maxRows = visibleRows,
+                horizontalSpacing = horizontalSpacingPx,
+            )
+        }
+        val hasOverflow = collapsedCount < labels.size
+        val visibleLabels = if (expanded || !hasOverflow) labels else labels.take(collapsedCount)
+        Column {
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                visibleLabels.forEachIndexed { index, label ->
+                    TagChip(label = label, onClick = { onSelected(index) })
+                }
+            }
+            if (hasOverflow) {
+                Spacer(Modifier.height(8.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TagOverflowControl(
+                        label = if (expanded) "收起" else "展开其余 ${labels.size - collapsedCount} 个",
+                        onClick = { expanded = !expanded },
+                    )
+                }
+            }
+        }
+    }
+}
+
+internal fun collapsedTagItemCount(
+    itemWidths: List<Int>,
+    availableWidth: Int,
+    maxRows: Int,
+    horizontalSpacing: Int,
+): Int {
+    if (itemWidths.isEmpty() || availableWidth <= 0 || maxRows <= 0) return 0
+    var row = 1
+    var rowWidth = 0
+    var visibleCount = 0
+    for (rawWidth in itemWidths) {
+        val width = rawWidth.coerceIn(0, availableWidth)
+        val nextWidth = if (rowWidth == 0) width else rowWidth + horizontalSpacing + width
+        if (rowWidth > 0 && nextWidth > availableWidth) {
+            row++
+            if (row > maxRows) break
+            rowWidth = width
+        } else {
+            rowWidth = nextWidth
+        }
+        visibleCount++
+    }
+    return visibleCount
+}
+
+@Composable
+private fun TagChip(label: String, onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier.clickable(onClick = onClick),
+        shape = RoundedCornerShape(8.dp),
+        color = SurfaceSoft,
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            color = InkSoft,
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun TagOverflowControl(label: String, onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier.clickable(onClick = onClick),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.primaryContainer,
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            color = MaterialTheme.colorScheme.onPrimaryContainer,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.Bold,
+        )
+    }
+}
+
 @Composable
 fun Pill(
     label: String,
@@ -530,9 +660,10 @@ fun RankingRow(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     prominent: Boolean = rank <= 3,
-	supportingText: String? = null,
+    supportingText: String? = null,
     isFavorite: Boolean = false,
     onToggleFavorite: (() -> Unit)? = null,
+    coverWidthOverride: Dp? = null,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     val rankColor = when (rank) {
@@ -542,6 +673,7 @@ fun RankingRow(
         else -> Muted
     }
     val background = if (prominent) rankColor.copy(alpha = .055f) else Color.Transparent
+    val coverWidth = coverWidthOverride ?: if (prominent) 70.dp else 52.dp
     Surface(
         modifier = modifier
             .fillMaxWidth()
@@ -567,7 +699,7 @@ fun RankingRow(
             )
             Box(
                 modifier = Modifier
-                    .width(if (prominent) 70.dp else 52.dp)
+                    .width(coverWidth)
                     .aspectRatio(3f / 4f)
                     .clip(RoundedCornerShape(12.dp)),
             ) {

@@ -45,6 +45,21 @@ class PureViewModelTest {
     }
 
     @Test
+    fun comicResolveStateKeepsOfficialTagsForDetailSearch() {
+        val state = JmComic(
+            id = "123",
+            title = "Tagged comic",
+            description = "",
+            coverUrl = null,
+            authors = emptyList(),
+            tags = listOf("全彩", "人妻"),
+            chapters = listOf(JmChapter("123", 1, "第 1 话")),
+        ).toResolveState(progress = null)
+
+        assertEquals(listOf("全彩", "人妻"), state.tags)
+    }
+
+    @Test
     fun progressUpdatesAreThrottledButCompletionAlwaysPublishes() {
         assertEquals(false, shouldPublishProgress(0.20f, 0.205f, 50_000_000L, completed = false))
         assertEquals(true, shouldPublishProgress(0.20f, 0.22f, 50_000_000L, completed = false))
